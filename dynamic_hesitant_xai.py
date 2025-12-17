@@ -628,11 +628,14 @@ def create_dataloaders_ddp(base_dir: str, batch_size: int, rank: int, world_size
                                  num_workers=num_workers, pin_memory=True, drop_last=True,
                                  worker_init_fn=worker_init_fn)
        
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+   
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler,
                                num_workers=num_workers, pin_memory=True, drop_last=False,
                                worker_init_fn=worker_init_fn)
        
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+        test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, sampler=test_sampler,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
 
@@ -760,11 +763,14 @@ def create_dataloaders_ddp(base_dir: str, batch_size: int, rank: int, world_size
                                  num_workers=num_workers, pin_memory=True, drop_last=True,
                                  worker_init_fn=worker_init_fn)
         
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                # ... برای val_loader و test_loader در تمام شاخه‌های dataset_type
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler,
                                num_workers=num_workers, pin_memory=True, drop_last=False,
                                worker_init_fn=worker_init_fn)
-        
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+       
+        test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, sampler=test_sampler,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
 
@@ -1106,20 +1112,24 @@ def main():
  
     ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
  
+        # ... بعد از اتمام آموزش ...
+
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         ensemble.module.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
         if is_main:
             print("Best hesitant fuzzy network loaded.\n")
- 
+
     dist.barrier()
- 
+
+    # <--- بلوک ارزیابی از شرط if is_main خارج شده است --->
+    print("\n" + "="*70)
+    print("EVALUATING FUZZY HESITANT ENSEMBLE")
+    print("="*70)
+    ensemble_test_acc, ensemble_weights, membership_values, activation_percentages = evaluate_ensemble_final_ddp(ensemble, test_loader, device, "Test", MODEL_NAMES, rank)
+    
+    # <--- کد چاپ نتایج و ذخیره فایل همچنان در شرط is_main باقی می‌ماند --->
     if is_main:
-        print("\n" + "="*70)
-        print("EVALUATING FUZZY HESITANT ENSEMBLE")
-        print("="*70)
-        ensemble_test_acc, ensemble_weights, membership_values, activation_percentages = evaluate_ensemble_final_ddp(ensemble, test_loader, device, "Test", MODEL_NAMES, rank)
-       
         print("\n" + "="*70)
         print("FINAL COMPARISON")
         print("="*70)
@@ -1127,44 +1137,22 @@ def main():
         print(f"Hesitant Ensemble Acc : {ensemble_test_acc:.2f}%")
         improvement = ensemble_test_acc - best_single
         print(f"Improvement : {improvement:+.2f}%")
-       
+        
         results = {
-            "method": "Fuzzy Hesitant Sets (DDP)",
-            "dataset": args.dataset,
-            "data_dir": args.data_dir,
-            "seed": args.seed,
-            "num_gpus": world_size,
-            "num_memberships": args.num_memberships,
-            "model_paths": args.model_paths,
-            "model_names": MODEL_NAMES,
-            "normalization": {
-                "means": [list(m) for m in MEANS],
-                "stds": [list(s) for s in STDS]
-            },
-            "individual_accuracies": {MODEL_NAMES[i]: acc for i, acc in enumerate(individual_accs)},
-            "best_single": {"name": MODEL_NAMES[best_idx], "acc": best_single},
-            "ensemble": {
-                "acc": ensemble_test_acc,
-                "weights": ensemble_weights,
-                "membership_values": membership_values
-            },
-            "improvement": improvement,
-            "training_history": history
+            # ... همانطور که بود ...
         }
-       
+        
         result_path = os.path.join(args.save_dir, 'hesitant_fuzzy_ddp_results.json')
-     
         with open(result_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"\nResults saved to: {result_path}")
-     
+        
         final_model_path = os.path.join(args.save_dir, 'hesitant_fuzzy_ddp_final.pt')
         torch.save({
             'hesitant_state_dict': ensemble.module.hesitant_fuzzy.state_dict(),
             'results': results,
             'args': vars(args)
         }, final_model_path)
-     
         print(f"Final model saved: {final_model_path}")
         print("="*70)
         
@@ -1172,6 +1160,8 @@ def main():
         print("\n" + "="*70)
         print("GENERATING GRAD-CAM VISUALIZATIONS")
         print("="*70)
+        
+        # ... بقیه کد Grad-CAM ...
         
         # Create a directory to save the results
         grad_cam_output_dir = os.path.join(args.save_dir, 'grad_cam_results')
