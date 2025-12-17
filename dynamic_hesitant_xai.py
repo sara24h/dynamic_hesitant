@@ -1147,7 +1147,7 @@ def main():
     cleanup_ddp()
 
 if __name__ == "__main__":
-    main() = loaders['valid']
+    main() == loaders['valid']
         test_loader = loaders['test']
     
     elif dataset_type == 'real_fake':
