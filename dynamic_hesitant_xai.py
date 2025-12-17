@@ -50,6 +50,11 @@ class GradCAM:
     def __call__(self, x, class_idx=None):
         # Forward pass
         output = self.model(x)
+
+        
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        
         if class_idx is None:
             class_idx = output.argmax(dim=1).item()
             
