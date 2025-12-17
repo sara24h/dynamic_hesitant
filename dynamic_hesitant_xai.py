@@ -674,14 +674,27 @@ class GradCAM:
 
     def __call__(self, input_tensor):
         self.model.eval()
+        
+        # Temporarily enable requires_grad for parameters
+        original_grads = [p.requires_grad for p in self.model.parameters()]
+        for p in self.model.parameters():
+            p.requires_grad = True
+
         logit = self.model(input_tensor)
         if isinstance(logit, (tuple, list)):
             logit = logit[0]
         score = logit.squeeze()  # For positive class in binary classification
+        
         self.model.zero_grad()
         score.backward()
-        gradients = self.gradients[0]
-        activations = self.activations[0]
+        
+        gradients = self.gradients
+        activations = self.activations
+        
+        # Restore original requires_grad
+        for p, orig in zip(self.model.parameters(), original_grads):
+            p.requires_grad = orig
+        
         weights = gradients.mean(dim=[1, 2], keepdim=True)
         cam = (weights * activations).sum(0)
         cam = F.relu(cam)
@@ -1017,7 +1030,7 @@ def main():
                         if isinstance(out, (tuple, list)):
                             out = out[0]
                         out = out.squeeze().item()
-                        pred_label = 1 if out > 0 else 0
+                    pred_label = 1 if out > 0 else 0
                     
                     cam = gradcam(img_norm)
                     cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), size=(256, 256), mode='bilinear', align_corners=False).squeeze()
