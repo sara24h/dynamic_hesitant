@@ -1013,8 +1013,11 @@ def main():
                     img_norm = norm(img)
                     
                     with torch.no_grad():
-                        out = model(img_norm).squeeze().item()
-                    pred_label = 1 if out > 0 else 0
+                        out = model(img_norm)
+                        if isinstance(out, (tuple, list)):
+                            out = out[0]
+                        out = out.squeeze().item()
+                        pred_label = 1 if out > 0 else 0
                     
                     cam = gradcam(img_norm)
                     cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), size=(256, 256), mode='bilinear', align_corners=False).squeeze()
