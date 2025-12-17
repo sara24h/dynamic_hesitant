@@ -1118,9 +1118,7 @@ def main():
         print("\n" + "="*70)
         print("EVALUATING FUZZY HESITANT ENSEMBLE")
         print("="*70)
-        ensemble_test_acc, ensemble_weights, membership_values = evaluate_ensemble_final_ddp(
-            ensemble, test_loader, device, "Test", MODEL_NAMES, rank
-        )
+        ensemble_test_acc, ensemble_weights, membership_values, activation_percentages = evaluate_ensemble_final_ddp(ensemble, test_loader, device, "Test", MODEL_NAMES, rank)
        
         print("\n" + "="*70)
         print("FINAL COMPARISON")
