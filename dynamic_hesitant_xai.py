@@ -389,6 +389,11 @@ def load_pruned_models(model_paths: List[str], device: torch.device, rank: int) 
             model.load_state_dict(ckpt['model_state_dict'])
             model = model.to(device).eval()
         
+            def move_masks(m):
+                if hasattr(m, 'masks'):
+                    m.masks = [mask.to(device) for mask in m.masks]
+            model.apply(move_masks)
+            
             if rank == 0:
                 param_count = sum(p.numel() for p in model.parameters())
                 print(f" → Parameters: {param_count:,}")
