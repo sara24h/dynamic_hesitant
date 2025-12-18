@@ -1010,14 +1010,21 @@ def main():
         args.data_dir, args.batch_size, rank, world_size, dataset_type=args.dataset
     )
  
-    if is_main:
+        if is_main:
         print("\n" + "="*70)
         print("EVALUATING INDIVIDUAL MODELS ON TEST SET (Before Training)")
         print("="*70)
         individual_accs = []
+        
+        # [مهم] این بخش را اضافه کنید: تعریف متغیر grad_cam_save_dir
+        grad_cam_save_dir = os.path.join(args.save_dir, 'grad_cams')
+        os.makedirs(grad_cam_save_dir, exist_ok=True)
+
         for i, model in enumerate(base_models):
             acc = evaluate_single_model(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", rank)
             individual_accs.append(acc)
+
+            # [مهم] این بخش را اضافه کنید: تولید Grad-CAM برای هر مدل
             model_grad_cam_dir = os.path.join(grad_cam_save_dir, MODEL_NAMES[i])
             generate_grad_cam_for_model(
                 model=model,
@@ -1025,7 +1032,7 @@ def main():
                 device=device,
                 model_name=MODEL_NAMES[i],
                 save_dir=model_grad_cam_dir,
-                num_samples=5  # Generate for 5 samples per model
+                num_samples=5  # تعداد نمونه‌ها برای هر مدل
             )
         
         best_single = max(individual_accs)
