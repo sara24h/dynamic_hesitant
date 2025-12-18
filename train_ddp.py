@@ -1,3 +1,5 @@
+# dynamic_hesitant/train_ddp.py
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -11,29 +13,12 @@ import warnings
 from tqdm import tqdm
 import numpy as np
 
-# Import custom modules
-from utils import set_seed
+# Import custom modules from our new structure
+from utils import set_seed, setup_ddp, cleanup_ddp
 from datasets.base_dataset import create_dataloaders_ddp
 from models import FuzzyHesitantEnsemble, load_pruned_models
 
 warnings.filterwarnings("ignore")
-
-
-def setup_ddp():
-    """Initialize distributed training"""
-    dist.init_process_group(backend='nccl')
-    rank = int(os.environ['RANK'])
-    local_rank = int(os.environ['LOCAL_RANK'])
-    world_size = int(os.environ['WORLD_SIZE'])
-    torch.cuda.set_device(local_rank)
-    return rank, local_rank, world_size
-
-
-def cleanup_ddp():
-    """Clean up distributed training"""
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
 
 @torch.no_grad()
 def evaluate_single_model(
@@ -43,7 +28,7 @@ def evaluate_single_model(
     name: str, 
     rank: int
 ) -> float:
-    """Evaluate a single model's accuracy"""
+    """Evaluate a single model's accuracy."""
     model.eval()
     correct = total = 0
  
@@ -64,8 +49,7 @@ def evaluate_single_model(
         print(f" {name}: {acc:.2f}%")
  
     return acc
-
-
+ 
 def train_hesitant_fuzzy_ddp(
     ensemble_model, 
     train_loader, 
@@ -77,7 +61,7 @@ def train_hesitant_fuzzy_ddp(
     rank, 
     world_size
 ):
-    """Train the hesitant fuzzy membership network"""
+    """Train the hesitant fuzzy membership network."""
     if rank == 0:
         os.makedirs(save_dir, exist_ok=True)
  
@@ -184,10 +168,9 @@ def train_hesitant_fuzzy_ddp(
  
     return best_val_acc, history
 
-
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, rank):
-    """Evaluate ensemble with detailed statistics"""
+    """Evaluate ensemble with detailed statistics."""
     model.eval()
     
     all_preds = []
@@ -255,10 +238,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, rank):
 
     return acc, avg_weights.tolist(), all_memberships.mean(axis=0).tolist(), activation_percentages.tolist()
 
-
 @torch.no_grad()
 def evaluate_accuracy_ddp(model, loader, device, rank):
-    """Quick accuracy evaluation"""
+    """Quick accuracy evaluation."""
     model.eval()
     correct = total = 0
  
@@ -271,7 +253,6 @@ def evaluate_accuracy_ddp(model, loader, device, rank):
  
     acc = 100. * correct / total
     return acc
-
 
 def main():
     SEED = 42
@@ -434,7 +415,6 @@ def main():
         print("="*70)
    
     cleanup_ddp()
-
 
 if __name__ == "__main__":
     main()
