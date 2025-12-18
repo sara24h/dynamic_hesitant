@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore")
 
 # ====================== SEED SETUP ======================
 def set_seed(seed: int = 42):
-    """Sets the seed for reproducibility across libraries."""
+    """Sets seed for reproducibility across libraries."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
