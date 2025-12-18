@@ -18,7 +18,7 @@ import random
 from sklearn.model_selection import train_test_split
 from PIL import Image
 import cv2
-from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam import EigenCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 warnings.filterwarnings("ignore")
@@ -1158,7 +1158,7 @@ def generate_grad_cam_for_model(model, loader, device, model_name, save_dir, cla
 
     # Use the wrapper to ensure GradCAM gets a tensor output
     wrapped_model = ModelWrapper(model)
-    cam = GradCAM(model=wrapped_model, target_layers=target_layers)
+    cam = EigenCAM(model=wrapped_model, target_layers=target_layers)
 
     try:
         samples_generated = 0
