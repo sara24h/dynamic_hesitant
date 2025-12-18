@@ -1,14 +1,19 @@
 # dynamic_hesitant/datasets/base_dataset.py
 
+"""
+This module contains the main function for creating DDP DataLoaders.
+It orchestrates the process by calling helper functions from the 'loaders' module.
+"""
+
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torchvision import transforms
+from torchvision import transforms, datasets
 import os
 from tqdm import tqdm
 import torch.distributed as dist
 
-# واردات توابع و کلاس‌های مورد نیاز از فایل loaders.py
+# Import helper functions and classes from the loaders module
 from .loaders import (
     UADFVDataset, 
     TransformSubset, 
@@ -85,15 +90,13 @@ def create_dataloaders_ddp(base_dir: str, batch_size: int, rank: int, world_size
         if rank == 0:
             print(f"Processing real-fake dataset from: {base_dir}")
         
-        # Only rank 0 does the split preparation to avoid race conditions
         if rank == 0:
             full_dataset, train_indices, val_indices, test_indices = prepare_real_fake_dataset(
                 base_dir, seed=42
             )
         
-        dist.barrier() # Wait for rank 0 to finish
+        dist.barrier()
 
-        # All ranks load the dataset
         if os.path.exists(os.path.join(base_dir, 'training_fake')) and \
            os.path.exists(os.path.join(base_dir, 'training_real')):
             dataset_dir = base_dir
