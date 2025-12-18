@@ -17,10 +17,7 @@ import json
 import random
 from sklearn.model_selection import train_test_split
 from PIL import Image
-import cv2
-from pytorch_grad_cam import ScoreCAM
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from pytorch_grad_cam.utils.image import show_cam_on_image
+
 warnings.filterwarnings("ignore")
 
 class UADFVDataset(Dataset):
@@ -397,34 +394,9 @@ def load_pruned_models(model_paths: List[str], device: torch.device, rank: int) 
             print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
      
         try:
-            # Load checkpoint to CPU first to inspect it
             ckpt = torch.load(path, map_location='cpu', weights_only=False)
-            
-            # --- شروع تغییرات ---
-            # Move masks to the target device before passing them to the model constructor
-            masks_on_device = {}
-            if isinstance(ckpt['masks'], dict):
-                for key, value in ckpt['masks'].items():
-                    if isinstance(value, torch.Tensor):
-                        masks_on_device[key] = value.to(device)
-                    else:
-                        masks_on_device[key] = value
-            elif isinstance(ckpt['masks'], list):
-                masks_on_device = [m.to(device) if isinstance(m, torch.Tensor) else m for m in ckpt['masks']]
-            else: # Fallback for single tensor or other types
-                if isinstance(ckpt['masks'], torch.Tensor):
-                    masks_on_device = ckpt['masks'].to(device)
-                else:
-                    masks_on_device = ckpt['masks']
-            # --- پایان تغییرات ---
-
-            # Initialize the model with masks already on the correct device
-            model = ResNet_50_pruned_hardfakevsreal(masks=masks_on_device)
-            
-            # Load the rest of the state dict. map_location ensures tensors are moved correctly.
+            model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
             model.load_state_dict(ckpt['model_state_dict'])
-            
-            # A final .to(device) is good practice, though it might be redundant now
             model = model.to(device).eval()
          
             if rank == 0:
@@ -1015,28 +987,12 @@ def main():
         print("EVALUATING INDIVIDUAL MODELS ON TEST SET (Before Training)")
         print("="*70)
         individual_accs = []
-
-        grad_cam_save_dir = os.path.join(args.save_dir, 'grad_cams')
-        os.makedirs(grad_cam_save_dir, exist_ok=True)
-
         for i, model in enumerate(base_models):
             acc = evaluate_single_model(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", rank)
             individual_accs.append(acc)
-
-            # [مهم] این بخش را اضافه کنید: تولید Grad-CAM برای هر مدل
-            model_grad_cam_dir = os.path.join(grad_cam_save_dir, MODEL_NAMES[i])
-            generate_grad_cam_for_model(
-                model=model,
-                loader=test_loader,
-                device=device,
-                model_name=MODEL_NAMES[i],
-                save_dir=model_grad_cam_dir,
-                num_samples=5
-            )
         best_single = max(individual_accs)
         best_idx = individual_accs.index(best_single)
         print(f"\nBest Single Model: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
-      
      
     dist.barrier()
    
@@ -1062,6 +1018,113 @@ def main():
         ensemble_test_acc, ensemble_weights, membership_values = evaluate_ensemble_final_ddp(
             ensemble, test_loader, device, "Test", MODEL_NAMES, rank
         )
+        # ====================== GRAD-CAM VISUALIZATION ON TEST SET ======================
+    if is_main:
+        print("\n" + "="*70)
+        print("GENERATING GRAD-CAM FOR INDIVIDUAL FROZEN MODELS ON TEST SAMPLES")
+        print("="*70)
+
+        import cv2
+        from torchvision.transforms import ToPILImage
+
+        # تنظیمات
+        output_dir = os.path.join(args.save_dir, 'gradcam_visualizations')
+        os.makedirs(output_dir, exist_ok=True)
+        num_samples = 20  # تعداد نمونه‌هایی که می‌خواید ویژوالیزیشن کنید (می‌تونید تغییر بدید)
+        target_layer = 'layer4.2'  # بهترین انتخاب برای مدل هرس‌شده ResNet-50
+
+        # کلاس GradCAM
+        class GradCAM:
+            def __init__(self, model, target_layer_name):
+                self.model = model
+                self.target_layer_name = target_layer_name
+                self.gradients = None
+                self.activations = None
+                self._register_hooks()
+
+            def _register_hooks(self):
+                def forward_hook(module, input, output):
+                    self.activations = output.detach()
+
+                def backward_hook(module, grad_input, grad_output):
+                    self.gradients = grad_output[0].detach()
+
+                target_module = dict(self.model.named_modules())[self.target_layer_name]
+                target_module.register_forward_hook(forward_hook)
+                target_module.register_backward_hook(backward_hook)
+
+            def generate_cam(self, input_tensor, target_class=None):
+                self.model.eval()
+                logit = self.model(input_tensor)
+                if isinstance(logit, (tuple, list)):
+                    logit = logit[0]
+
+                if target_class is None:
+                    target_class = logit.squeeze().argmax().item()
+
+                score = logit[:, target_class]
+                self.model.zero_grad()
+                score.backward()
+
+                gradients = self.gradients  # [B, C, H, W]
+                activations = self.activations  # [B, C, H, W]
+                weights = gradients.mean(dim=[2, 3], keepdim=True)  # [B, C, 1, 1]
+
+                cam = (weights * activations).sum(dim=1, keepdim=True)  # [B, 1, H, W]
+                cam = F.relu(cam)
+                cam = cam / (cam.max() + 1e-8)
+                cam = F.interpolate(cam, size=input_tensor.shape[2:], mode='bilinear', align_corners=False)
+                return cam.squeeze(0).squeeze(0).cpu().numpy()  # [H, W]
+
+        # جمع‌آوری چند نمونه از تست (فقط رانک ۰)
+        sample_images = []
+        sample_labels = []
+        sample_paths = []  # اگر بخواید اسم فایل رو بدونید
+
+        for images, labels in test_loader:
+            sample_images.append(images)
+            sample_labels.append(labels)
+            # اگر دیتاستتون مسیر فایل داره (مثل UADFVDataset)، می‌تونید مسیرها رو هم بگیرید
+            break  # فقط اولین بچ رو بگیرید، بعداً سابست بگیرید
+
+        all_images = torch.cat(sample_images)[:num_samples].to(device)
+        all_labels = torch.cat(sample_labels)[:num_samples].cpu().numpy()
+
+        to_pil = ToPILImage()
+
+        for model_idx, model in enumerate(base_models):
+            print(f"\nProcessing Model {model_idx+1}/{len(base_models)}: {MODEL_NAMES[model_idx]}")
+            gradcam = GradCAM(model, target_layer)
+
+            for idx in range(all_images.size(0)):
+                img_tensor = all_images[idx].unsqueeze(0)  # [1, 3, H, W]
+                original_img = to_pil(all_images[idx].cpu())
+
+                cam = gradcam.generate_cam(img_tensor)
+
+                # ذخیره تصویر اصلی + هیت‌مپ
+                heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+                heatmap = cv2.resize(heatmap, (original_img.size[0], original_img.size[1]))
+                original_np = np.array(original_img)
+                overlay = cv2.addWeighted(original_np, 0.6, heatmap, 0.4, 0)
+
+                label_str = 'real' if all_labels[idx] == 1 else 'fake'
+                pred = model(img_tensor)
+                if isinstance(pred, (tuple, list)):
+                    pred = pred[0]
+                pred_label = 'real' if pred.item() > 0 else 'fake'
+                correct = "correct" if label_str == pred_label else "wrong"
+
+                save_path = os.path.join(
+                    output_dir,
+                    f"model{model_idx+1}_{MODEL_NAMES[model_idx]}_sample{idx+1}_{label_str}_{correct}.png"
+                )
+                cv2.imwrite(save_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+                print(f"   → Saved: {os.path.basename(save_path)}")
+
+        print(f"\nAll Grad-CAM visualizations saved to: {output_dir}")
+        print("="*70)
+    # =====================================================================
        
         print("\n" + "="*70)
         print("FINAL COMPARISON")
@@ -1113,79 +1176,6 @@ def main():
         print("All done!")
    
     cleanup_ddp()
-
-# [کد جدید] این کلاس را قبل از تابع generate_grad_cam_for_model اضافه کنید
-class ModelWrapper(nn.Module):
-    def __init__(self, model):
-        super(ModelWrapper, self).__init__()
-        self.model = model
-
-    def forward(self, x):
-        output = self.model(x)
-        if isinstance(output, (tuple, list)):
-            return output[0]
-        return output
-
-# [تابع اصلاح شده با ScoreCAM]
-def generate_grad_cam_for_model(model, loader, device, model_name, save_dir, class_names=['fake', 'real'], num_samples=5):
-    """
-    Generates and saves ScoreCAM visualizations for a given model.
-    ScoreCAM is a gradient-free method that can work with complex or pruned models.
-    """
-    print(f"\n[ScoreCAM] Generating visualizations for {model_name}...")
-    
-    os.makedirs(save_dir, exist_ok=True)
-
-    try:
-        target_layers = [model.layer4]
-    except AttributeError:
-        print(f"[ERROR] Could not find 'layer4' in model {model_name}. Skipping CAM.")
-        return
-
-    # [تغییر کلیدی] از ScoreCAM استفاده می‌کنیم
-    # برای ScoreCAM باید مدل را در حالت eval قرار دهیم و گرادیان‌ها را غیرفعال کنیم
-    model.eval()
-    wrapped_model = ModelWrapper(model)
-    cam = ScoreCAM(model=wrapped_model, target_layers=target_layers)
-
-    samples_generated = 0
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
-        
-        # Get model's prediction for naming the output file
-        with torch.no_grad():
-            outputs = model(images)
-            if isinstance(outputs, (tuple, list)):
-                outputs = outputs[0]
-            probs = torch.sigmoid(outputs)
-            preds = (probs > 0.5).long()
-
-        # Generate the CAM (ScoreCAM does not need gradients)
-        grayscale_cam = cam(input_tensor=images)
-        
-        for i in range(images.shape[0]):
-            if samples_generated >= num_samples:
-                break
-            
-            rgb_img = images[i].cpu().numpy().transpose(1, 2, 0)
-            rgb_img = np.clip(rgb_img, 0, 1)
-            grayscale_cam_i = grayscale_cam[i, :]
-            visualization = show_cam_on_image(rgb_img, grayscale_cam_i, use_rgb=True)
-
-            pred_label = class_names[preds[i].item()]
-            true_label = class_names[labels[i].item()]
-            filename = f"{model_name}_sample_{samples_generated+1}_pred_{pred_label}_true_{true_label}.jpg"
-            filepath = os.path.join(save_dir, filename)
-
-            visualization_bgr = cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(filepath, visualization_bgr)
-            
-            samples_generated += 1
-
-        if samples_generated >= num_samples:
-            break
-            
-    print(f"[ScoreCAM] Finished generating {num_samples} visualizations for {model_name} in {save_dir}")
  
 if __name__ == "__main__":
     main()
