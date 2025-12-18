@@ -1,5 +1,10 @@
 # dynamic_hesitant/datasets/loaders.py
 
+"""
+This module contains helper functions and classes for dataset handling.
+It includes custom datasets, data splitting logic, and dataset-specific preparation functions.
+"""
+
 import os
 import warnings
 import random
