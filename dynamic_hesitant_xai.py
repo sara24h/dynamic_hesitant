@@ -1114,43 +1114,42 @@ def main():
    
     cleanup_ddp()
 
+# [کد جدید] این کلاس را قبل از تابع generate_grad_cam_for_model اضافه کنید
+class ModelWrapper(nn.Module):
+    def __init__(self, model):
+        super(ModelWrapper, self).__init__()
+        self.model = model
+
+    def forward(self, x):
+        # The model returns a tuple, we only need the first element (the logits)
+        output = self.model(x)
+        if isinstance(output, (tuple, list)):
+            return output[0]
+        return output
+
+# [تابع اصلاح شده]
 def generate_grad_cam_for_model(model, loader, device, model_name, save_dir, class_names=['fake', 'real'], num_samples=5):
     """
     Generates and saves Grad-CAM visualizations for a given model.
-    
-    Args:
-        model (nn.Module): The model to visualize.
-        loader (DataLoader): The data loader to get images from.
-        device (torch.device): The device to run the model on.
-        model_name (str): Name of the model for saving files.
-        save_dir (str): Directory to save the visualization images.
-        class_names (list): List of class names ['fake', 'real'].
-        num_samples (int): Number of samples to generate Grad-CAM for.
     """
     print(f"\n[Grad-CAM] Generating visualizations for {model_name}...")
     
-    # Create the save directory if it doesn't exist
     os.makedirs(save_dir, exist_ok=True)
 
-    # For ResNet architectures, the target layer is usually the last convolutional block
-    # We need to inspect the model to find the correct layer. 'layer4' is standard for ResNet.
-    # Make sure your pruned model has a 'layer4' attribute.
     try:
         target_layers = [model.layer4]
     except AttributeError:
         print(f"[ERROR] Could not find 'layer4' in model {model_name}. Skipping Grad-CAM.")
         return
 
-    # Initialize GradCAM
-    # Initialize GradCAM
-    cam = GradCAM(model=model, target_layers=target_layers)
+    # [تغییر کلیدی] مدل را با پوشش به GradCAM می‌دهیم
+    wrapped_model = ModelWrapper(model)
+    cam = GradCAM(model=wrapped_model, target_layers=target_layers)
 
-    # We only need to run on a few samples
     samples_generated = 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
         
-        # Get model's prediction
         with torch.no_grad():
             outputs = model(images)
             if isinstance(outputs, (tuple, list)):
@@ -1158,35 +1157,23 @@ def generate_grad_cam_for_model(model, loader, device, model_name, save_dir, cla
             probs = torch.sigmoid(outputs)
             preds = (probs > 0.5).long()
 
+        # Generate the CAM
         grayscale_cam = cam(input_tensor=images)
         
-        # Iterate over the batch
         for i in range(images.shape[0]):
             if samples_generated >= num_samples:
                 break
             
-            # Get the original image and convert to numpy
-            # The image is normalized, so we need to un-normalize it for visualization
-            # Assuming mean and std are not applied in the test loader transform for simplicity here
-            # If they are, you would need to un-normalize
             rgb_img = images[i].cpu().numpy().transpose(1, 2, 0)
-            # The image might be out of [0, 1] range, so clip it
             rgb_img = np.clip(rgb_img, 0, 1)
-
-            # Get the grayscale CAM for this image
             grayscale_cam_i = grayscale_cam[i, :]
-
-            # Superimpose the CAM on the image
             visualization = show_cam_on_image(rgb_img, grayscale_cam_i, use_rgb=True)
 
-            # Create a descriptive filename
             pred_label = class_names[preds[i].item()]
             true_label = class_names[labels[i].item()]
             filename = f"{model_name}_sample_{samples_generated+1}_pred_{pred_label}_true_{true_label}.jpg"
             filepath = os.path.join(save_dir, filename)
 
-            # Save the visualization
-            # Convert from RGB to BGR for OpenCV saving
             visualization_bgr = cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR)
             cv2.imwrite(filepath, visualization_bgr)
             
