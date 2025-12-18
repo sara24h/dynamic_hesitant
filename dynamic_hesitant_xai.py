@@ -1142,7 +1142,8 @@ def generate_grad_cam_for_model(model, loader, device, model_name, save_dir, cla
         return
 
     # Initialize GradCAM
-    cam = GradCAM(model=model, target_layers=target_layers, use_cuda=device.type == 'cuda')
+    # Initialize GradCAM
+    cam = GradCAM(model=model, target_layers=target_layers)
 
     # We only need to run on a few samples
     samples_generated = 0
