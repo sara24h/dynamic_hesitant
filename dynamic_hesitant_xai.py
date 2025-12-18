@@ -397,9 +397,34 @@ def load_pruned_models(model_paths: List[str], device: torch.device, rank: int) 
             print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
      
         try:
+            # Load checkpoint to CPU first to inspect it
             ckpt = torch.load(path, map_location='cpu', weights_only=False)
-            model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
+            
+            # --- شروع تغییرات ---
+            # Move masks to the target device before passing them to the model constructor
+            masks_on_device = {}
+            if isinstance(ckpt['masks'], dict):
+                for key, value in ckpt['masks'].items():
+                    if isinstance(value, torch.Tensor):
+                        masks_on_device[key] = value.to(device)
+                    else:
+                        masks_on_device[key] = value
+            elif isinstance(ckpt['masks'], list):
+                masks_on_device = [m.to(device) if isinstance(m, torch.Tensor) else m for m in ckpt['masks']]
+            else: # Fallback for single tensor or other types
+                if isinstance(ckpt['masks'], torch.Tensor):
+                    masks_on_device = ckpt['masks'].to(device)
+                else:
+                    masks_on_device = ckpt['masks']
+            # --- پایان تغییرات ---
+
+            # Initialize the model with masks already on the correct device
+            model = ResNet_50_pruned_hardfakevsreal(masks=masks_on_device)
+            
+            # Load the rest of the state dict. map_location ensures tensors are moved correctly.
             model.load_state_dict(ckpt['model_state_dict'])
+            
+            # A final .to(device) is good practice, though it might be redundant now
             model = model.to(device).eval()
          
             if rank == 0:
