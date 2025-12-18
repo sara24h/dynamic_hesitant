@@ -13,7 +13,7 @@ import numpy as np
 
 # Import custom modules
 from utils import set_seed
-from datasets import create_dataloaders_ddp
+from datasets.base_dataset import create_dataloaders_ddp, set_seed
 from models import FuzzyHesitantEnsemble, load_pruned_models
 
 warnings.filterwarnings("ignore")
