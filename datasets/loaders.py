@@ -1,10 +1,5 @@
 # dynamic_hesitant/datasets/loaders.py
 
-"""
-This module contains helper functions and classes for dataset handling.
-It includes custom datasets, data splitting logic, and dataset-specific preparation functions.
-"""
-
 import os
 import warnings
 import random
@@ -19,30 +14,14 @@ from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
-# ====================== SEED SETUP ======================
-def set_seed(seed: int = 42):
-    """Sets seed for reproducibility across libraries."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    print(f"[SEED] All random seeds set to: {seed}")
- 
 def worker_init_fn(worker_id):
     """Initializes worker processes for DataLoader with a unique seed."""
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-# ====================== CUSTOM DATASET CLASSES ======================
 class UADFVDataset(Dataset):
-    """
-    Custom Dataset for UADFV dataset structure.
-    Expects a directory with 'fake/frames' and 'real/frames' subdirectories.
-    """
+    """Custom Dataset for UADFV dataset structure."""
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
@@ -83,17 +62,14 @@ class UADFVDataset(Dataset):
         return image, label
 
 class TransformSubset(Subset):
-    """
-    A Subset class that applies a transform to the items.
-    This is useful for applying different transforms to train/val/test splits.
-    """
+    """A Subset class that applies a transform to the items."""
     def __init__(self, dataset, indices, transform):
         super().__init__(dataset, indices)
         self.transform = transform
    
     def __getitem__(self, idx):
         # This handles ImageFolder datasets
-        if hasattr(self.dataset, 'samples'):
+        if hasattr(self.dataset, 'samples') and hasattr(self.dataset, 'loader'):
             img_path, label = self.dataset.samples[self.indices[idx]]
             img = self.dataset.loader(img_path)
         # This handles custom datasets like UADFVDataset
@@ -105,38 +81,23 @@ class TransformSubset(Subset):
             img = self.transform(img)
         return img, label
 
-# ====================== DATASET SPLIT FUNCTIONS ======================
 def create_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    """
-    Create reproducible train/val/test splits from a dataset.
-    """
+    """Create reproducible train/val/test splits from a dataset."""
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
-   
     num_samples = len(dataset)
     indices = list(range(num_samples))
-   
-    # Get labels for stratified split
     labels = [dataset.samples[i][1] for i in indices]
-   
-    # First split: separate test set
+    
     train_val_indices, test_indices = train_test_split(
-        indices,
-        test_size=test_ratio,
-        random_state=seed,
-        stratify=labels
+        indices, test_size=test_ratio, random_state=seed, stratify=labels
     )
-   
-    # Second split: separate train and val
     train_val_labels = [labels[i] for i in train_val_indices]
     val_size = val_ratio / (train_ratio + val_ratio)
-   
+    
     train_indices, val_indices = train_test_split(
-        train_val_indices,
-        test_size=val_size,
-        random_state=seed,
-        stratify=train_val_labels
+        train_val_indices, test_size=val_size, random_state=seed, stratify=train_val_labels
     )
-   
+    
     return train_indices, val_indices, test_indices
 
 def prepare_real_fake_dataset(base_dir, seed=42):
