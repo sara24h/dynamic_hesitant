@@ -1158,12 +1158,7 @@ def generate_grad_cam_for_model(model, loader, device, model_name, save_dir, cla
             probs = torch.sigmoid(outputs)
             preds = (probs > 0.5).long()
 
-        # We want to visualize the reasoning for the predicted class
-        # The target for GradCAM is the output logit corresponding to the predicted class
-        targets = [ClassifierOutputTarget(pred.item()) for pred in preds]
-
-        # Generate the CAM
-        grayscale_cam = cam(input_tensor=images, targets=targets)
+        grayscale_cam = cam(input_tensor=images)
         
         # Iterate over the batch
         for i in range(images.shape[0]):
