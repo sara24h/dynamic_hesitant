@@ -1010,13 +1010,12 @@ def main():
         args.data_dir, args.batch_size, rank, world_size, dataset_type=args.dataset
     )
  
-        if is_main:
+    if is_main:
         print("\n" + "="*70)
         print("EVALUATING INDIVIDUAL MODELS ON TEST SET (Before Training)")
         print("="*70)
         individual_accs = []
-        
-        # [مهم] این بخش را اضافه کنید: تعریف متغیر grad_cam_save_dir
+
         grad_cam_save_dir = os.path.join(args.save_dir, 'grad_cams')
         os.makedirs(grad_cam_save_dir, exist_ok=True)
 
@@ -1032,12 +1031,12 @@ def main():
                 device=device,
                 model_name=MODEL_NAMES[i],
                 save_dir=model_grad_cam_dir,
-                num_samples=5  # تعداد نمونه‌ها برای هر مدل
+                num_samples=5
             )
-        
         best_single = max(individual_accs)
         best_idx = individual_accs.index(best_single)
         print(f"\nBest Single Model: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+      
      
     dist.barrier()
    
