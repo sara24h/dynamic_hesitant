@@ -18,7 +18,7 @@ import random
 from sklearn.model_selection import train_test_split
 from PIL import Image
 import cv2
-from pytorch_grad_cam import EigenCAM
+from pytorch_grad_cam import ScoreCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 warnings.filterwarnings("ignore")
@@ -1121,93 +1121,71 @@ class ModelWrapper(nn.Module):
         self.model = model
 
     def forward(self, x):
-        # The model returns a tuple, we only need the first element (the logits)
         output = self.model(x)
         if isinstance(output, (tuple, list)):
             return output[0]
         return output
 
-# [تابع اصلاح شده و نهایی]
+# [تابع اصلاح شده با ScoreCAM]
 def generate_grad_cam_for_model(model, loader, device, model_name, save_dir, class_names=['fake', 'real'], num_samples=5):
     """
-    Generates and saves Grad-CAM visualizations for a given model.
-    This function temporarily enables gradients for the model.
+    Generates and saves ScoreCAM visualizations for a given model.
+    ScoreCAM is a gradient-free method that can work with complex or pruned models.
     """
-    print(f"\n[Grad-CAM] Generating visualizations for {model_name}...")
+    print(f"\n[ScoreCAM] Generating visualizations for {model_name}...")
     
     os.makedirs(save_dir, exist_ok=True)
 
     try:
         target_layers = [model.layer4]
     except AttributeError:
-        print(f"[ERROR] Could not find 'layer4' in model {model_name}. Skipping Grad-CAM.")
+        print(f"[ERROR] Could not find 'layer4' in model {model_name}. Skipping CAM.")
         return
 
-    # [شروع بخش کلیدی برای حل مشکل]
-    # Store original training state and requires_grad setting
-    model_was_in_training = model.training
-    original_param_states = {}
-    for name, param in model.named_parameters():
-        original_param_states[name] = param.requires_grad
-
-    # Temporarily enable gradients and set model to train mode
-    model.train()
-    for param in model.parameters():
-        param.requires_grad = True
-    # [پایان بخش کلیدی]
-
-    # Use the wrapper to ensure GradCAM gets a tensor output
+    # [تغییر کلیدی] از ScoreCAM استفاده می‌کنیم
+    # برای ScoreCAM باید مدل را در حالت eval قرار دهیم و گرادیان‌ها را غیرفعال کنیم
+    model.eval()
     wrapped_model = ModelWrapper(model)
-    cam = EigenCAM(model=wrapped_model, target_layers=target_layers)
+    cam = ScoreCAM(model=wrapped_model, target_layers=target_layers)
 
-    try:
-        samples_generated = 0
-        for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
-            
-            # Get model's prediction for naming the output file
-            with torch.no_grad(): # We don't need gradients for this part
-                outputs = model(images)
-                if isinstance(outputs, (tuple, list)):
-                    outputs = outputs[0]
-                probs = torch.sigmoid(outputs)
-                preds = (probs > 0.5).long()
+    samples_generated = 0
+    for images, labels in loader:
+        images, labels = images.to(device), labels.to(device)
+        
+        # Get model's prediction for naming the output file
+        with torch.no_grad():
+            outputs = model(images)
+            if isinstance(outputs, (tuple, list)):
+                outputs = outputs[0]
+            probs = torch.sigmoid(outputs)
+            preds = (probs > 0.5).long()
 
-            # Generate the CAM (gradients are calculated here)
-            grayscale_cam = cam(input_tensor=images)
-            
-            for i in range(images.shape[0]):
-                if samples_generated >= num_samples:
-                    break
-                
-                rgb_img = images[i].cpu().numpy().transpose(1, 2, 0)
-                rgb_img = np.clip(rgb_img, 0, 1)
-                grayscale_cam_i = grayscale_cam[i, :]
-                visualization = show_cam_on_image(rgb_img, grayscale_cam_i, use_rgb=True)
-
-                pred_label = class_names[preds[i].item()]
-                true_label = class_names[labels[i].item()]
-                filename = f"{model_name}_sample_{samples_generated+1}_pred_{pred_label}_true_{true_label}.jpg"
-                filepath = os.path.join(save_dir, filename)
-
-                visualization_bgr = cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(filepath, visualization_bgr)
-                
-                samples_generated += 1
-
+        # Generate the CAM (ScoreCAM does not need gradients)
+        grayscale_cam = cam(input_tensor=images)
+        
+        for i in range(images.shape[0]):
             if samples_generated >= num_samples:
                 break
-                
-    finally:
-        # [شروع بخش بازگرداندن به حالت اولیه]
-        # Restore original training state and requires_grad settings
-        if not model_was_in_training:
-            model.eval()
-        for name, param in model.named_parameters():
-            param.requires_grad = original_param_states[name]
-        # [پایان بخش بازگرداندن]
             
-    print(f"[Grad-CAM] Finished generating {num_samples} visualizations for {model_name} in {save_dir}")
+            rgb_img = images[i].cpu().numpy().transpose(1, 2, 0)
+            rgb_img = np.clip(rgb_img, 0, 1)
+            grayscale_cam_i = grayscale_cam[i, :]
+            visualization = show_cam_on_image(rgb_img, grayscale_cam_i, use_rgb=True)
+
+            pred_label = class_names[preds[i].item()]
+            true_label = class_names[labels[i].item()]
+            filename = f"{model_name}_sample_{samples_generated+1}_pred_{pred_label}_true_{true_label}.jpg"
+            filepath = os.path.join(save_dir, filename)
+
+            visualization_bgr = cv2.cvtColor(visualization, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(filepath, visualization_bgr)
+            
+            samples_generated += 1
+
+        if samples_generated >= num_samples:
+            break
+            
+    print(f"[ScoreCAM] Finished generating {num_samples} visualizations for {model_name} in {save_dir}")
  
 if __name__ == "__main__":
     main()
