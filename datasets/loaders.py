@@ -1,3 +1,5 @@
+# dynamic_hesitant/datasets/loaders.py
+
 import os
 import warnings
 import random
@@ -12,6 +14,25 @@ from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
+# ====================== SEED SETUP ======================
+def set_seed(seed: int = 42):
+    """Sets the seed for reproducibility across libraries."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"[SEED] All random seeds set to: {seed}")
+ 
+def worker_init_fn(worker_id):
+    """Initializes worker processes for DataLoader with a unique seed."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+# ====================== CUSTOM DATASET CLASSES ======================
 class UADFVDataset(Dataset):
     """
     Custom Dataset for UADFV dataset structure.
@@ -57,6 +78,10 @@ class UADFVDataset(Dataset):
         return image, label
 
 class TransformSubset(Subset):
+    """
+    A Subset class that applies a transform to the items.
+    This is useful for applying different transforms to train/val/test splits.
+    """
     def __init__(self, dataset, indices, transform):
         super().__init__(dataset, indices)
         self.transform = transform
@@ -75,14 +100,10 @@ class TransformSubset(Subset):
             img = self.transform(img)
         return img, label
 
-def worker_init_fn(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
+# ====================== DATASET SPLIT FUNCTIONS ======================
 def create_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
     """
-    Create reproducible train/val/test splits from a dataset
+    Create reproducible train/val/test splits from a dataset.
     """
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
    
@@ -114,6 +135,7 @@ def create_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_rat
     return train_indices, val_indices, test_indices
 
 def prepare_real_fake_dataset(base_dir, seed=42):
+    """Prepares the real_and_fake_face dataset."""
     if os.path.exists(os.path.join(base_dir, 'training_fake')) and \
        os.path.exists(os.path.join(base_dir, 'training_real')):
         real_fake_dir = base_dir
@@ -150,6 +172,7 @@ def prepare_real_fake_dataset(base_dir, seed=42):
     return full_dataset, train_indices, val_indices, test_indices
 
 def prepare_hard_fake_real_dataset(base_dir, seed=42):
+    """Prepares the hardfakevsrealfaces dataset."""
     if os.path.exists(os.path.join(base_dir, 'fake')) and \
        os.path.exists(os.path.join(base_dir, 'real')):
         dataset_dir = base_dir
@@ -186,6 +209,7 @@ def prepare_hard_fake_real_dataset(base_dir, seed=42):
     return full_dataset, train_indices, val_indices, test_indices
 
 def prepare_deepflux_dataset(base_dir, seed=42):
+    """Prepares the DeepFLUX dataset."""
     if os.path.exists(os.path.join(base_dir, 'Fake')) and \
        os.path.exists(os.path.join(base_dir, 'Real')):
         dataset_dir = base_dir
@@ -222,10 +246,7 @@ def prepare_deepflux_dataset(base_dir, seed=42):
     return full_dataset, train_indices, val_indices, test_indices
 
 def prepare_uadfV_dataset(base_dir, seed=42):
-    """
-    Prepares the UADFV dataset for splitting.
-    Assumes the base_dir is the root of the UADFV folder.
-    """
+    """Prepares the UADFV dataset for splitting."""
     if not os.path.exists(base_dir):
         raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
 
