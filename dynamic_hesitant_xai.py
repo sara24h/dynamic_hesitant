@@ -882,9 +882,20 @@ def main():
     SEED = 42
     set_seed(SEED)
   
-    rank, local_rank, world_size = setup_ddp()
-    device = torch.device(f'cuda:{local_rank}')
-    is_main = (rank == 0)
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        # در حال اجرا با torchrun — DDP فعال
+        rank, local_rank, world_size = setup_ddp()
+        device = torch.device(f'cuda:{local_rank}')
+        is_main = (rank == 0)
+        print(f"[Rank {rank}] Running in DDP mode with world_size={world_size}")
+    else:
+        # اجرا با python معمولی — تک GPU
+        rank = 0
+        local_rank = 0
+        world_size = 1
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        is_main = True
+        print("Running in single-GPU mode (no DDP)")
   
     parser = argparse.ArgumentParser(description="Train Fuzzy Hesitant Ensemble with DDP")
     parser.add_argument('--epochs', type=int, default=30)
