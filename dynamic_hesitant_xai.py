@@ -71,7 +71,7 @@ def worker_init_fn(worker_id):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-# ====================== DATASET SPLIT FUNCTIONS ======================
+
 def create_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
     """
     Create reproducible train/val/test splits from a dataset
@@ -916,86 +916,75 @@ def main():
     vis_loader = DataLoader(test_loader.dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
     num_vis = args.num_grad_cam_samples
 
-    for idx, (image, label) in enumerate(vis_loader):
+    for idx, (image, label_from_loader) in enumerate(vis_loader):
         if idx >= num_vis:
             break
+
         image = image.to(device)
-        label = label.item()
-        original_dataset = test_loader.dataset
-        actual_idx = original_dataset.indices[idx]  # ایندکس واقعی در full_dataset
+
+        # استخراج مسیر و لیبل واقعی از full dataset (توصیه‌شده و دقیق)
+        original_dataset = test_loader.dataset  # این یک Subset است
+        actual_idx = original_dataset.indices[idx]
         img_path, true_label = original_dataset.dataset.samples[actual_idx]
-        
+
         print(f"\n[GradCAM {idx+1}/{num_vis}]")
         print(f"  Original image path: {img_path}")
         print(f"  True label: {'real' if true_label == 1 else 'fake'} (label={true_label})")
-        if isinstance(original_dataset, Subset):
-            actual_idx = original_dataset.indices[idx]  # اگر Subset باشد
-            img_path = original_dataset.dataset.samples[actual_idx][0]
-        elif hasattr(original_dataset, 'samples'):  # برای UADFVDataset یا ImageFolder
-            img_path = original_dataset.samples[idx][0]
-        else:
-            img_path = "Unknown path (custom dataset)"
 
-        print(f"\n[GradCAM {idx+1}/{num_vis}]")
-        print(f"  Original image path: {img_path}")
-        print(f"  True label: {'real' if label == 1 else 'fake'}")
-
+        # پیش‌بینی انسامبل
         with torch.no_grad():
             output, weights, _, _ = ensemble(image, return_details=True)
-
         pred = 1 if output.squeeze().item() > 0 else 0
+        print(f"  Predicted: {'real' if pred == 1 else 'fake'}")
+
+        # بقیه کد GradCAM بدون تغییر...
         active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
         combined_cam = None
-
         for i in active_models:
             model = ensemble.models[i]
             for p in model.parameters():
                 p.requires_grad_(True)
-
-            target_layer = model.layer4[2].conv3
+            target_layer = model.layer4[2].conv3  # مطمئن شو این لایه در همه مدل‌ها وجود داره
             gradcam = GradCAM(model, target_layer)
-
             with torch.enable_grad():
                 x_n = ensemble.normalizations(image, i)
                 model_out = model(x_n)
-        
-        # ✅ اضافه کردن این بررسی
                 if isinstance(model_out, (tuple, list)):
                     model_out = model_out[0]
-        
                 model_out = model_out.squeeze()
                 score = model_out if pred == 1 else -model_out
                 cam = gradcam.generate(score)
-
             weight = weights[0, i].item()
             if combined_cam is None:
                 combined_cam = weight * cam
             else:
                 combined_cam += weight * cam
-
+            # برگرداندن requires_grad به False
             for p in model.parameters():
                 p.requires_grad_(False)
 
         if combined_cam is not None:
             combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
             img_np = image[0].cpu().permute(1, 2, 0).numpy()
-
             img_h, img_w = img_np.shape[:2]
             combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h))
-    
+
             heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
             heatmap = np.float32(heatmap) / 255
             overlay = heatmap + img_np
             overlay = overlay / overlay.max()
 
-            save_path = os.path.join(vis_dir, f"sample_{idx}_label_{label}_pred_{pred}.png")
-            plt.figure(figsize=(8, 8))
+            # بهتره از true_label برای نام فایل استفاده کنی نه label_from_loader
+            save_path = os.path.join(vis_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+            
+            plt.figure(figsize=(10, 10))
             plt.imshow(overlay)
-            plt.title(f"Label: {'real' if label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
+            plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
             plt.axis('off')
-            plt.savefig(save_path, bbox_inches='tight', dpi=150)
+            plt.savefig(save_path, bbox_inches='tight', dpi=200)
             plt.close()
-            print(f"GradCAM saved: {save_path}")
+            
+            print(f"  GradCAM saved: {save_path}")
 
     print("="*70)
     print("GradCAM visualizations completed!")
