@@ -921,6 +921,18 @@ def main():
             break
         image = image.to(device)
         label = label.item()
+        original_dataset = test_loader.dataset
+        if isinstance(original_dataset, Subset):
+            actual_idx = original_dataset.indices[idx]  # اگر Subset باشد
+            img_path = original_dataset.dataset.samples[actual_idx][0]
+        elif hasattr(original_dataset, 'samples'):  # برای UADFVDataset یا ImageFolder
+            img_path = original_dataset.samples[idx][0]
+        else:
+            img_path = "Unknown path (custom dataset)"
+
+        print(f"\n[GradCAM {idx+1}/{num_vis}]")
+        print(f"  Original image path: {img_path}")
+        print(f"  True label: {'real' if label == 1 else 'fake'}")
 
         with torch.no_grad():
             output, weights, _, _ = ensemble(image, return_details=True)
