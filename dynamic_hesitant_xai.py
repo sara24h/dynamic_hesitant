@@ -777,7 +777,7 @@ def main():
     parser.add_argument('--data_dir', type=str, required=True, help='Base directory of dataset')
     parser.add_argument('--model_paths', type=str, nargs='+', required=True, help='Paths to pruned model checkpoints')
     parser.add_argument('--model_names', type=str, nargs='+', required=True, help='Names for each model')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints')
+    parser.add_argument('--save_dir', type=str, default='/kaggle/working/')
     parser.add_argument('--seed', type=int, default=SEED, help='Random seed for reproducibility')
   
     args = parser.parse_args()
