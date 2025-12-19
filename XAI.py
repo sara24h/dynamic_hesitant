@@ -51,7 +51,7 @@ def visualize_grad_cam(model, image_tensor, target_layers, class_index, mean, st
     plt.figure(figsize=(12, 6))
     
     plt.subplot(1, 2, 1)
-    plt.imshow(denormalized_img) # نمایش تصویر دنورمالایز شده
+    plt.imshow(denormalized_img)
     plt.title(f'Original Image (Predicted: {"Real" if class_index == 1 else "Fake"})')
     plt.axis('off')
     
@@ -59,6 +59,9 @@ def visualize_grad_cam(model, image_tensor, target_layers, class_index, mean, st
     plt.imshow(visualization)
     plt.title(f'Grad-CAM for Class {"Real" if class_index == 1 else "Fake"}')
     plt.axis('off')
+    
+    # *** اضافه کردن این خط برای ذخیره تصویر ***
+    plt.savefig('grad_cam_result.png')
     
     plt.show()
 
