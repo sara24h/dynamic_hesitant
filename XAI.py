@@ -10,7 +10,6 @@ import torch.nn.functional as F
 
 # کتابخانه‌های مورد نیاز برای Grad-CAM
 from pytorch_grad_cam import GradCAM
-# *** تغییر ۱: وارد کردن کلاس صحیح برای مسائل دو کلاسه ***
 from pytorch_grad_cam.utils.model_targets import BinaryClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
@@ -28,8 +27,6 @@ def visualize_grad_cam(model, image_tensor, target_layers, class_index, mean, st
     # ساخت نمونه Grad-CAM
     cam = GradCAM(model=model, target_layers=target_layers)
     
-    # *** تغییر ۲: استفاده از BinaryClassifierOutputTarget ***
-    # این کلاس برای مسائل دو کلاسه (مانند Real/Fake) مناسب است.
     targets = [BinaryClassifierOutputTarget(class_index)]
     
     # اجرای Grad-CAM
@@ -37,19 +34,24 @@ def visualize_grad_cam(model, image_tensor, target_layers, class_index, mean, st
     grayscale_cam = grayscale_cam[0, :]
     
     # --- بخش اصلاح شده برای نمایش بهتر تصویر ---
+    # 1. تبدیل تنسور نرمال‌شده به numpy
     normalized_img = image_tensor.cpu().numpy()
-    denormalized_img = np.transpose(normalized_img, (1, 2, 0))
-    denormalized_img = denormalized_img * std + mean
-    denormalized_img = np.clip(denormalized_img, 0, 1)
     
-    rgb_img_for_cam = np.transpose(normalized_img, (1, 2, 0))
-    visualization = show_cam_on_image(rgb_img_for_cam, grayscale_cam, use_rgb=True)
+    # 2. دِنورمالایز کردن تصویر برای نمایش
+    # فرمول: (img * std) + mean
+    denormalized_img = np.transpose(normalized_img, (1, 2, 0)) # به [H, W, C] تبدیل کن
+    denormalized_img = denormalized_img * std + mean
+    denormalized_img = np.clip(denormalized_img, 0, 1) # مقادیر را بین 0 و 1 محدود کن
+    
+    # 3. ادغام نقشه حرارتی با تصویر اصلی
+    # *** تغییر کلیدی: استفاده از تصویر دنورمالایز شده که در محدوده [0, 1] است ***
+    visualization = show_cam_on_image(denormalized_img, grayscale_cam, use_rgb=True)
     
     # نمایش نتایج
     plt.figure(figsize=(12, 6))
     
     plt.subplot(1, 2, 1)
-    plt.imshow(denormalized_img)
+    plt.imshow(denormalized_img) # نمایش تصویر دنورمالایز شده
     plt.title(f'Original Image (Predicted: {"Real" if class_index == 1 else "Fake"})')
     plt.axis('off')
     
