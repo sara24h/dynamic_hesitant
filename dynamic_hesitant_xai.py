@@ -864,17 +864,17 @@ class GradCAM:
         self.target_layer.register_forward_hook(forward_hook)
         self.target_layer.register_backward_hook(backward_hook)
 
-    def generate(self, input_image, score):
-        self.model.eval()
-        logit = self.model(input_image)
+    def generate(self, score):
         self.model.zero_grad()
         score.backward()
+        if self.gradients is None:
+            raise ValueError("Gradients not captured - ensure forward pass happened after hooking.")
         gradients = self.gradients[0]
         activations = self.activations[0]
         weights = gradients.mean(dim=[1, 2], keepdim=True)
         cam = (weights * activations).sum(dim=0)
         cam = F.relu(cam)
-        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), input_image.shape[2:], mode='bilinear', align_corners=False)
+        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), activations.shape[2:], mode='bilinear', align_corners=False)
         cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
         return cam.squeeze().cpu().numpy()
 
@@ -1070,6 +1070,9 @@ def main():
             combined_cam = None
             for i in active_models:
                 model = ensemble.module.models[i]
+                # Temporarily enable requires_grad for parameters to allow gradient flow
+                for p in model.parameters():
+                    p.requires_grad = True
                 # Assume target layer for ResNet50-pruned (adjust if necessary)
                 target_layer = model.layer4[2].conv3  # Last conv in last bottleneck
                 gradcam = GradCAM(model, target_layer)
@@ -1081,12 +1084,15 @@ def main():
                         score = model_out  # For positive class (real)
                     else:
                         score = -model_out  # For negative class (fake)
-                    cam = gradcam.generate(x_n, score)
+                    cam = gradcam.generate(score)
                 weight = weights[0, i].item()
                 if combined_cam is None:
                     combined_cam = weight * cam
                 else:
                     combined_cam += weight * cam
+                # Set back to False if needed (optional since end of script)
+                for p in model.parameters():
+                    p.requires_grad = False
             # Normalize combined CAM
             if combined_cam is not None:
                 combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
