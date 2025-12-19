@@ -961,7 +961,11 @@ def main():
         if combined_cam is not None:
             combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
             img_np = image[0].cpu().permute(1, 2, 0).numpy()
-            heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam), cv2.COLORMAP_JET)
+
+            img_h, img_w = img_np.shape[:2]
+            combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h))
+    
+            heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
             heatmap = np.float32(heatmap) / 255
             overlay = heatmap + img_np
             overlay = overlay / overlay.max()
