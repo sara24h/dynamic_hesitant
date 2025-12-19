@@ -755,7 +755,7 @@ class GradCAM:
         weights = gradients.mean(dim=[1, 2], keepdim=True)
         cam = (weights * activations).sum(dim=0)
         cam = F.relu(cam)
-        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), activations.shape[2:], mode='bilinear', align_corners=False)
+        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), activations.shape[1:], mode='bilinear', align_corners=False)
         cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
         return cam.squeeze().cpu().numpy()
 
