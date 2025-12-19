@@ -727,7 +727,6 @@ def evaluate_accuracy(model, loader, device):
     acc = 100. * correct / total
     return acc
 
-
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -746,204 +745,19 @@ class GradCAM:
         self.target_layer.register_forward_hook(forward_hook)
         self.target_layer.register_backward_hook(backward_hook)
 
-    def generate(self, output, target_class=None):
-        """
-        Generate GradCAM heatmap
-        Args:
-            output: Model output tensor (must have requires_grad=True)
-            target_class: Optional target class index (for multi-class)
-        """
+    def generate(self, score):
         self.model.zero_grad()
-        
-        # For binary classification, use the output directly
-        if target_class is None:
-            score = output.squeeze()
-        else:
-            score = output[:, target_class]
-        
-        # Backward pass
-        score.backward(retain_graph=True)
-        
+        score.backward()
         if self.gradients is None:
-            raise ValueError("Gradients not captured")
-        
-        # Get first batch item
-        gradients = self.gradients[0]  # [C, H, W]
-        activations = self.activations[0]  # [C, H, W]
-        
-        # Global average pooling of gradients
-        weights = gradients.mean(dim=[1, 2], keepdim=True)  # [C, 1, 1]
-        
-        # Weighted combination
-        cam = (weights * activations).sum(dim=0)  # [H, W]
-        
-        # ReLU to keep only positive influences
+            raise ValueError("Gradients not captured - ensure forward pass happened after hooking.")
+        gradients = self.gradients[0]
+        activations = self.activations[0]
+        weights = gradients.mean(dim=[1, 2], keepdim=True)
+        cam = (weights * activations).sum(dim=0)
         cam = F.relu(cam)
-        
-        # Normalize to [0, 1]
-        cam = cam - cam.min()
-        cam = cam / (cam.max() + 1e-8)
-        
-        return cam.cpu().numpy()
-
-
-# ==================== GRADCAM VISUALIZATION (FIXED) ====================
-def visualize_gradcam_ensemble(ensemble, test_loader, device, model_names, save_dir, num_samples=5):
-    """
-    Generate GradCAM visualizations for the first num_samples from test set
-    """
-    print("="*70)
-    print("GENERATING GRADCAM VISUALIZATIONS FOR ENSEMBLE OUTPUT")
-    print("="*70)
-
-    ensemble.eval()
-    vis_dir = os.path.join(save_dir, 'gradcam_vis')
-    os.makedirs(vis_dir, exist_ok=True)
-
-    # Create a loader with batch_size=1 and shuffle for random samples
-    vis_loader = DataLoader(
-        test_loader.dataset, 
-        batch_size=1, 
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False
-    )
-
-    sample_count = 0
-    
-    for idx, (image, label) in enumerate(vis_loader):
-        if sample_count >= num_samples:
-            break
-            
-        image = image.to(device)
-        label_val = label.item()
-
-        # Get ensemble prediction
-        with torch.no_grad():
-            output, weights, _, _ = ensemble(image, return_details=True)
-            pred_val = 1 if output.squeeze().item() > 0 else 0
-
-        # Find active models (weight > threshold)
-        active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
-        
-        if len(active_models) == 0:
-            print(f"[WARNING] No active models for sample {sample_count}, skipping...")
-            continue
-
-        print(f"\nProcessing sample {sample_count + 1}/{num_samples}")
-        print(f" Label: {'Real' if label_val == 1 else 'Fake'} | Pred: {'Real' if pred_val == 1 else 'Fake'}")
-        print(f" Active models: {[model_names[i] for i in active_models]}")
-
-        combined_cam = None
-
-        # Generate GradCAM for each active model
-        for model_idx in active_models:
-            model = ensemble.models[model_idx]
-            
-            # Enable gradients for this model temporarily
-            for p in model.parameters():
-                p.requires_grad_(True)
-            
-            # Get target layer (assumes ResNet architecture)
-            try:
-                target_layer = model.layer4[2].conv3
-            except AttributeError:
-                print(f"[WARNING] Could not find layer4[2].conv3 in model {model_idx}, skipping...")
-                for p in model.parameters():
-                    p.requires_grad_(False)
-                continue
-            
-            # Create GradCAM object
-            gradcam = GradCAM(model, target_layer)
-            
-            # Forward pass with gradients enabled
-            model.train()  # Enable gradient computation
-            x_normalized = ensemble.normalizations(image, model_idx)
-            x_normalized.requires_grad_(True)
-            
-            model_output = model(x_normalized)
-            
-            # Handle tuple/list outputs
-            if isinstance(model_output, (tuple, list)):
-                model_output = model_output[0]
-            
-            # Generate CAM
-            try:
-                cam = gradcam.generate(model_output)
-                
-                # Weight by ensemble weight
-                model_weight = weights[0, model_idx].item()
-                
-                if combined_cam is None:
-                    combined_cam = model_weight * cam
-                else:
-                    combined_cam += model_weight * cam
-                
-                print(f"  ✓ Model {model_idx} ({model_names[model_idx]}): weight={model_weight:.3f}")
-                
-            except Exception as e:
-                print(f"  ✗ Model {model_idx} failed: {e}")
-            
-            # Disable gradients again
-            model.eval()
-            for p in model.parameters():
-                p.requires_grad_(False)
-
-        # Visualize combined CAM
-        if combined_cam is not None:
-            # Normalize combined CAM
-            combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
-            
-            # Get original image
-            img_np = image[0].cpu().permute(1, 2, 0).numpy()
-            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())  # Normalize to [0,1]
-            
-            # Resize CAM to match image size
-            img_h, img_w = img_np.shape[:2]
-            combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h))
-            
-            # Create heatmap
-            heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
-            heatmap = np.float32(heatmap) / 255
-            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-            
-            # Overlay heatmap on image
-            overlay = 0.6 * img_np + 0.4 * heatmap
-            overlay = overlay / overlay.max()
-            
-            # Save visualization
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-            
-            axes[0].imshow(img_np)
-            axes[0].set_title('Original Image')
-            axes[0].axis('off')
-            
-            axes[1].imshow(combined_cam_resized, cmap='jet')
-            axes[1].set_title('GradCAM Heatmap')
-            axes[1].axis('off')
-            
-            axes[2].imshow(overlay)
-            axes[2].set_title(f'Overlay\nLabel: {"Real" if label_val==1 else "Fake"} | Pred: {"Real" if pred_val==1 else "Fake"}')
-            axes[2].axis('off')
-            
-            save_path = os.path.join(vis_dir, f'sample_{sample_count:02d}_label_{label_val}_pred_{pred_val}.png')
-            plt.tight_layout()
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            plt.close()
-            
-            print(f"  ✓ Saved: {save_path}")
-            sample_count += 1
-        else:
-            print(f"  ✗ No CAM generated for this sample")
-
-    print("\n" + "="*70)
-    print(f"GradCAM visualization completed! Generated {sample_count} visualizations.")
-    print(f"Saved to: {vis_dir}")
-    print("="*70)
-
-
-
-    
+        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), activations.shape[1:], mode='bilinear', align_corners=False)
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        return cam.squeeze().cpu().numpy()
 
 def main():
     SEED = 42
@@ -1169,13 +983,5 @@ def main():
     print("GradCAM visualizations completed!")
     print("="*70)
 
-visualize_gradcam_ensemble(
-        ensemble=ensemble,
-        test_loader=test_loader,
-        device=device,
-        model_names=MODEL_NAMES,
-        save_dir=args.save_dir,
-        num_samples=args.num_grad_cam_samples
-    )
 if __name__ == "__main__":
     main()
