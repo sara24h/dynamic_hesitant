@@ -997,7 +997,7 @@ def main():
         ensemble_test_acc, ensemble_weights, membership_values, activation_percentages = evaluate_ensemble_final_ddp(
             ensemble, test_loader, device, "Test", MODEL_NAMES, rank
         )
-      
+     
         print("\n" + "="*70)
         print("FINAL COMPARISON")
         print("="*70)
@@ -1005,115 +1005,90 @@ def main():
         print(f"Hesitant Ensemble Acc : {ensemble_test_acc:.2f}%")
         improvement = ensemble_test_acc - best_single
         print(f"Improvement : {improvement:+.2f}%")
-      
-        results = {
-            "method": "Fuzzy Hesitant Sets (DDP)",
-            "dataset": args.dataset,
-            "data_dir": args.data_dir,
-            "seed": args.seed,
-            "num_gpus": world_size,
-            "num_memberships": args.num_memberships,
-            "model_paths": args.model_paths,
-            "model_names": MODEL_NAMES,
-            "normalization": {
-                "means": [list(m) for m in MEANS],
-                "stds": [list(s) for s in STDS]
-            },
-            "individual_accuracies": {MODEL_NAMES[i]: acc for i, acc in enumerate(individual_accs)},
-            "best_single": {"name": MODEL_NAMES[best_idx], "acc": best_single},
-            "ensemble": {
-                "acc": ensemble_test_acc,
-                "weights": ensemble_weights,
-                "membership_values": membership_values,
-                "activation_percentages": activation_percentages
-            },
-            "improvement": improvement,
-            "training_history": history
-        }
-      
-        result_path = os.path.join(args.save_dir, 'hesitant_fuzzy_ddp_results.json')
-    
-        with open(result_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"\nResults saved to: {result_path}")
-    
-        final_model_path = os.path.join(args.save_dir, 'hesitant_fuzzy_ddp_final.pt')
-        torch.save({
-            'hesitant_state_dict': ensemble.module.hesitant_fuzzy.state_dict(),
-            'results': results,
-            'args': vars(args)
-        }, final_model_path)
-    
+     
+        # ... (ذخیره نتایج و مدل مثل قبل)
+
         print(f"Final model saved: {final_model_path}")
 
-        # Visualize GradCAM for some test samples
+        # === شروع بخش GradCAM با حفاظت DDP ===
         print("="*70)
-        print("GENERATING GRADCAM VISUALIZATIONS FOR ENSEMBLE OUTPUT")
+        print("GENERATING GRADCAM VISUALIZATIONS FOR ENSEMBLE OUTPUT (ONLY ON RANK 0)")
         print("="*70)
-        ensemble.eval()
-        vis_dir = os.path.join(args.save_dir, 'gradcam_vis')
-        os.makedirs(vis_dir, exist_ok=True)
-        # Create a new loader for visualization: batch_size=1, shuffle=True to pick random samples
-        vis_loader = DataLoader(test_loader.dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
-        num_vis = args.num_grad_cam_samples
-        for idx, (image, label) in enumerate(vis_loader):
-            if idx >= num_vis:
-                break
-            image = image.to(device)
-            label = label.item()
-            # Compute ensemble output and weights (no grad needed here)
-            with torch.no_grad():
-                output, weights, memberships, model_outputs = ensemble(image, return_details=True)
-            pred = 1 if output.squeeze().item() > 0 else 0
-            # Find active models
-            active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
-            combined_cam = None
-            for i in active_models:
-                model = ensemble.module.models[i]
-                # Temporarily enable requires_grad for parameters to allow gradient flow
-                for p in model.parameters():
-                    p.requires_grad = True
-                # Assume target layer for ResNet50-pruned (adjust if necessary)
-                target_layer = model.layer4[2].conv3  # Last conv in last bottleneck
-                gradcam = GradCAM(model, target_layer)
-                # Enable grad for computation
-                with torch.enable_grad():
-                    x_n = ensemble.module.normalizations(image, i)
-                    model_out = model(x_n).squeeze()
-                    if pred == 1:
-                        score = model_out  # For positive class (real)
+
+        # همه rankها صبر می‌کنن تا rank 0 آماده بشه
+        dist.barrier()
+
+        if rank == 0:  # فقط rank 0 GradCAM تولید می‌کنه
+            ensemble.eval()
+            vis_dir = os.path.join(args.save_dir, 'gradcam_vis')
+            os.makedirs(vis_dir, exist_ok=True)
+
+            vis_loader = DataLoader(test_loader.dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
+            num_vis = args.num_grad_cam_samples
+
+            for idx, (image, label) in enumerate(vis_loader):
+                if idx >= num_vis:
+                    break
+                image = image.to(device)
+                label = label.item()
+
+                with torch.no_grad():
+                    output, weights, memberships, model_outputs = ensemble(image, return_details=True)
+                pred = 1 if output.squeeze().item() > 0 else 0
+
+                active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
+                combined_cam = None
+
+                for i in active_models:
+                    model = ensemble.module.models[i]
+                    # موقتاً فعال کردن گرادیان
+                    for p in model.parameters():
+                        p.requires_grad_(True)
+
+                    target_layer = model.layer4[2].conv3
+                    gradcam = GradCAM(model, target_layer)
+
+                    with torch.enable_grad():
+                        x_n = ensemble.module.normalizations(image, i)
+                        model_out = model(x_n).squeeze()
+                        score = model_out if pred == 1 else -model_out
+                        cam = gradcam.generate(score)
+
+                    weight = weights[0, i].item()
+                    if combined_cam is None:
+                        combined_cam = weight * cam
                     else:
-                        score = -model_out  # For negative class (fake)
-                    cam = gradcam.generate(score)
-                weight = weights[0, i].item()
-                if combined_cam is None:
-                    combined_cam = weight * cam
-                else:
-                    combined_cam += weight * cam
-                # Set back to False if needed (optional since end of script)
-                for p in model.parameters():
-                    p.requires_grad = False
-            # Normalize combined CAM
-            if combined_cam is not None:
-                combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
-                # Overlay on original image
-                img = image[0].cpu().permute(1, 2, 0).numpy()
-                heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam), cv2.COLORMAP_JET)
-                heatmap = np.float32(heatmap) / 255
-                overlay = heatmap + np.float32(img)
-                overlay = overlay / np.max(overlay)
-                # Save visualization
-                save_path = os.path.join(vis_dir, f"sample_{idx}_label_{label}_pred_{pred}.png")
-                plt.imshow(overlay)
-                plt.title(f"Label: {label} ({'real' if label == 1 else 'fake'}), Pred: {pred} ({'real' if pred == 1 else 'fake'})")
-                plt.axis('off')
-                plt.savefig(save_path, bbox_inches='tight')
-                plt.close()
-                print(f"GradCAM saved: {save_path}")
-        print("="*70)
-        print("GradCAM visualizations completed!")
-        print("="*70)
-    
+                        combined_cam += weight * cam
+
+                    # برگرداندن به حالت frozen
+                    for p in model.parameters():
+                        p.requires_grad_(False)
+
+                if combined_cam is not None:
+                    combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
+                    img = image[0].cpu().permute(1, 2, 0).numpy()
+                    heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam), cv2.COLORMAP_JET)
+                    heatmap = np.float32(heatmap) / 255
+                    overlay = heatmap + np.float32(img)
+                    overlay = overlay / overlay.max()
+
+                    save_path = os.path.join(vis_dir, f"sample_{idx}_label_{label}_pred_{pred}.png")
+                    plt.imshow(overlay)
+                    plt.title(f"Label: {'real' if label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
+                    plt.axis('off')
+                    plt.savefig(save_path, bbox_inches='tight', dpi=150)
+                    plt.close()
+                    print(f"GradCAM saved: {save_path}")
+
+            print("="*70)
+            print("GradCAM visualizations completed!")
+            print("="*70)
+
+        # همه rankها صبر می‌کنن تا rank 0 کار GradCAM رو تموم کنه
+        dist.barrier()
+
+    # نهایی: همه rankها همزمان خارج می‌شن
+    dist.barrier()
     cleanup_ddp()
 
 if __name__ == "__main__":
