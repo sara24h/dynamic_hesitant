@@ -26,7 +26,8 @@ def visualize_grad_cam(model, image_tensor, target_layers, class_index, mean, st
     input_tensor = image_tensor.unsqueeze(0)
     
     # ساخت نمونه Grad-CAM
-    cam = GradCAM(model=model, target_layers=target_layers, use_cuda=torch.cuda.is_available())
+    # *** خط اصلاح شده: آرگومان use_cuda حذف شد ***
+    cam = GradCAM(model=model, target_layers=target_layers)
     
     # تعریف هدف: کلاسی که می‌خواهیم توضیح برای آن نمایش داده شود
     targets = [ClassifierOutputTarget(class_index)]
