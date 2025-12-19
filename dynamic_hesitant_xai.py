@@ -891,6 +891,7 @@ def main():
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size per GPU')
     parser.add_argument('--num_memberships', type=int, default=3, help='Number of membership values per model')
+    parser.add_argument('--num_grad_cam_samples', type=int, default=5, help='Number of samples for GradCAM visualization')
   
     # [NEW/CHANGED FOR UADFV]
     parser.add_argument('--dataset', type=str, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'], required=True,
@@ -1054,7 +1055,7 @@ def main():
         os.makedirs(vis_dir, exist_ok=True)
         # Create a new loader for visualization: batch_size=1, shuffle=True to pick random samples
         vis_loader = DataLoader(test_loader.dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
-        num_vis = 5
+        num_vis = args.num_grad_cam_samples
         for idx, (image, label) in enumerate(vis_loader):
             if idx >= num_vis:
                 break
