@@ -922,6 +922,12 @@ def main():
         image = image.to(device)
         label = label.item()
         original_dataset = test_loader.dataset
+        actual_idx = original_dataset.indices[idx]  # ایندکس واقعی در full_dataset
+        img_path, true_label = original_dataset.dataset.samples[actual_idx]
+        
+        print(f"\n[GradCAM {idx+1}/{num_vis}]")
+        print(f"  Original image path: {img_path}")
+        print(f"  True label: {'real' if true_label == 1 else 'fake'} (label={true_label})")
         if isinstance(original_dataset, Subset):
             actual_idx = original_dataset.indices[idx]  # اگر Subset باشد
             img_path = original_dataset.dataset.samples[actual_idx][0]
