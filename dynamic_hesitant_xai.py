@@ -904,7 +904,7 @@ def main():
     }, final_model_path)
     print(f"Final model saved: {final_model_path}")
 
-    # GradCAM Visualization
+        # GradCAM Visualization
     print("="*70)
     print("GENERATING GRADCAM VISUALIZATIONS FOR ENSEMBLE OUTPUT")
     print("="*70)
@@ -913,27 +913,37 @@ def main():
     vis_dir = os.path.join(args.save_dir, 'gradcam_vis')
     os.makedirs(vis_dir, exist_ok=True)
 
-    vis_loader = DataLoader(test_loader.dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
-    num_vis = args.num_grad_cam_samples
+    # 1. شاخص‌های مجموعه تست را دریافت کنید
+    # test_loader.dataset یک شیء Subset است که شامل شاخص‌های مجموعه تست است
+    test_indices = test_loader.dataset.indices
+    
+    # 2. این شاخص‌ها را برای نمونه‌برداری تصادفی به هم بریزید
+    # از یک کپی استفاده می‌کنیم تا ترتیب اصلی شاخص‌ها حفظ شود
+    vis_indices = test_indices.copy()
+    random.shuffle(vis_indices)
+    
+    # 3. فقط به تعداد مورد نیاز نمونه برداری کنید
+    vis_indices = vis_indices[:args.num_grad_cam_samples]
 
+    # 4. یک Subset و DataLoader جدید برای مصورسازی ایجاد کنید
+    # این DataLoader دیگر نیازی به shuffle ندارد چون ما خودمان شاخص‌ها را به هم ریخته‌ایم
+    vis_dataset = Subset(test_loader.dataset.dataset, vis_indices)
+    vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
+
+    # 5. در حلقه، از شاخص صحیح برای استخراج مسیر و لیبل استفاده کنید
     for idx, (image, label_from_loader) in enumerate(vis_loader):
-        if idx >= num_vis:
-            break
-
         image = image.to(device)
+        
+        # شاخص واقعی این نمونه در مجموعه داده اصلی
+        original_full_dataset_index = vis_indices[idx]
+        
+        # مسیر و لیبل واقعی را با استفاده از شاخص صحیح استخراج کنید
+        img_path, true_label = test_loader.dataset.dataset.samples[original_full_dataset_index]
+        
+        # برای اطمینان، می‌توانید بررسی کنید که لیبل دریافتی از DataLoader با لیبل استخراج شده برابر است
+        assert label_from_loader == true_label, "Mismatch between DataLoader label and dataset label!"
 
-        original_dataset = test_loader.dataset
-        if hasattr(vis_loader, 'sampler') and hasattr(vis_loader.sampler, 'indices'):
-            # اگر از sampler استفاده شده (مثلاً با shuffle=True)
-            sample_idx = vis_loader.sampler.indices[idx]
-        else:
-            # در غیر این صورت، از idx استفاده می‌کنیم
-            sample_idx = idx
-
-        # حالا با استفاده از شاخص صحیح، مسیر و لیبل را استخراج می‌کنیم
-        img_path, true_label = original_dataset.dataset.samples[sample_idx]
-
-        print(f"\n[GradCAM {idx+1}/{num_vis}]")
+        print(f"\n[GradCAM {idx+1}/{len(vis_loader)}]")
         print(f"  Original image path: {img_path}")
         print(f"  True label: {'real' if true_label == 1 else 'fake'} (label={true_label})")
 
@@ -943,14 +953,14 @@ def main():
         pred = 1 if output.squeeze().item() > 0 else 0
         print(f"  Predicted: {'real' if pred == 1 else 'fake'}")
 
-        # بقیه کد GradCAM بدون تغییر...
+        # بقیه کد GradCAM بدون تغییر باقی می‌ماند...
         active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
         combined_cam = None
         for i in active_models:
             model = ensemble.models[i]
             for p in model.parameters():
                 p.requires_grad_(True)
-            target_layer = model.layer4[2].conv3  # مطمئن شو این لایه در همه مدل‌ها وجود داره
+            target_layer = model.layer4[2].conv3
             gradcam = GradCAM(model, target_layer)
             with torch.enable_grad():
                 x_n = ensemble.normalizations(image, i)
@@ -965,7 +975,6 @@ def main():
                 combined_cam = weight * cam
             else:
                 combined_cam += weight * cam
-            # برگرداندن requires_grad به False
             for p in model.parameters():
                 p.requires_grad_(False)
 
@@ -980,7 +989,6 @@ def main():
             overlay = heatmap + img_np
             overlay = overlay / overlay.max()
 
-            # بهتره از true_label برای نام فایل استفاده کنی نه label_from_loader
             save_path = os.path.join(vis_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
             
             plt.figure(figsize=(10, 10))
