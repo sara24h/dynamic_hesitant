@@ -56,7 +56,7 @@ class UADFVDataset(Dataset):
         return image, label
 
 # ====================== SEED SETUP ======================
-def set_seed(seed: int = 123):
+def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
