@@ -961,7 +961,7 @@ def main():
                 if isinstance(model_out, (tuple, list)):
                     model_out = model_out[0]
                 model_out = model_out.squeeze()
-                score = model_out if pred == 1 else -model_out
+                score = model_out if pred_numeric == 1 else -model_out
                 cam = gradcam.generate(score)
             weight = weights[0, i].item()
             if combined_cam is None:
