@@ -913,6 +913,8 @@ def main():
     vis_dir = os.path.join(args.save_dir, 'gradcam_vis')
     os.makedirs(vis_dir, exist_ok=True)
 
+    g = torch.Generator()
+    g.manual_seed(42)
     vis_loader = DataLoader(test_loader.dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
     num_vis = args.num_grad_cam_samples
 
