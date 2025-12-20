@@ -936,8 +936,15 @@ def main():
         # پیش‌بینی انسامبل
         with torch.no_grad():
             output, weights, _, _ = ensemble(image, return_details=True)
-        pred = 1 if output.squeeze().item() > 0 else 0
-        print(f"  Predicted: {'real' if pred == 1 else 'fake'}")
+        
+
+        prediction_score = output.squeeze().item()
+        predicted_label_str = 'real' if prediction_score > 0 else 'fake'
+        true_label_str = 'real' if true_label == 1 else 'fake'
+
+        pred_numeric = 1 if prediction_score > 0 else 0
+        print(f"  True label: {true_label_str} (label={true_label})")
+        print(f"  Predicted: {predicted_label_str} (score={prediction_score:.4f})")
 
         # بقیه کد GradCAM بدون تغییر...
         active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
@@ -977,15 +984,12 @@ def main():
             overlay = overlay / overlay.max()
 
             # بهتره از true_label برای نام فایل استفاده کنی نه label_from_loader
-            save_path = os.path.join(vis_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+            save_path = os.path.join(vis_dir, f"sample_{idx}_true{true_label_str}_pred{predicted_label_str}.png")
             
-            plt.figure(figsize=(10, 10))
-            plt.imshow(overlay)
-            plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
-            plt.axis('off')
+            plt.title(f"True: {true_label_str} | Pred: {predicted_label_str}\n{os.path.basename(img_path)}")
             plt.savefig(save_path, bbox_inches='tight', dpi=200)
             plt.close()
-            
+
             print(f"  GradCAM saved: {save_path}")
 
     print("="*70)
