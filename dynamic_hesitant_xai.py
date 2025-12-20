@@ -913,8 +913,6 @@ def main():
     vis_dir = os.path.join(args.save_dir, 'gradcam_vis')
     os.makedirs(vis_dir, exist_ok=True)
 
-    g = torch.Generator()
-    g.manual_seed(42)
     vis_loader = DataLoader(test_loader.dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
     num_vis = args.num_grad_cam_samples
 
@@ -924,10 +922,16 @@ def main():
 
         image = image.to(device)
 
-        # استخراج مسیر و لیبل واقعی از full dataset (توصیه‌شده و دقیق)
-        original_dataset = test_loader.dataset  # این یک Subset است
-        actual_idx = original_dataset.indices[idx]
-        img_path, true_label = original_dataset.dataset.samples[actual_idx]
+        original_dataset = test_loader.dataset
+        if hasattr(vis_loader, 'sampler') and hasattr(vis_loader.sampler, 'indices'):
+            # اگر از sampler استفاده شده (مثلاً با shuffle=True)
+            sample_idx = vis_loader.sampler.indices[idx]
+        else:
+            # در غیر این صورت، از idx استفاده می‌کنیم
+            sample_idx = idx
+
+        # حالا با استفاده از شاخص صحیح، مسیر و لیبل را استخراج می‌کنیم
+        img_path, true_label = original_dataset.dataset.samples[sample_idx]
 
         print(f"\n[GradCAM {idx+1}/{num_vis}]")
         print(f"  Original image path: {img_path}")
@@ -936,15 +940,8 @@ def main():
         # پیش‌بینی انسامبل
         with torch.no_grad():
             output, weights, _, _ = ensemble(image, return_details=True)
-        
-
-        prediction_score = output.squeeze().item()
-        predicted_label_str = 'real' if prediction_score > 0 else 'fake'
-        true_label_str = 'real' if true_label == 1 else 'fake'
-
-        pred_numeric = 1 if prediction_score > 0 else 0
-        print(f"  True label: {true_label_str} (label={true_label})")
-        print(f"  Predicted: {predicted_label_str} (score={prediction_score:.4f})")
+        pred = 1 if output.squeeze().item() > 0 else 0
+        print(f"  Predicted: {'real' if pred == 1 else 'fake'}")
 
         # بقیه کد GradCAM بدون تغییر...
         active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
@@ -961,7 +958,7 @@ def main():
                 if isinstance(model_out, (tuple, list)):
                     model_out = model_out[0]
                 model_out = model_out.squeeze()
-                score = model_out if pred_numeric == 1 else -model_out
+                score = model_out if pred == 1 else -model_out
                 cam = gradcam.generate(score)
             weight = weights[0, i].item()
             if combined_cam is None:
@@ -984,12 +981,15 @@ def main():
             overlay = overlay / overlay.max()
 
             # بهتره از true_label برای نام فایل استفاده کنی نه label_from_loader
-            save_path = os.path.join(vis_dir, f"sample_{idx}_true{true_label_str}_pred{predicted_label_str}.png")
+            save_path = os.path.join(vis_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
             
-            plt.title(f"True: {true_label_str} | Pred: {predicted_label_str}\n{os.path.basename(img_path)}")
+            plt.figure(figsize=(10, 10))
+            plt.imshow(overlay)
+            plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+            plt.axis('off')
             plt.savefig(save_path, bbox_inches='tight', dpi=200)
             plt.close()
-
+            
             print(f"  GradCAM saved: {save_path}")
 
     print("="*70)
