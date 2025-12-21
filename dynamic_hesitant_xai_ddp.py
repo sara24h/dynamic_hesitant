@@ -691,10 +691,10 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         outputs, weights, memberships, _ = model(images, return_details=True)
         pred = (outputs.squeeze(1) > 0).long()
         
-        local_preds.append(pred.cpu())
-        local_labels.append(labels.cpu())
-        local_weights.append(weights.cpu())
-        local_memberships.append(memberships.cpu())
+        local_preds.append(pred)
+        local_labels.append(labels)
+        local_weights.append(weights)
+        local_memberships.append(memberships)
 
     local_preds_tensor = torch.cat(local_preds)
     local_labels_tensor = torch.cat(local_labels)
@@ -714,10 +714,10 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         gathered_memberships = None
 
     # اصلاح: انتقال تانسورها به دستگاه مناسب قبل از gather
-    dist.gather(local_preds_tensor.to(device), gathered_preds, dst=0)
-    dist.gather(local_labels_tensor.to(device), gathered_labels, dst=0)
-    dist.gather(local_weights_tensor.to(device), gathered_weights, dst=0)
-    dist.gather(local_memberships_tensor.to(device), gathered_memberships, dst=0)
+    dist.gather(local_preds_tensor, gathered_preds, dst=0)
+    dist.gather(local_labels_tensor, gathered_labels, dst=0)
+    dist.gather(local_weights_tensor, gathered_weights, dst=0)
+    dist.gather(local_memberships_tensor, gathered_memberships, dst=0)
 
     if is_main:
         all_preds = torch.cat(gathered_preds).cpu().numpy()
@@ -961,7 +961,7 @@ def main():
     ).to(device)
     
     # بسته‌بندی مدل با DDP
-    ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
     
     hesitant_net = ensemble.module.hesitant_fuzzy
     trainable = sum(p.numel() for p in hesitant_net.parameters())
