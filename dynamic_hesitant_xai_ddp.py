@@ -19,6 +19,10 @@ import matplotlib.pyplot as plt
 import cv2
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+# استفاده از کتابخانه grad-cam به جای پیاده‌سازی دستی
+from grad_cam.utils.model_targets import ClassifierOutputTarget
+from grad_cam.utils.image import show_cam_on_image
+from grad_cam import GradCAM
 warnings.filterwarnings("ignore")
 
 # کلاس UADFVDataset بدون تغییر باقی می‌ماند
@@ -230,7 +234,7 @@ def prepare_deepflux_dataset(base_dir, seed=42):
 def prepare_uadfV_dataset(base_dir, seed=42):
     """
     Prepares UADFV dataset for splitting.
-    Assumes the base_dir is the root of the UADFV folder.
+    Assumes that base_dir is the root of the UADFV folder.
     """
     if not os.path.exists(base_dir):
         raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
@@ -747,37 +751,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     
     return 0.0, [0.0]*len(model_names), [[0.0]*3]*len(model_names), [0.0]*len(model_names)
 
-class GradCAM:
-    def __init__(self, model, target_layer):
-        self.model = model
-        self.target_layer = target_layer
-        self.gradients = None
-        self.activations = None
-        self._register_hooks()
-
-    def _register_hooks(self):
-        def forward_hook(module, input, output):
-            self.activations = output.detach()
-
-        def backward_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0].detach()
-
-        self.target_layer.register_forward_hook(forward_hook)
-        self.target_layer.register_backward_hook(backward_hook)
-
-    def generate(self, score):
-        self.model.zero_grad()
-        score.backward()
-        if self.gradients is None:
-            raise ValueError("Gradients not captured")
-        gradients = self.gradients[0]
-        activations = self.activations[0]
-        weights = gradients.mean(dim=[1, 2], keepdim=True)
-        cam = (weights * activations).sum(dim=0)
-        cam = F.relu(cam)
-        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), activations.shape[1:], mode='bilinear', align_corners=False)
-        return (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr, device, save_dir, local_rank):
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy
@@ -1072,61 +1045,46 @@ def main():
                 output, weights, _, _ = ensemble.module(image, return_details=True)
             pred = 1 if output.squeeze().item() > 0 else 0
             active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
+            
+            # استفاده از کتابخانه grad-cam برای تولید تصاویر
+            img_np = image[0].cpu().permute(1, 2, 0).numpy()
+            img_h, img_w = img_np.shape[:2]
+            
+            # ایجاد تصویر overlay برای هر مدل فعال
             combined_cam = None
             for i in active_models:
                 model = ensemble.module.models[i]
                 model.eval()
-                for p in model.parameters():
-                    p.requires_grad_(True)
-                target_layer = model.layer4[2].conv3
-                gradcam = GradCAM(model, target_layer)
-                with torch.enable_grad():
-                    x_n = ensemble.module.normalizations(image, i)
-                    model_out = model(x_n)
-                    if isinstance(model_out, (tuple, list)):
-                        model_out = model_out[0]
-                    model_out = model_out.squeeze()
-                    score = model_out if pred == 1 else -model_out
-                    cam = gradcam.generate(score)
+                
+                # ایجاد GradCAM برای هر مدل
+                target_layers = [model.layer4[-1]]
+                cam = GradCAM(model=model, target_layers=target_layers, use_cuda=True)
+                
+                # نرمال‌سازی تصویر برای GradCAM
+                input_tensor = torch.from_numpy(img_np).unsqueeze(0).to(device)
+                
+                # استفاده از کتابخانه grad-cam برای تولید CAM
+                targets = [ClassifierOutputTarget(pred)]
+                grayscale_cam = cam(input_tensor=input_tensor, targets=targets)[0, :]
+                
+                # تبدیل به RGB
+                cam_image = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
+                
                 weight = weights[0, i].item()
                 if combined_cam is None:
-                    combined_cam = weight * cam
+                    combined_cam = weight * grayscale_cam
                 else:
-                    combined_cam += weight * cam
-                for p in model.parameters():
-                    p.requires_grad_(False)
-
-            if combined_cam is not None:
-                # اصلاح: تبدیل combined_cam به آرایه numpy و بررسی ابعاد
-                combined_cam_np = combined_cam.cpu().numpy()
-                
-                # بررسی ابعاد combined_cam
-                if combined_cam_np.size == 0:
-                    print(f"Warning: Empty CAM for sample {idx}, skipping visualization")
-                    continue
-                
-                # نرمال‌سازی combined_cam
-                combined_cam_norm = (combined_cam_np - combined_cam_np.min()) / (combined_cam_np.max() - combined_cam_np.min() + 1e-8)
-                
-                img_np = image[0].cpu().permute(1, 2, 0).numpy()
-                img_h, img_w = img_np.shape[:2]
-                
-                # تغییر اندازه combined_cam_norm
-                combined_cam_resized = cv2.resize(combined_cam_norm, (img_w, img_h))
-
-                heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
-                heatmap = np.float32(heatmap) / 255
-                overlay = heatmap + img_np
-                overlay = overlay / overlay.max()
-
-                save_path = os.path.join(vis_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
-                
-                plt.figure(figsize=(10, 10))
-                plt.imshow(overlay)
-                plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
-                plt.axis('off')
-                plt.savefig(save_path, bbox_inches='tight', dpi=200)
-                plt.close()
+                    combined_cam += weight * grayscale_cam
+            
+            # ذخیره تصویر نهایی
+            save_path = os.path.join(vis_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+            
+            plt.figure(figsize=(10, 10))
+            plt.imshow(combined_cam)
+            plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+            plt.axis('off')
+            plt.savefig(save_path, bbox_inches='tight', dpi=200)
+            plt.close()
                 
         print("="*70)
         print("GradCAM visualizations completed!")
