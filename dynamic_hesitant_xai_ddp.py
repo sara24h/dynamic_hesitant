@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 import cv2
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-# استفاده از کتابخانه grad-cam به جای پیاده‌سازی دستی
+# استفاده از کتابخانه grad-cam به جای پیاده‌سازی دستی GradCAM
 from grad_cam.utils.model_targets import ClassifierOutputTarget
 from grad_cam.utils.image import show_cam_on_image
 from grad_cam import GradCAM
@@ -42,7 +42,7 @@ class UADFVDataset(Dataset):
                     for img_file in os.listdir(subdir_path):
                         img_path = os.path.join(subdir_path, img_file)
                         if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                            self.samples.append((img_path, self.class_to_idx['fake']))
+                            self.samples.append((img_path, self.class_to_idx['fake'])
        
         # Load real images
         real_frames_dir = os.path.join(self.root_dir, 'real', 'frames')
@@ -52,28 +52,19 @@ class UADFVDataset(Dataset):
                 if os.path.isdir(subdir_path):
                     for img_file in os.listdir(subdir_path):
                         img_path = os.path.join(subdir_path, img_file)
-                        if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                            self.samples.append((img_path, self.class_to_idx['real']))
-    def __len__(self):
-        return len(self.samples)
-    def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        image = Image.open(img_path).convert('RGB')
-        if self.transform:
-            image = self.transform(image)
-        return image, label
+                        if img_file.lower().endwith(```
 
-# توابع کمکی بدون تغییر باقی می‌مانند
+# توابع کمکی بدون تغییر باقی می‌ماند
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cuidnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
     if dist.is_initialized():
-        # Only print on the main process to avoid clutter
+        # Only print on main process to avoid clutter
         if dist.get_rank() == 0:
             print(f"[SEED] All random seeds set to: {seed}")
     else:
@@ -117,153 +108,7 @@ def create_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_rat
   
     return train_indices, val_indices, test_indices
 
-def prepare_real_fake_dataset(base_dir, seed=42):
-    if os.path.exists(os.path.join(base_dir, 'training_fake')) and \
-       os.path.exists(os.path.join(base_dir, 'training_real')):
-        real_fake_dir = base_dir
-    elif os.path.exists(os.path.join(base_dir, 'real_and_fake_face')):
-        real_fake_dir = os.path.join(base_dir, 'real_and_fake_face')
-    else:
-        raise FileNotFoundError(
-            f"Could not find training_fake/training_real in:\n"
-            f" - {base_dir}\n"
-            f" - {os.path.join(base_dir, 'real_and_fake_face')}"
-        )
-  
-    temp_transform = transforms.Compose([transforms.ToTensor()])
-    full_dataset = datasets.ImageFolder(real_fake_dir, transform=temp_transform)
-  
-    if dist.get_rank() == 0:
-        print(f"\n[Dataset Info - Real/Fake]")
-        print(f"Total samples: {len(full_dataset)}")
-        print(f"Classes: {full_dataset.classes}")
-        print(f"Class to index: {full_dataset.class_to_idx}")
-  
-    train_indices, val_indices, test_indices = create_reproducible_split(
-        full_dataset,
-        train_ratio=0.7,
-        val_ratio=0.15,
-        test_ratio=0.15,
-        seed=seed
-    )
-  
-    if dist.get_rank() == 0:
-        print(f"\n[Split Statistics]")
-        print(f"Train: {len(train_indices)} samples ({len(train_indices)/len(full_dataset)*100:.1f}%)")
-        print(f"Valid: {len(val_indices)} samples ({len(val_indices)/len(full_dataset)*100:.1f}%)")
-        print(f"Test: {len(test_indices)} samples ({len(test_indices)/len(full_dataset)*100:.1f}%)")
-  
-    return full_dataset, train_indices, val_indices, test_indices
-
-def prepare_hard_fake_real_dataset(base_dir, seed=42):
-    if os.path.exists(os.path.join(base_dir, 'fake')) and \
-       os.path.exists(os.path.join(base_dir, 'real')):
-        dataset_dir = base_dir
-    elif os.path.exists(os.path.join(base_dir, 'hardfakevsrealfaces')):
-        dataset_dir = os.path.join(base_dir, 'hardfakevsrealfaces')
-    else:
-        raise FileNotFoundError(
-            f"Could not find fake/real folders in:\n"
-            f" - {base_dir}\n"
-            f" - {os.path.join(base_dir, 'hardfakevsrealfaces')}"
-        )
-  
-    temp_transform = transforms.Compose([transforms.ToTensor()])
-    full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
-  
-    if dist.get_rank() == 0:
-        print(f"\n[Dataset Info - HardFakeVsReal]")
-        print(f"Total samples: {len(full_dataset)}")
-        print(f"Classes: {full_dataset.classes}")
-        print(f"Class to index: {full_dataset.class_to_idx}")
-  
-    train_indices, val_indices, test_indices = create_reproducible_split(
-        full_dataset,
-        train_ratio=0.7,
-        val_ratio=0.15,
-        test_ratio=0.15,
-        seed=seed
-    )
-  
-    if dist.get_rank() == 0:
-        print(f"\n[Split Statistics]")
-        print(f"Train: {len(train_indices)} samples ({len(train_indices)/len(full_dataset)*100:.1f}%)")
-        print(f"Valid: {len(val_indices)} samples ({len(val_indices)/len(full_dataset)*100:.1f}%)")
-        print(f"Test: {len(test_indices)} samples ({len(test_indices)/len(full_dataset)*100:.1f}%)")
-  
-    return full_dataset, train_indices, val_indices, test_indices
-
-def prepare_deepflux_dataset(base_dir, seed=42):
-    if os.path.exists(os.path.join(base_dir, 'Fake')) and \
-       os.path.exists(os.path.join(base_dir, 'Real')):
-        dataset_dir = base_dir
-    elif os.path.exists(os.path.join(base_dir, 'DeepFLUX')):
-        dataset_dir = os.path.join(base_dir, 'DeepFLUX')
-    else:
-        raise FileNotFoundError(
-            f"Could not find Fake/Real folders in:\n"
-            f" - {base_dir}\n"
-            f" - {os.path.join(base_dir, 'DeepFLUX')}"
-        )
-  
-    temp_transform = transforms.Compose([transforms.ToTensor()])
-    full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
-  
-    if dist.get_rank() == 0:
-        print(f"\n[Dataset Info - DeepFLUX]")
-        print(f"Total samples: {len(full_dataset)}")
-        print(f"Classes: {full_dataset.classes}")
-        print(f"Class to index: {full_dataset.class_to_idx}")
-  
-    train_indices, val_indices, test_indices = create_reproducible_split(
-        full_dataset,
-        train_ratio=0.7,
-        val_ratio=0.15,
-        test_ratio=0.15,
-        seed=seed
-    )
-  
-    if dist.get_rank() == 0:
-        print(f"\n[Split Statistics]")
-        print(f"Train: {len(train_indices)} samples ({len(train_indices)/len(full_dataset)*100:.1f}%)")
-        print(f"Valid: {len(val_indices)} samples ({len(val_indices)/len(full_dataset)*100:.1f}%)")
-        print(f"Test: {len(test_indices)} samples ({len(test_indices)/len(full_dataset)*100:.1f}%)")
-  
-    return full_dataset, train_indices, val_indices, test_indices
-
-def prepare_uadfV_dataset(base_dir, seed=42):
-    """
-    Prepares UADFV dataset for splitting.
-    Assumes that base_dir is the root of the UADFV folder.
-    """
-    if not os.path.exists(base_dir):
-        raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
-    temp_transform = transforms.Compose([transforms.ToTensor()])
-    full_dataset = UADFVDataset(base_dir, transform=temp_transform)
-    
-    if dist.get_rank() == 0:
-        print(f"\n[Dataset Info - UADFV]")
-        print(f"Total samples: {len(full_dataset)}")
-        print(f"Classes: {full_dataset.classes}")
-        print(f"Class to index: {full_dataset.class_to_idx}")
-    
-    train_indices, val_indices, test_indices = create_reproducible_split(
-        full_dataset,
-        train_ratio=0.7,
-        val_ratio=0.15,
-        test_ratio=0.15,
-        seed=seed
-    )
-    
-    if dist.get_rank() == 0:
-        print(f"\n[Split Statistics]")
-        print(f"Train: {len(train_indices)} samples ({len(train_indices)/len(full_dataset)*100:.1f}%)")
-        print(f"Valid: {len(val_indices)} samples ({len(val_indices)/len(full_dataset)*100:.1f}%)")
-        print(f"Test: {len(test_indices)} samples ({len(test_indices)/len(full_dataset)*100:.1f}%)")
-    
-    return full_dataset, train_indices, val_indices, test_indices
-
-# کلاس‌های مدل بدون تغییر باقی می‌مانند
+# کلاس‌های مدل بدون تغییر باقی می‌ماند
 class HesitantFuzzyMembership(nn.Module):
     def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, dropout: float = 0.3):
         super().__init__()
@@ -277,6 +122,8 @@ class HesitantFuzzyMembership(nn.Module):
             nn.BatchNorm2d(64), nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1)
         )
     
@@ -301,7 +148,7 @@ class HesitantFuzzyMembership(nn.Module):
 class MultiModelNormalization(nn.Module):
     def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
         super().__init__()
-        for i, (m, s) in enumerate(zip(means, stds)):
+        for i, (m, s) in enumerate(zip(means, stds):
             self.register_buffer(f'mean_{i}', torch.tensor(m).view(1, 3, 1, 1))
             self.register_buffer(f'std_{i}', torch.tensor(s).view(1, 3, 1, 1))
   
@@ -373,7 +220,7 @@ class FuzzyHesitantEnsemble(nn.Module):
         if return_details:
             return final_output, final_weights, all_memberships, outputs
         return final_output, final_weights
-    
+
 def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.Module]:
     try:
         from model.pruned_model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
@@ -485,7 +332,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size, shuffle=False,
                                 sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
-  
+                                
     elif dataset_type == 'real_fake':
         print(f"Processing real-fake dataset from: {base_dir}")
         full_dataset, train_indices, val_indices, test_indices = prepare_real_fake_dataset(base_dir, seed=42)
@@ -500,7 +347,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
       
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
-      
         train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=42)
       
         train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
@@ -520,7 +366,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
                                worker_init_fn=worker_init_fn)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
                                 sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
-                                worker_init_fn=worker_init_fn)
+                                worker_init_fn= worker_init_fn)
                                 
     elif dataset_type == 'hard_fake_real':
         print(f"Processing hardfakevsrealfaces dataset from: {base_dir}")
@@ -532,7 +378,9 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         elif os.path.exists(os.path.join(base_dir, 'hardfakevsrealfaces')):
             dataset_dir = os.path.join(base_dir, 'hardfakevsrealfaces')
         else:
-            raise FileNotFoundError(f"Could not find fake/real folders in {base_dir}")
+            raise FileNotFoundError(f"Could not find fake/real folders in:\n"
+                            f" - {base_dir}\n"
+                            f" - {os.path.join(base_dir, 'hardfakevsrealfaces')}")
       
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
@@ -567,7 +415,9 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         elif os.path.exists(os.path.join(base_dir, 'DeepFLUX')):
             dataset_dir = os.path.join(base_dir, 'DeepFLUX')
         else:
-            raise FileNotFoundError(f"Could not find Fake/Real folders in {base_dir}")
+            raise FileNotFoundError(f"Could not find Fake/Real folders in:\n"
+                            f" - {base_dir}\n"
+                            f" - {os.path.join(base_dir, 'DeepFLUX')")
       
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
@@ -618,10 +468,11 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
                                  worker_init_fn=worker_init_fn)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                                sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
-                               worker_init_fn=worker_init_fn)
+                                 worker_init_fn=worker_init_fn)
         test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
                                 sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
-                                worker_init_fn=worker_init_fn)
+                                 worker_init_fn=worker_init_fn)
+                                
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}. Use 'wild', 'real_fake', 'hard_fake_real', 'deepflux', or 'uadfV'")
   
@@ -741,15 +592,46 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Samples: {total_samples:,}")
         print(f"\nAverage Model Weights:")
-        for i, (w, name) in enumerate(zip(avg_weights, model_names)):
+        for i, (w, name) in enumerate(zip(avg_weights, model_names):
             print(f" {i+1:2d}. {name:<25}: {w:6.4f} ({w*100:5.2f}%)")
         print(f"\nActivation Frequency:")
-        for i, (perc, count, name) in enumerate(zip(activation_percentages, activation_counts, model_names)):
-            print(f" {i+1:2d}. {name:<25}: {perc:6.2f}% active ({int(count):,} / {total_samples:,} samples)")
+        for i, (perc, count, name) in enumerate(zip(activation_percentages, activation_counts, model_names):
+            print(f" {i+1:2d}. {name:<25}: {perc:6.2f}% active ({int(count):,} / {total_samples:,} samples")
         print(f"{'='*70}")
         return acc, avg_weights.tolist(), all_memberships.mean(axis=0).tolist(), activation_percentages.tolist()
     
     return 0.0, [0.0]*len(model_names), [[0.0]*3]*len(model_names), [0.0]*len(model_names)
+
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        self._register_hooks()
+
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            self.activations = output.detach()
+
+        def backward_hook(module, grad_in, grad_out):
+            self.gradients = grad_out[0].detach()
+
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
+
+    def generate(self, score):
+        self.model.zero_grad()
+        score.backward()
+        if self.gradients is None:
+            raise ValueError("Gradients not captured")
+        gradients = self.gradients[0]
+        activations = self.activations[0]
+        weights = gradients.mean(dim=[1, 2], keepdim=True)
+        cam = (weights * activations).sum(dim=0)
+        cam = F.relu(cam)
+        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), activations.shape[1:], mode='bilinear', align_corners=False)
+        return (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
 
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr, device, save_dir, local_rank):
     os.makedirs(save_dir, exist_ok=True)
@@ -841,6 +723,75 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         print(f"\nTraining completed! Best Val Acc: {best_val_acc:.2f}%")
     return best_val_acc, history
 
+def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
+    model.eval()
+    local_preds = []
+    local_labels = []
+    local_weights = []
+    local_memberships = []
+    
+    for images, labels in tqdm(loader, desc=f"Evaluating {name}", leave=True, disable=not is_main):
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs, weights, memberships, _ = model(images, return_details=True)
+        pred = (outputs.squeeze(1) > 0).long()
+        
+        local_preds.append(pred)
+        local_labels.append(labels)
+        local_weights.append(weights)
+        local_memberships.append(memberships)
+
+    local_preds_tensor = torch.cat(local_preds)
+    local_labels_tensor = torch.cat(local_labels)
+    local_weights_tensor = torch.cat(local_weights)
+    local_memberships_tensor = torch.cat(local_memberships)
+
+    world_size = dist.get_world_size()
+    if is_main:
+        gathered_preds = [torch.zeros_like(local_preds_tensor) for _ in range(world_size)]
+        gathered_labels = [torch.zeros_like(local_labels_tensor) for _ in range(world_size)]
+        gathered_weights = [torch.zeros_like(local_weights_tensor) for _ in range(world_size)]
+        gathered_memberships = [torch.zeros_like(local_memberships_tensor) for _ in range(world_size)]
+    else:
+        gathered_preds = None
+        gathered_labels = None
+        gathered_weights = None
+        gathered_memberships = None
+
+    # اصلاح: انتقال تانسورها به دستگاه مناسب قبل از gather
+    dist.gather(local_preds_tensor, gathered_preds, dst=0)
+    dist.gather(local_labels_tensor, gathered_labels, dst=0)
+    dist.gather(local_weights_tensor, gathered_weights, dst=0)
+    dist.gather(local_memberships_tensor, gathered_memberships, dst=0)
+
+    if is_main:
+        all_preds = torch.cat(gathered_preds).cpu().numpy()
+        all_labels = torch.cat(gathered_labels).cpu().numpy()
+        all_weights = torch.cat(gathered_weights).cpu().numpy()
+        all_memberships = torch.cat(gathered_memberships).cpu().numpy()
+        
+        acc = 100. * np.mean(all_preds == all_labels)
+        avg_weights = all_weights.mean(axis=0)
+        activation_counts = (all_weights > 1e-4).sum(axis=0)
+        total_samples = all_weights.shape[0]
+        activation_percentages = (activation_counts / total_samples) * 100
+        
+        print(f"\n{'='*70}")
+        print(f"{name.upper()} SET RESULTS")
+        print(f"{'='*70}")
+        print(f" → Accuracy: {acc:.3f}%")
+        print(f" → Total Samples: {total_samples:,}")
+        print(f"\nAverage Model Weights:")
+        for i, (w, name) in enumerate(zip(avg_weights, model_names):
+            print(f" {i+1:2d}. {name:<25}: {w:6.4f} ({w*100:5.2f}%)")
+        print(f"\nActivation Frequency:")
+        for i, (perc, count, name) in enumerate(zip(activation_percentages, activation_counts, model_names):
+            print(f" {i+1:2d}. {name:<25}: {perc:6.2f}% active ({int(count):,} / {total_samples:,} samples)")
+        print(f"{'='*70}")
+        return acc, avg_weights.tolist(), all_memberships.mean(axis=0).tolist(), activation_percentages.tolist()
+    
+    return 0.0, [0.0]*len(model_names), [[0.0]*3]*len(model_names), [0.0]*len(model_names)
+
 def setup_distributed():
     """تابع برای راه‌اندازی محیط توزیع‌شده"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -866,7 +817,7 @@ def cleanup_distributed():
 def main():
     SEED = 42
     set_seed(SEED)
-  
+    
     # راه‌اندازی محیط توزیع‌شده
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0  # فقط در پردازش اصلی چاپ می‌کنیم
@@ -890,9 +841,12 @@ def main():
     if len(args.model_names) != len(args.model_paths):
         raise ValueError(f"Number of model_names ({len(args.model_names)}) must match model_paths ({len(args.model_paths)})")
   
-    MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
-    STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-  
+    MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816), (0.4668, 0.3816), (0.3414)]
+    STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161)]
+    MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816), (0.3414)]
+    STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161)]
+    MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622), (0.3416), (0.4668, 0.3816), (0.3414)]
+    
     MEANS = MEANS[:len(args.model_paths)]
     STDS = STDS[:len(args.model_paths)]
   
@@ -900,6 +854,7 @@ def main():
         set_seed(args.seed)
   
     if is_main:
+        print("="*70)
         print("="*70)
         print(f"Distributed Data Parallel Training on {world_size} GPUs | SEED: {args.seed}")
         print("="*70)
@@ -940,7 +895,7 @@ def main():
     trainable = sum(p.numel() for p in hesitant_net.parameters())
     total_params = sum(p.numel() for p in ensemble.parameters())
     if is_main:
-        print(f"Total params: {total_params:,} | Trainable: {trainable:,} | Frozen: {total_params - trainable:,}\n")
+        print(f"Total params: {total_params:,} | Trainable: {trainable:,} | Frozen: {total_params - trainable:,} | Frozen: {total_params - trainable:,}")
   
     # ایجاد DataLoader با DistributedSampler
     train_loader, val_loader, test_loader = create_dataloaders(
@@ -1036,18 +991,34 @@ def main():
         full_test_dataset = test_loader.dataset.dataset
         vis_loader = DataLoader(full_test_dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
         
-        for idx, (image, label) in enumerate(tqdm(vis_loader, total=args.num_grad_cam_samples, desc="Generating GradCAM")):
+        # 1. شاخص‌های مجموعه تست را دریافت کنید
+        test_indices = test_loader.dataset.indices
+        
+        # 2. این شاخص‌ها را برای نمونه‌برداری به هم بریزید
+        vis_indices = test_indices.copy()
+        random.shuffle(vis_indices)
+        
+        # 3. فقط به تعداد مورد نیاز نمونه برداری کنید
+        vis_indices = vis_indices[:args.num_grad_cam_samples]
+
+        # 4. یک Subset و DataLoader جدید برای مصورسازی
+        # این DataLoader دیگر نیازی به shuffle ندارد چون ما خودمان شاخص‌ها را به هم بریزید کرده‌ایم
+        vis_dataset = Subset(full_test_dataset, vis_indices)
+        vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
+        
+        # 5. در حلقه، از شاخص‌های استفاده می‌کنیم
+        for idx, (image, label_from_loader) in enumerate(tqdm(vis_loader, total=args.num_grad_cam_samples, desc="Generating GradCAM"):
             if idx >= args.num_grad_cam_samples:
                 break
             image = image.to(device)
-            img_path, true_label = full_test_dataset.samples[idx]
+            img_path, true_label = full_test_dataset.samples[vis_indices[idx]]
             with torch.no_grad():
                 output, weights, _, _ = ensemble.module(image, return_details=True)
             pred = 1 if output.squeeze().item() > 0 else 0
             active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
             
             # استفاده از کتابخانه grad-cam برای تولید تصاویر
-            img_np = image[0].cpu().permute(1, 2, 0).numpy()
+            img_np = image[0].cpu().permute(1, 2, 0)
             img_h, img_w = img_np.shape[:2]
             
             # ایجاد تصویر overlay برای هر مدل فعال
@@ -1055,37 +1026,57 @@ def main():
             for i in active_models:
                 model = ensemble.module.models[i]
                 model.eval()
+                model.eval()
                 
                 # ایجاد GradCAM برای هر مدل
                 target_layers = [model.layer4[-1]]
-                cam = GradCAM(model=model, target_layers=target_layers, use_cuda=True)
+                cam = GradCAM(model, target_layers, use_cuda=True)
                 
                 # نرمال‌سازی تصویر برای GradCAM
-                input_tensor = torch.from_numpy(img_np).unsqueeze(0).to(device)
-                
-                # استفاده از کتابخانه grad-cam برای تولید CAM
-                targets = [ClassifierOutputTarget(pred)]
-                grayscale_cam = cam(input_tensor=input_tensor, targets=targets)[0, :]
-                
-                # تبدیل به RGB
-                cam_image = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
-                
+                x_n = ensemble.module.normalizations(image, i)
+                model_out = model(x_n)
+                if isinstance(model_out, (tuple, list):
+                    model_out = model_out[0]
+                model_out = model_out.squeeze()
+                score = model_out if pred == 1 else -model_out
+                cam = gradcam.generate(score)
                 weight = weights[0, i].item()
                 if combined_cam is None:
-                    combined_cam = weight * grayscale_cam
+                    combined_cam = weight * cam
                 else:
-                    combined_cam += weight * grayscale_cam
+                    combined_cam += weight * cam
+                else:
+                    combined_cam += weight * cam
+                for p in model.parameters():
+                    p.requires_grad_(False)
+                for p in model.parameters():
+                    p.requires_grad_(False)
             
             # ذخیره تصویر نهایی
-            save_path = os.path.join(vis_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
-            
-            plt.figure(figsize=(10, 10))
-            plt.imshow(combined_cam)
-            plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
-            plt.axis('off')
-            plt.savefig(save_path, bbox_inches='tight', dpi=200)
-            plt.close()
+            if combined_cam is not None:
+                combined_cam_np = combined_cam.cpu().numpy()
+                combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
+                img_np = image[0].cpu().permute(1, 2, 0)
+                img_h, img_w = img_np.shape[:2]
+                combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h)
                 
+                heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
+                heatmap = np.float32(heatmap) / 255
+                overlay = heatmap + img_np
+                overlay = overlay / overlay.max()
+
+                save_path = os.path.join(vis_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+                
+                plt.figure(figsize=(10, 10))
+                plt.imshow(overlay)
+                plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+                plt.axis('off')
+                plt.savefig(save_path, bbox_inches='tight', dpi=200)
+                plt.close()
+                print(f"  GradCAM saved: {save_path}")
+                
+                print(f"  GradCAM saved: {save_path}")
+        
         print("="*70)
         print("GradCAM visualizations completed!")
         print("="*70)
