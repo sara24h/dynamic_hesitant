@@ -1097,7 +1097,9 @@ def main():
                     p.requires_grad_(False)
 
             if combined_cam is not None:
-                combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
+                # اصلاح: تبدیل combined_cam به آرایه numpy قبل از تغییر اندازه
+                combined_cam_np = combined_cam.cpu().numpy()
+                combined_cam = (combined_cam_np - combined_cam_np.min()) / (combined_cam_np.max() - combined_cam_np.min() + 1e-8)
                 img_np = image[0].cpu().permute(1, 2, 0).numpy()
                 img_h, img_w = img_np.shape[:2]
                 combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h))
