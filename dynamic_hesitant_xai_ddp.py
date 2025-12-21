@@ -1051,7 +1051,7 @@ def main():
         }, final_model_path)
         print(f"Final model saved: {final_model_path}")
 
-        # GradCAM Visualization
+        # GradCAM Visualization - فقط در پردازش اصلی اجرا می‌شود
         print("="*70)
         print("GENERATING GRADCAM VISUALIZATIONS FOR ENSEMBLE OUTPUT")
         print("="*70)
@@ -1060,24 +1060,26 @@ def main():
         vis_dir = os.path.join(args.save_dir, 'gradcam_vis')
         os.makedirs(vis_dir, exist_ok=True)
 
-        # 1. شاخص‌های مجموعه تست را دریافت کنید
-        # test_loader.dataset یک شیء Subset است که شامل شاخص‌های مجموعه تست است
-        test_indices = test_loader.dataset.indices
-        
-        # 2. این شاخص‌ها را برای نمونه‌برداری تصادفی به هم بریزید
-        # از یک کپی استفاده می‌کنیم تا ترتیب اصلی شاخص‌ها حفظ شود
-        vis_indices = test_indices.copy()
-        random.shuffle(vis_indices)
-        
-        # 3. فقط به تعداد مورد نیاز نمونه برداری کنید
-        vis_indices = vis_indices[:args.num_grad_cam_samples]
+        if args.dataset == 'wild':
+            # در حالت 'wild'، مستقیماً از ImageFolder استفاده می‌کنیم
+            full_test_dataset = test_loader.dataset
+            # ایجاد شاخص‌های تصادفی برای نمونه‌برداری
+            total_samples = len(full_test_dataset)
+            vis_indices = list(range(total_samples))
+            random.shuffle(vis_indices)
+            vis_indices = vis_indices[:args.num_grad_cam_samples]
+            vis_dataset = Subset(full_test_dataset, vis_indices)
+        else:
+            # برای حالت‌های دیگر که از Subset استفاده می‌کنند
+            test_indices = test_loader.dataset.indices
+            vis_indices = test_indices.copy()
+            random.shuffle(vis_indices)
+            vis_indices = vis_indices[:args.num_grad_cam_samples]
+            vis_dataset = Subset(test_loader.dataset.dataset, vis_indices)
 
-        # 4. یک Subset و DataLoader جدید برای مصورسازی ایجاد کنید
-        # این DataLoader دیگر نیازی به shuffle ندارد چون ما خودمان شاخص‌ها را به هم ریخته‌ایم
-        vis_dataset = Subset(test_loader.dataset.dataset, vis_indices)
         vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
 
-        # 5. در حلقه، از شاخص صحیح برای استخراج مسیر و لیبل استفاده کنید
+        # در حلقه، از شاخص صحیح برای استخراج مسیر و لیبل استفاده کنید
         for idx, (image, label_from_loader) in enumerate(vis_loader):
             image = image.to(device)
             
@@ -1085,10 +1087,12 @@ def main():
             original_full_dataset_index = vis_indices[idx]
             
             # مسیر و لیبل واقعی را با استفاده از شاخص صحیح استخراج کنید
-            img_path, true_label = test_loader.dataset.dataset.samples[original_full_dataset_index]
-            
-            # برای اطمینان، می‌توانید بررسی کنید که لیبل دریافتی از DataLoader با لیبل استخراج شده برابر است
-            assert label_from_loader == true_label, "Mismatch between DataLoader label and dataset label!"
+            if args.dataset == 'wild':
+                # در حالت 'wild'، مستقیماً از ImageFolder استفاده می‌کنیم
+                img_path, true_label = full_test_dataset.samples[original_full_dataset_index]
+            else:
+                # برای حالت‌های دیگر
+                img_path, true_label = test_loader.dataset.dataset.samples[original_full_dataset_index]
 
             print(f"\n[GradCAM {idx+1}/{len(vis_loader)}]")
             print(f"  Original image path: {img_path}")
