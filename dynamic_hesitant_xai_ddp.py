@@ -614,7 +614,8 @@ def evaluate_single_model(model: nn.Module, loader: DataLoader, device: torch.de
 
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr, device, save_dir, local_rank):
     os.makedirs(save_dir, exist_ok=True)
-    hesitant_net = ensemble_model.hesitant_fuzzy
+    # اصلاح: دسترسی به hesitant_fuzzy از طریق module
+    hesitant_net = ensemble_model.module.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
@@ -895,6 +896,7 @@ def main():
     # بسته‌بندی مدل با DDP
     ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     
+    # اصلاح: دسترسی به hesitant_fuzzy از طریق module
     hesitant_net = ensemble.module.hesitant_fuzzy
     trainable = sum(p.numel() for p in hesitant_net.parameters())
     total_params = sum(p.numel() for p in ensemble.parameters())
@@ -927,6 +929,7 @@ def main():
     ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        # اصلاح: دسترسی به hesitant_fuzzy از طریق module
         ensemble.module.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
         if is_main:
             print("Best hesitant fuzzy network loaded.\n")
@@ -935,6 +938,7 @@ def main():
         print("\n" + "="*70)
         print("EVALUATING FUZZY HESITANT ENSEMBLE")
         print("="*70)
+    # اصلاح: ارسال ensemble.module به تابع ارزیابی
     ensemble_test_acc, ensemble_weights, membership_values, activation_percentages = evaluate_ensemble_final(
         ensemble.module, test_loader, device, "Test", MODEL_NAMES, is_main
     )
@@ -971,6 +975,7 @@ def main():
         # Save final model
         final_model_path = os.path.join(args.save_dir, 'final_ensemble_model.pt')
         torch.save({
+            # اصلاح: دسترسی به state_dict از طریق module
             'ensemble_state_dict': ensemble.module.state_dict(),
             'hesitant_fuzzy_state_dict': ensemble.module.hesitant_fuzzy.state_dict(),
             'test_accuracy': ensemble_test_acc,
@@ -985,6 +990,7 @@ def main():
         print("GENERATING GRADCAM VISUALIZATIONS FOR ENSEMBLE OUTPUT")
         print("="*70)
 
+        # اصلاح: دسترسی به ensemble.module برای ارزیابی
         ensemble.module.eval()
         vis_dir = os.path.join(args.save_dir, 'gradcam_vis')
         os.makedirs(vis_dir, exist_ok=True)
@@ -1025,6 +1031,7 @@ def main():
 
             # پیش‌بینی انسامبل
             with torch.no_grad():
+                # اصلاح: دسترسی به ensemble.module
                 output, weights, _, _ = ensemble.module(image, return_details=True)
             pred = 1 if output.squeeze().item() > 0 else 0
             print(f"  Predicted: {'real' if pred == 1 else 'fake'}")
@@ -1033,12 +1040,14 @@ def main():
             active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
             combined_cam = None
             for i in active_models:
+                # اصلاح: دسترسی به ensemble.module.models
                 model = ensemble.module.models[i]
                 for p in model.parameters():
                     p.requires_grad_(True)
                 target_layer = model.layer4[2].conv3
                 gradcam = GradCAM(model, target_layer)
                 with torch.enable_grad():
+                    # اصلاح: دسترسی به ensemble.module.normalizations
                     x_n = ensemble.module.normalizations(image, i)
                     model_out = model(x_n)
                     if isinstance(model_out, (tuple, list)):
