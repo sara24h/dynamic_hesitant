@@ -1097,12 +1097,22 @@ def main():
                     p.requires_grad_(False)
 
             if combined_cam is not None:
-                # اصلاح: تبدیل combined_cam به آرایه numpy قبل از تغییر اندازه
+                # اصلاح: تبدیل combined_cam به آرایه numpy و بررسی ابعاد
                 combined_cam_np = combined_cam.cpu().numpy()
-                combined_cam = (combined_cam_np - combined_cam_np.min()) / (combined_cam_np.max() - combined_cam_np.min() + 1e-8)
+                
+                # بررسی ابعاد combined_cam
+                if combined_cam_np.size == 0:
+                    print(f"Warning: Empty CAM for sample {idx}, skipping visualization")
+                    continue
+                
+                # نرمال‌سازی combined_cam
+                combined_cam_norm = (combined_cam_np - combined_cam_np.min()) / (combined_cam_np.max() - combined_cam_np.min() + 1e-8)
+                
                 img_np = image[0].cpu().permute(1, 2, 0).numpy()
                 img_h, img_w = img_np.shape[:2]
-                combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h))
+                
+                # تغییر اندازه combined_cam_norm
+                combined_cam_resized = cv2.resize(combined_cam_norm, (img_w, img_h))
 
                 heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
                 heatmap = np.float32(heatmap) / 255
