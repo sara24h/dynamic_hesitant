@@ -229,7 +229,7 @@ def prepare_deepflux_dataset(base_dir, seed=42):
 
 def prepare_uadfV_dataset(base_dir, seed=42):
     """
-    Prepares the UADFV dataset for splitting.
+    Prepares UADFV dataset for splitting.
     Assumes the base_dir is the root of the UADFV folder.
     """
     if not os.path.exists(base_dir):
@@ -713,16 +713,17 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         gathered_weights = None
         gathered_memberships = None
 
-    dist.gather(local_preds_tensor, gathered_preds, dst=0)
-    dist.gather(local_labels_tensor, gathered_labels, dst=0)
-    dist.gather(local_weights_tensor, gathered_weights, dst=0)
-    dist.gather(local_memberships_tensor, gathered_memberships, dst=0)
+    # اصلاح: انتقال تانسورها به دستگاه مناسب قبل از gather
+    dist.gather(local_preds_tensor.to(device), gathered_preds, dst=0)
+    dist.gather(local_labels_tensor.to(device), gathered_labels, dst=0)
+    dist.gather(local_weights_tensor.to(device), gathered_weights, dst=0)
+    dist.gather(local_memberships_tensor.to(device), gathered_memberships, dst=0)
 
     if is_main:
-        all_preds = torch.cat(gathered_preds).numpy()
-        all_labels = torch.cat(gathered_labels).numpy()
-        all_weights = torch.cat(gathered_weights).numpy()
-        all_memberships = torch.cat(gathered_memberships).numpy()
+        all_preds = torch.cat(gathered_preds).cpu().numpy()
+        all_labels = torch.cat(gathered_labels).cpu().numpy()
+        all_weights = torch.cat(gathered_weights).cpu().numpy()
+        all_memberships = torch.cat(gathered_memberships).cpu().numpy()
         
         acc = 100. * np.mean(all_preds == all_labels)
         avg_weights = all_weights.mean(axis=0)
