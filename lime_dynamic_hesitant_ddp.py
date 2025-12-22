@@ -105,7 +105,7 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         image_tensor: Input image tensor
         device: Device to run computations on
         target_size: Target size for the explanation
-        hide_rest: If True, grays out the unimportant superpixels (like in papers).
+        hide_rest: If True, grays out the unimportant superpixels.
                    If False, highlights the boundaries of important superpixels.
         
     Returns:
@@ -140,12 +140,10 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
     )
     
     # Get the explanation for the predicted class
-    # THIS IS THE KEY CHANGE:
-    # hide_rest=True will gray out the unimportant parts.
-    # positive_only=False shows both positive and negative contributors.
+    # >>>>>>>>>>>>> اینجا تغییر اصلی را اعمال کنید <<<<<<<<<<<<<<
     temp, mask = explanation.get_image_and_mask(
         explanation.top_labels[0], 
-        positive_only=False, 
+        positive_only=True,  # <<< به True تغییر دادید
         num_features=10, 
         hide_rest=hide_rest
     )
@@ -1232,10 +1230,7 @@ def main():
                     
                     print(f"  GradCAM saved: {gradcam_save_path}")
 
-            # تولید LIME
-            # ... داخل حلقه visualization ...
-
-# تولید LIME با روش جدید (نواحی خاکستری)
+         
             if idx < args.num_lime_samples:
                 try:
         # فراخوانی با hide_rest=True برای تولید تصاویر مقاله‌ای
