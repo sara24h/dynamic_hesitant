@@ -1049,17 +1049,17 @@ def main():
         # ذخیره نتایج
         # نمونه اصلاح شده برای بخش ذخیره نتایج
         final_results = {
-            "test_accuracy": float(test_acc),  # تبدیل به float پایتون
+            "test_accuracy": float(ensemble_test_acc),  # تبدیل به float پایتون
             "avg_diversity": float(avg_diversity),
             "avg_kappa": float(avg_kappa),
-            "model_weights": [float(w) for w in model_weights]
+            "model_weights": [float(w) for w in ensemble_weights]
         }
 
 # فقط Rank 0 عملیات ذخیره فایل را انجام دهد تا تداخل پیش نیاید
         if dist.get_rank() == 0:
             with open("final_results.json", "w") as f:
                 json.dump(final_results, f, indent=4)
-             print("Results saved successfully!")
+            print("Results saved successfully!")
         
         # ذخیره مدل نهایی
         final_model_path = os.path.join(args.save_dir, 'final_kappa_ensemble.pt')
