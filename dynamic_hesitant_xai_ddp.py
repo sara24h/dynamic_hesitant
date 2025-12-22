@@ -667,7 +667,7 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
                               name: str, mean: Tuple[float, float, float], 
                               std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
-    normalizer = MultiModelNormalization([mean], [std])
+    normalizer = MultiModelNormalization([mean], [std]).to(device) 
     correct = 0
     total = 0
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
