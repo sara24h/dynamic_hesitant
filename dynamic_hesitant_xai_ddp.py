@@ -1020,7 +1020,7 @@ def main():
         args.epochs, args.lr, device, args.save_dir, local_rank
     )
     
-    # بارگذاری بهترین مدل
+    dist.barrier()
     ckpt_path = os.path.join(args.save_dir, 'best_kappa_aware_ensemble.pt')
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -1047,26 +1047,19 @@ def main():
         print(f"Improvement           : {improvement:+.2f}%")
         
         # ذخیره نتایج
+        # نمونه اصلاح شده برای بخش ذخیره نتایج
         final_results = {
-            'best_single_model': {
-                'name': MODEL_NAMES[best_idx],
-                'accuracy': best_single
-            },
-            'ensemble': {
-                'test_accuracy': ensemble_test_acc,
-                'avg_diversity': avg_diversity,
-                'avg_kappa': avg_kappa,
-                'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)},
-                'activation_percentages': {name: float(p) for name, p in zip(MODEL_NAMES, activation_percentages)}
-            },
-            'improvement': float(improvement),
-            'training_history': history
+            "test_accuracy": float(test_acc),  # تبدیل به float پایتون
+            "avg_diversity": float(avg_diversity),
+            "avg_kappa": float(avg_kappa),
+            "model_weights": [float(w) for w in model_weights]
         }
-        
-        results_path = os.path.join(args.save_dir, 'final_results_kappa.json')
-        with open(results_path, 'w') as f:
-            json.dump(final_results, f, indent=4)
-        print(f"\nResults saved to: {results_path}")
+
+# فقط Rank 0 عملیات ذخیره فایل را انجام دهد تا تداخل پیش نیاید
+        if dist.get_rank() == 0:
+            with open("final_results.json", "w") as f:
+                json.dump(final_results, f, indent=4)
+             print("Results saved successfully!")
         
         # ذخیره مدل نهایی
         final_model_path = os.path.join(args.save_dir, 'final_kappa_ensemble.pt')
