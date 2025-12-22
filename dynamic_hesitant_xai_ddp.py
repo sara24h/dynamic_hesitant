@@ -913,27 +913,30 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+# این بخش را جایگزین تابع main() فعلی خود کنید
+
 def main():
     SEED = 42
     set_seed(SEED)
   
     # راه‌اندازی محیط توزیع‌شده
     device, local_rank, rank, world_size = setup_distributed()
-    is_main = rank == 0  # فقط در پردازش اصلی چاپ می‌کنیم
+    is_main = rank == 0
   
-    parser = argparse.ArgumentParser(description="Train Fuzzy Hesitant Ensemble")
+    parser = argparse.ArgumentParser(description="Train Kappa-Aware Fuzzy Hesitant Ensemble")
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--num_memberships', type=int, default=3, help='Number of membership values per model')
-    parser.add_argument('--num_grad_cam_samples', type=int, default=5, help='Number of samples for GradCAM visualization')
-    parser.add_argument('--dataset', type=str, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'], required=True,
-                       help='Dataset type')
-    parser.add_argument('--data_dir', type=str, required=True, help='Base directory of dataset')
-    parser.add_argument('--model_paths', type=str, nargs='+', required=True, help='Paths to pruned model checkpoints')
-    parser.add_argument('--model_names', type=str, nargs='+', required=True, help='Names for each model')
+    parser.add_argument('--num_memberships', type=int, default=3)
+    parser.add_argument('--diversity_weight', type=float, default=0.3)
+    parser.add_argument('--min_diversity_threshold', type=float, default=0.2)
+    parser.add_argument('--num_grad_cam_samples', type=int, default=5)
+    parser.add_argument('--dataset', type=str, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'], required=True)
+    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--model_paths', type=str, nargs='+', required=True)
+    parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/')
-    parser.add_argument('--seed', type=int, default=SEED, help='Random seed for reproducibility')
+    parser.add_argument('--seed', type=int, default=SEED)
   
     args = parser.parse_args()
   
@@ -951,39 +954,37 @@ def main():
   
     if is_main:
         print("="*70)
-        print(f"Distributed Data Parallel Training on {world_size} GPUs | SEED: {args.seed}")
+        print(f"Distributed Training on {world_size} GPUs | SEED: {args.seed}")
         print("="*70)
         print(f"Device: {device}")
         print(f"Batch size: {args.batch_size}")
         print(f"Dataset: {args.dataset}")
         print(f"Data directory: {args.data_dir}")
-        print(f"\nUsing normalization parameters:")
-        print(f" MEANS: {MEANS}")
-        print(f" STDS: {STDS}")
-        print(f"\nModels to load:")
-        for i, (path, name) in enumerate(zip(args.model_paths, args.model_names)):
-            print(f" {i+1}. {name}: {path}")
+        print(f"Diversity weight: {args.diversity_weight}")
+        print(f"Min diversity threshold: {args.min_diversity_threshold}")
         print("="*70 + "\n")
   
     base_models = load_pruned_models(args.model_paths, device)
     if len(base_models) != len(args.model_paths):
         if is_main:
-            print(f"[WARNING] Only {len(base_models)}/{len(args.model_paths)} models loaded. Adjusting parameters.")
+            print(f"[WARNING] Only {len(base_models)}/{len(args.model_paths)} models loaded.")
         MEANS = MEANS[:len(base_models)]
         STDS = STDS[:len(base_models)]
         MODEL_NAMES = args.model_names[:len(base_models)]
     else:
         MODEL_NAMES = args.model_names
   
-    ensemble = FuzzyHesitantEnsemble(
-        base_models, MEANS, STDS,
+    # ✅ استفاده از نام صحیح کلاس و پارامترهای درست
+    ensemble = KappaAwareFuzzyEnsemble(
+        base_models, 
+        MEANS, 
+        STDS,
         num_memberships=args.num_memberships,
         freeze_models=True,
-        cum_weight_threshold=0.9,
-        hesitancy_threshold=0.2
+        diversity_weight=args.diversity_weight,
+        min_diversity_threshold=args.min_diversity_threshold
     ).to(device)
     
-    # بسته‌بندی مدل با DDP
     ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
     
     hesitant_net = ensemble.module.hesitant_fuzzy
@@ -992,55 +993,60 @@ def main():
     if is_main:
         print(f"Total params: {total_params:,} | Trainable: {trainable:,} | Frozen: {total_params - trainable:,}\n")
   
-    # ایجاد DataLoader با DistributedSampler
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset, is_distributed=True
     )
     
-    # ارزیابی مدل‌های فردی با تابع DDP
+    # ارزیابی مدل‌های فردی
     if is_main:
         print("\n" + "="*70)
-        print("EVALUATING INDIVIDUAL MODELS ON TEST SET (Before Training)")
+        print("EVALUATING INDIVIDUAL MODELS (Before Training)")
         print("="*70)
+    
     individual_accs = []
     for i, model in enumerate(base_models):
-        acc = evaluate_single_model_ddp(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", is_main)
+        acc = evaluate_single_model(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", 
+                                    MEANS[i], STDS[i], is_main, is_distributed=True)
         individual_accs.append(acc)
+    
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
     if is_main:
-        print(f"\nBest Single Model: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+        print(f"\nBest Single Model: {MODEL_NAMES[best_idx]} → {best_single:.2f}%")
   
-    best_val_acc, history = train_hesitant_fuzzy(
+    # ✅ استفاده از تابع صحیح آموزش
+    best_val_acc, history = train_kappa_aware_ensemble(
         ensemble, train_loader, val_loader,
         args.epochs, args.lr, device, args.save_dir, local_rank
     )
     
-    ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
+    # بارگذاری بهترین مدل
+    ckpt_path = os.path.join(args.save_dir, 'best_kappa_aware_ensemble.pt')
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         ensemble.module.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
         if is_main:
-            print("Best hesitant fuzzy network loaded.\n")
+            print("Best model loaded.\n")
 
+    # ارزیابی نهایی
     if is_main:
         print("\n" + "="*70)
-        print("EVALUATING FUZZY HESITANT ENSEMBLE")
+        print("FINAL EVALUATION")
         print("="*70)
-    ensemble_test_acc, ensemble_weights, membership_values, activation_percentages = evaluate_ensemble_final_ddp(
-        ensemble.module, test_loader, device, "Test", MODEL_NAMES, is_main
-    )
+    
+    ensemble_test_acc, ensemble_weights, avg_diversity, avg_kappa, activation_percentages = \
+        evaluate_ensemble_final_kappa(ensemble.module, test_loader, device, "Test", MODEL_NAMES, is_main)
     
     if is_main:
         print("\n" + "="*70)
         print("FINAL COMPARISON")
         print("="*70)
         print(f"Best Single Model Acc : {best_single:.2f}%")
-        print(f"Hesitant Ensemble Acc : {ensemble_test_acc:.2f}%")
+        print(f"Kappa-Aware Ensemble  : {ensemble_test_acc:.2f}%")
         improvement = ensemble_test_acc - best_single
-        print(f"Improvement : {improvement:+.2f}%")
+        print(f"Improvement           : {improvement:+.2f}%")
         
-        # Save final results
+        # ذخیره نتایج
         final_results = {
             'best_single_model': {
                 'name': MODEL_NAMES[best_idx],
@@ -1048,6 +1054,8 @@ def main():
             },
             'ensemble': {
                 'test_accuracy': ensemble_test_acc,
+                'avg_diversity': avg_diversity,
+                'avg_kappa': avg_kappa,
                 'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)},
                 'activation_percentages': {name: float(p) for name, p in zip(MODEL_NAMES, activation_percentages)}
             },
@@ -1055,98 +1063,91 @@ def main():
             'training_history': history
         }
         
-        results_path = os.path.join(args.save_dir, 'final_results.json')
+        results_path = os.path.join(args.save_dir, 'final_results_kappa.json')
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=4)
         print(f"\nResults saved to: {results_path}")
         
-        # Save final model
-        final_model_path = os.path.join(args.save_dir, 'final_ensemble_model.pt')
+        # ذخیره مدل نهایی
+        final_model_path = os.path.join(args.save_dir, 'final_kappa_ensemble.pt')
         torch.save({
             'ensemble_state_dict': ensemble.module.state_dict(),
             'hesitant_fuzzy_state_dict': ensemble.module.hesitant_fuzzy.state_dict(),
             'test_accuracy': ensemble_test_acc,
             'model_names': MODEL_NAMES,
             'means': MEANS,
-            'stds': STDS
+            'stds': STDS,
+            'diversity_weight': args.diversity_weight
         }, final_model_path)
         print(f"Final model saved: {final_model_path}")
 
-        # GradCAM Visualization - فقط در پردازش اصلی اجرا می‌شود
+        # GradCAM Visualization
         print("="*70)
-        print("GENERATING GRADCAM VISUALIZATIONS FOR ENSEMBLE OUTPUT")
+        print("GENERATING GRADCAM VISUALIZATIONS")
         print("="*70)
 
         ensemble.module.eval()
-        vis_dir = os.path.join(args.save_dir, 'gradcam_vis')
+        vis_dir = os.path.join(args.save_dir, 'gradcam_kappa_vis')
         os.makedirs(vis_dir, exist_ok=True)
 
         if args.dataset == 'wild':
-            # در حالت 'wild'، مستقیماً از ImageFolder استفاده می‌کنیم
             full_test_dataset = test_loader.dataset
-            # ایجاد شاخص‌های تصادفی برای نمونه‌برداری
             total_samples = len(full_test_dataset)
             vis_indices = list(range(total_samples))
             random.shuffle(vis_indices)
             vis_indices = vis_indices[:args.num_grad_cam_samples]
             vis_dataset = Subset(full_test_dataset, vis_indices)
         else:
-            # برای حالت‌های دیگر که از Subset استفاده می‌کنند
             test_indices = test_loader.dataset.indices
             vis_indices = test_indices.copy()
             random.shuffle(vis_indices)
             vis_indices = vis_indices[:args.num_grad_cam_samples]
             vis_dataset = Subset(test_loader.dataset.dataset, vis_indices)
 
-        vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
+        vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0)
 
-        # در حلقه، از شاخص صحیح برای استخراج مسیر و لیبل استفاده کنید
         for idx, (image, label_from_loader) in enumerate(vis_loader):
             image = image.to(device)
-            
-            # شاخص واقعی این نمونه در مجموعه داده اصلی
             original_full_dataset_index = vis_indices[idx]
             
-            # مسیر و لیبل واقعی را با استفاده از شاخص صحیح استخراج کنید
             if args.dataset == 'wild':
-                # در حالت 'wild'، مستقیماً از ImageFolder استفاده می‌کنیم
                 img_path, true_label = full_test_dataset.samples[original_full_dataset_index]
             else:
-                # برای حالت‌های دیگر
                 img_path, true_label = test_loader.dataset.dataset.samples[original_full_dataset_index]
 
             print(f"\n[GradCAM {idx+1}/{len(vis_loader)}]")
-            print(f"  Original image path: {img_path}")
-            print(f"  True label: {'real' if true_label == 1 else 'fake'} (label={true_label})")
+            print(f"  Path: {img_path}")
+            print(f"  True: {'real' if true_label == 1 else 'fake'}")
 
-            # پیش‌بینی انسامبل
             with torch.no_grad():
-                output, weights, _, _ = ensemble.module(image, return_details=True)
+                output, weights, _, _, _ = ensemble.module(image, return_details=True)
             pred = 1 if output.squeeze().item() > 0 else 0
-            print(f"  Predicted: {'real' if pred == 1 else 'fake'}")
+            print(f"  Pred: {'real' if pred == 1 else 'fake'}")
 
-            # بقیه کد GradCAM با استفاده از پیاده‌سازی سفارشی
             active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
             combined_cam = None
+            
             for i in active_models:
                 model = ensemble.module.models[i]
                 for p in model.parameters():
                     p.requires_grad_(True)
                 target_layer = model.layer4[2].conv3
                 gradcam = GradCAM(model, target_layer)
+                
                 with torch.enable_grad():
                     x_n = ensemble.module.normalizations(image, i)
                     model_out = model(x_n)
                     if isinstance(model_out, (tuple, list)):
                         model_out = model_out[0]
-                    model_out = model_out.squeeze()
-                    score = model_out if pred == 1 else -model_out
+                    score = model_out.squeeze() if pred == 1 else -model_out.squeeze()
                     cam = gradcam.generate(score)
+                
                 weight = weights[0, i].item()
                 if combined_cam is None:
                     combined_cam = weight * cam
                 else:
                     combined_cam += weight * cam
+                
                 for p in model.parameters():
                     p.requires_grad_(False)
 
@@ -1161,23 +1162,57 @@ def main():
                 overlay = heatmap + img_np
                 overlay = overlay / overlay.max()
 
-                save_path = os.path.join(vis_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+                save_path = os.path.join(vis_dir, f"sample_{idx}_true{true_label}_pred{pred}.png")
                 
                 plt.figure(figsize=(10, 10))
                 plt.imshow(overlay)
-                plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+                plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
                 plt.axis('off')
                 plt.savefig(save_path, bbox_inches='tight', dpi=200)
                 plt.close()
                 
-                print(f"  GradCAM saved: {save_path}")
+                print(f"  Saved: {save_path}")
 
         print("="*70)
-        print("GradCAM visualizations completed!")
+        print("GradCAM completed!")
         print("="*70)
     
-    # پاک‌سازی محیط توزیع‌شده
     cleanup_distributed()
+
+
+# تابع کمکی برای ارزیابی مدل‌های فردی
+@torch.no_grad()
+def evaluate_single_model(model, loader, device, name, mean, std, is_main, is_distributed=False):
+    model.eval()
+    correct = total = 0
+    mean_t = torch.tensor(mean).view(1, 3, 1, 1).to(device)
+    std_t = torch.tensor(std).view(1, 3, 1, 1).to(device)
+    
+    for images, labels in loader:
+        images = images.to(device)
+        labels = labels.to(device)
+        images_norm = (images - mean_t) / std_t
+        
+        outputs = model(images_norm)
+        if isinstance(outputs, (tuple, list)):
+            outputs = outputs[0]
+        
+        pred = (outputs.squeeze(1) > 0).long()
+        total += labels.size(0)
+        correct += pred.eq(labels.long()).sum().item()
+    
+    if is_distributed:
+        correct_t = torch.tensor(correct, dtype=torch.long, device=device)
+        total_t = torch.tensor(total, dtype=torch.long, device=device)
+        dist.all_reduce(correct_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_t, op=dist.ReduceOp.SUM)
+        correct = correct_t.item()
+        total = total_t.item()
+    
+    acc = 100. * correct / total
+    if is_main:
+        print(f"{name}: {acc:.2f}%")
+    return acc
 
 
 if __name__ == "__main__":
