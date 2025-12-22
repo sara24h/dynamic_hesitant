@@ -912,6 +912,10 @@ def main():
     parser.add_argument('--num_grad_cam_samples', type=int, default=5, help='Number of samples for GradCAM visualization')
     parser.add_argument('--dataset', type=str, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'], required=True,
                        help='Dataset type')
+    parser.add_argument('--cum_weight_threshold', type=float, default=0.9, 
+                   help='Cumulative weight threshold for model selection (default: 0.9)')
+    parser.add_argument('--hesitancy_threshold', type=float, default=0.2, 
+                   help='Hesitancy threshold for high uncertainty detection (default: 0.2)')
     parser.add_argument('--data_dir', type=str, required=True, help='Base directory of dataset')
     parser.add_argument('--model_paths', type=str, nargs='+', required=True, help='Paths to pruned model checkpoints')
     parser.add_argument('--model_names', type=str, nargs='+', required=True, help='Names for each model')
@@ -962,11 +966,11 @@ def main():
         base_models, MEANS, STDS,
         num_memberships=args.num_memberships,
         freeze_models=True,
-        cum_weight_threshold=0.9,
-        hesitancy_threshold=0.2
+        cum_weight_threshold=args.cum_weight_threshold,
+        hesitancy_threshold=args.hesitancy_threshold
     ).to(device)
     
-    # بسته‌بندی مدل با DDP
+
     ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
     
     hesitant_net = ensemble.module.hesitant_fuzzy
