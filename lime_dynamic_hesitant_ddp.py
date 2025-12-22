@@ -1250,7 +1250,7 @@ def main():
                     plt.savefig(lime_save_path, bbox_inches='tight', dpi=200)
                     plt.close()
         
-                   print(f"  LIME (Grayed) saved: {lime_save_path}")
+                    print(f"  LIME (Grayed) saved: {lime_save_path}")
 
                 except Exception as e:
                     print(f"  Error generating LIME: {e}")
