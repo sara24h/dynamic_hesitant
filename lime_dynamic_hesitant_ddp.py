@@ -96,7 +96,8 @@ class GradCAM:
         cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
         return cam.squeeze().cpu().numpy()
 
-def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256), hide_rest=False):
+# تابع جدید برای تولید توضیحات LIME
+def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256)):
     """
     Generate LIME explanation for a given image and model.
     
@@ -105,8 +106,6 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         image_tensor: Input image tensor
         device: Device to run computations on
         target_size: Target size for the explanation
-        hide_rest: If True, grays out the unimportant superpixels (like in papers).
-                   If False, highlights the boundaries of important superpixels.
         
     Returns:
         LIME explanation image
@@ -140,14 +139,11 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
     )
     
     # Get the explanation for the predicted class
-    # THIS IS THE KEY CHANGE:
-    # hide_rest=True will gray out the unimportant parts.
-    # positive_only=False shows both positive and negative contributors.
     temp, mask = explanation.get_image_and_mask(
         explanation.top_labels[0], 
-        positive_only=False, 
+        positive_only=True, 
         num_features=10, 
-        hide_rest=hide_rest
+        hide_rest=False
     )
     
     # Create the explanation image
@@ -1233,25 +1229,48 @@ def main():
                     print(f"  GradCAM saved: {gradcam_save_path}")
 
             # تولید LIME
-            # ... داخل حلقه visualization ...
-
-# تولید LIME با روش جدید (نواحی خاکستری)
             if idx < args.num_lime_samples:
                 try:
-        # فراخوانی با hide_rest=True برای تولید تصاویر مقاله‌ای
-                    lime_img_grayed = generate_lime_explanation(ensemble.module, image, device, hide_rest=True)
-        
-                    lime_save_path = os.path.join(lime_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}_grayed.png")
-        
+                    lime_img = generate_lime_explanation(ensemble.module, image, device)
+                    
+                    lime_save_path = os.path.join(lime_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+                    
                     plt.figure(figsize=(10, 10))
-                    plt.imshow(lime_img_grayed)
+                    plt.imshow(lime_img)
                     plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
                     plt.axis('off')
                     plt.savefig(lime_save_path, bbox_inches='tight', dpi=200)
                     plt.close()
-        
-                    print(f"  LIME (Grayed) saved: {lime_save_path}")
-
+                    
+                    print(f"  LIME saved: {lime_save_path}")
+                    
+                    # ایجاد تصویر ترکیبی از GradCAM و LIME
+                    if idx < args.num_grad_cam_samples and 'combined_cam' in locals():
+                        combined_save_path = os.path.join(combined_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+                        
+                        fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+                        
+                        # تصویر اصلی
+                        axes[0].imshow(img_np)
+                        axes[0].set_title("Original Image")
+                        axes[0].axis('off')
+                        
+                        # GradCAM
+                        axes[1].imshow(overlay)
+                        axes[1].set_title("GradCAM")
+                        axes[1].axis('off')
+                        
+                        # LIME
+                        axes[2].imshow(lime_img)
+                        axes[2].set_title("LIME")
+                        axes[2].axis('off')
+                        
+                        plt.suptitle(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+                        plt.tight_layout()
+                        plt.savefig(combined_save_path, bbox_inches='tight', dpi=200)
+                        plt.close()
+                        
+                        print(f"  Combined visualization saved: {combined_save_path}")
                 except Exception as e:
                     print(f"  Error generating LIME: {e}")
 
