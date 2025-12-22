@@ -664,20 +664,16 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
 
 @torch.no_grad()
 def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device, 
-                               name: str, is_main: bool, normalizer: MultiModelNormalization, 
-                               model_idx: int) -> float:
- 
+                              name: str, mean: Tuple[float, float, float], 
+                              std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
+    normalizer = MultiModelNormalization([mean], [std])
     correct = 0
     total = 0
-    
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
-        
-        # ✅ اعمال نرمالیزاسیون با استفاده از MultiModelNormalization
-        images_normalized = normalizer(images, model_idx)
-        
-        out = model(images_normalized)
+        images = normalizer(images, 0)
+        out = model(images)
         if isinstance(out, (tuple, list)):
             out = out[0]
         pred = (out.squeeze(1) > 0).long()
@@ -952,7 +948,6 @@ def main():
             print(f" {i+1}. {name}: {path}")
         print("="*70 + "\n")
   
-    # بارگذاری مدل‌های پایه
     base_models = load_pruned_models(args.model_paths, device)
     if len(base_models) != len(args.model_paths):
         if is_main:
@@ -963,12 +958,6 @@ def main():
     else:
         MODEL_NAMES = args.model_names
   
-    # ✅ ایجاد normalizer برای استفاده در ارزیابی مدل‌های تکی و انسمبل
-    normalizer = MultiModelNormalization(MEANS, STDS).to(device)
-    if is_main:
-        print(f"✓ MultiModelNormalization created with {len(base_models)} models\n")
-  
-    # ساخت مدل انسمبل
     ensemble = FuzzyHesitantEnsemble(
         base_models, MEANS, STDS,
         num_memberships=args.num_memberships,
@@ -991,56 +980,40 @@ def main():
         args.data_dir, args.batch_size, dataset_type=args.dataset, is_distributed=True
     )
     
-    # ✅ ارزیابی مدل‌های فردی با نرمالیزاسیون صحیح
+    # ارزیابی مدل‌های فردی با تابع DDP
     if is_main:
         print("\n" + "="*70)
         print("EVALUATING INDIVIDUAL MODELS ON TEST SET (Before Training)")
         print("="*70)
-    
     individual_accs = []
     for i, model in enumerate(base_models):
-        acc = evaluate_single_model_ddp(
-            model=model,
-            loader=test_loader,
-            device=device,
-            name=f"Model {i+1} ({MODEL_NAMES[i]})",
-            is_main=is_main,
-            normalizer=normalizer,  # ✅ پاس دادن normalizer
-            model_idx=i            # ✅ شاخص مدل
-        )
+        acc = evaluate_single_model_ddp(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i],is_main)
         individual_accs.append(acc)
-    
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
     if is_main:
         print(f"\nBest Single Model: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
-        print("="*70)
   
-    # آموزش شبکه Fuzzy Hesitant
     best_val_acc, history = train_hesitant_fuzzy(
         ensemble, train_loader, val_loader,
         args.epochs, args.lr, device, args.save_dir, local_rank
     )
     
-    # بارگذاری بهترین مدل
     ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         ensemble.module.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
         if is_main:
-            print("✓ Best hesitant fuzzy network loaded.\n")
+            print("Best hesitant fuzzy network loaded.\n")
 
-    # ارزیابی نهایی انسمبل
     if is_main:
         print("\n" + "="*70)
         print("EVALUATING FUZZY HESITANT ENSEMBLE")
         print("="*70)
-    
     ensemble_test_acc, ensemble_weights, membership_values, activation_percentages = evaluate_ensemble_final_ddp(
         ensemble.module, test_loader, device, "Test", MODEL_NAMES, is_main
     )
     
-    # مقایسه نهایی و ذخیره نتایج
     if is_main:
         print("\n" + "="*70)
         print("FINAL COMPARISON")
@@ -1048,16 +1021,13 @@ def main():
         print(f"Best Single Model Acc : {best_single:.2f}%")
         print(f"Hesitant Ensemble Acc : {ensemble_test_acc:.2f}%")
         improvement = ensemble_test_acc - best_single
-        print(f"Improvement           : {improvement:+.2f}%")
+        print(f"Improvement : {improvement:+.2f}%")
         
-        # ذخیره نتایج نهایی
+        # Save final results
         final_results = {
             'best_single_model': {
                 'name': MODEL_NAMES[best_idx],
                 'accuracy': best_single
-            },
-            'individual_models': {
-                MODEL_NAMES[i]: float(acc) for i, acc in enumerate(individual_accs)
             },
             'ensemble': {
                 'test_accuracy': ensemble_test_acc,
@@ -1071,9 +1041,9 @@ def main():
         results_path = os.path.join(args.save_dir, 'final_results.json')
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=4)
-        print(f"\n✓ Results saved to: {results_path}")
+        print(f"\nResults saved to: {results_path}")
         
-        # ذخیره مدل نهایی
+        # Save final model
         final_model_path = os.path.join(args.save_dir, 'final_ensemble_model.pt')
         torch.save({
             'ensemble_state_dict': ensemble.module.state_dict(),
@@ -1083,10 +1053,10 @@ def main():
             'means': MEANS,
             'stds': STDS
         }, final_model_path)
-        print(f"✓ Final model saved: {final_model_path}")
+        print(f"Final model saved: {final_model_path}")
 
-        # ✅ GradCAM Visualization - با استفاده از normalizer
-        print("\n" + "="*70)
+        # GradCAM Visualization - فقط در پردازش اصلی اجرا می‌شود
+        print("="*70)
         print("GENERATING GRADCAM VISUALIZATIONS FOR ENSEMBLE OUTPUT")
         print("="*70)
 
@@ -1095,13 +1065,16 @@ def main():
         os.makedirs(vis_dir, exist_ok=True)
 
         if args.dataset == 'wild':
+            # در حالت 'wild'، مستقیماً از ImageFolder استفاده می‌کنیم
             full_test_dataset = test_loader.dataset
+            # ایجاد شاخص‌های تصادفی برای نمونه‌برداری
             total_samples = len(full_test_dataset)
             vis_indices = list(range(total_samples))
             random.shuffle(vis_indices)
             vis_indices = vis_indices[:args.num_grad_cam_samples]
             vis_dataset = Subset(full_test_dataset, vis_indices)
         else:
+            # برای حالت‌های دیگر که از Subset استفاده می‌کنند
             test_indices = test_loader.dataset.indices
             vis_indices = test_indices.copy()
             random.shuffle(vis_indices)
@@ -1110,14 +1083,19 @@ def main():
 
         vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
 
+        # در حلقه، از شاخص صحیح برای استخراج مسیر و لیبل استفاده کنید
         for idx, (image, label_from_loader) in enumerate(vis_loader):
             image = image.to(device)
             
+            # شاخص واقعی این نمونه در مجموعه داده اصلی
             original_full_dataset_index = vis_indices[idx]
             
+            # مسیر و لیبل واقعی را با استفاده از شاخص صحیح استخراج کنید
             if args.dataset == 'wild':
+                # در حالت 'wild'، مستقیماً از ImageFolder استفاده می‌کنیم
                 img_path, true_label = full_test_dataset.samples[original_full_dataset_index]
             else:
+                # برای حالت‌های دیگر
                 img_path, true_label = test_loader.dataset.dataset.samples[original_full_dataset_index]
 
             print(f"\n[GradCAM {idx+1}/{len(vis_loader)}]")
@@ -1130,34 +1108,28 @@ def main():
             pred = 1 if output.squeeze().item() > 0 else 0
             print(f"  Predicted: {'real' if pred == 1 else 'fake'}")
 
-            # GradCAM برای مدل‌های فعال
+            # بقیه کد GradCAM با استفاده از پیاده‌سازی سفارشی
             active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
             combined_cam = None
-            
             for i in active_models:
                 model = ensemble.module.models[i]
                 for p in model.parameters():
                     p.requires_grad_(True)
-                
                 target_layer = model.layer4[2].conv3
                 gradcam = GradCAM(model, target_layer)
-                
                 with torch.enable_grad():
-                    # ✅ استفاده از normalizer برای نرمالیزاسیون
-                    x_n = normalizer(image, i)
+                    x_n = ensemble.module.normalizations(image, i)
                     model_out = model(x_n)
                     if isinstance(model_out, (tuple, list)):
                         model_out = model_out[0]
                     model_out = model_out.squeeze()
                     score = model_out if pred == 1 else -model_out
                     cam = gradcam.generate(score)
-                
                 weight = weights[0, i].item()
                 if combined_cam is None:
                     combined_cam = weight * cam
                 else:
                     combined_cam += weight * cam
-                
                 for p in model.parameters():
                     p.requires_grad_(False)
 
@@ -1181,17 +1153,14 @@ def main():
                 plt.savefig(save_path, bbox_inches='tight', dpi=200)
                 plt.close()
                 
-                print(f"  ✓ GradCAM saved: {save_path}")
+                print(f"  GradCAM saved: {save_path}")
 
-        print("\n" + "="*70)
-        print("✓ GradCAM visualizations completed!")
+        print("="*70)
+        print("GradCAM visualizations completed!")
         print("="*70)
     
     # پاک‌سازی محیط توزیع‌شده
     cleanup_distributed()
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
