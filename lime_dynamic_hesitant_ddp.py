@@ -143,7 +143,7 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         explanation.top_labels[0], 
         positive_only=True, 
         num_features=10, 
-        hide_rest=False
+        hide_rest=True
     )
     
     # Create the explanation image
