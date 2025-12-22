@@ -131,19 +131,19 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         return np.hstack([1 - probs, probs])
     
     # Generate explanation
+    # >>>>>>>>>>>>> اینجا تغییر اصلی را اعمال کنید <<<<<<<<<<<<<<
     explanation = explainer.explain_instance(
         img_np, 
         predict_fn, 
         top_labels=1, 
-        hide_color=0, 
+        hide_color=(128, 128, 128),  # <<< به رنگ خاکستری تغییر دادید
         num_samples=1000
     )
     
     # Get the explanation for the predicted class
-    # >>>>>>>>>>>>> اینجا تغییر اصلی را اعمال کنید <<<<<<<<<<<<<<
     temp, mask = explanation.get_image_and_mask(
         explanation.top_labels[0], 
-        positive_only=True,  # <<< به True تغییر دادید
+        positive_only=True,  # این را True نگه دارید
         num_features=10, 
         hide_rest=hide_rest
     )
