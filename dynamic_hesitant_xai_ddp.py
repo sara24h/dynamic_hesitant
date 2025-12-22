@@ -960,14 +960,28 @@ def main():
         test_acc, ensemble_weights, diversity_score, avg_kappa, activation_pct = \
             evaluate_ensemble_final_kappa(model_for_eval, test_loader, device, "Test", MODEL_NAMES, is_main)
         
-        # ذخیره نتایج
+        # ذخیره نتایج (با تبدیل numpy types به Python native types)
+        def convert_to_native(obj):
+            """تبدیل numpy types به Python native types برای JSON"""
+            if isinstance(obj, (np.integer, np.int32, np.int64)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float32, np.float64)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {key: convert_to_native(val) for key, val in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_native(item) for item in obj]
+            return obj
+        
         final_results = {
-            'test_accuracy': test_acc,
-            'diversity_score': diversity_score,
-            'average_kappa': avg_kappa,
+            'test_accuracy': float(test_acc),
+            'diversity_score': float(diversity_score),
+            'average_kappa': float(avg_kappa),
             'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)},
             'activation_percentages': {name: float(p) for name, p in zip(MODEL_NAMES, activation_pct)},
-            'training_history': history
+            'training_history': convert_to_native(history)
         }
         
         with open(os.path.join(args.save_dir, 'kappa_results.json'), 'w') as f:
