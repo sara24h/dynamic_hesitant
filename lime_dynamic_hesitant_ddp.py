@@ -20,12 +20,10 @@ import cv2
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 warnings.filterwarnings("ignore")
-
-# اضافه کردن کتابخانه LIME
 from lime import lime_image
 from skimage.segmentation import mark_boundaries
 
-# کلاس UADFVDataset بدون تغییر باقی می‌ماند
+
 class UADFVDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
@@ -98,19 +96,7 @@ class GradCAM:
 
 # تابع جدید برای تولید توضیحات LIME
 def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256)):
-    """
-    Generate LIME explanation for a given image and model.
-    
-    Args:
-        model: The model to explain
-        image_tensor: Input image tensor
-        device: Device to run computations on
-        target_size: Target size for the explanation
-        
-    Returns:
-        LIME explanation image
-    """
-    # Convert tensor to numpy and ensure it's in the right format
+   
     img_np = image_tensor[0].cpu().permute(1, 2, 0).numpy()
     img_np = (img_np * 255).astype(np.uint8)
     
@@ -176,9 +162,7 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 def create_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    """
-    Create reproducible train/val/test splits from a dataset
-    """
+   
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
   
     num_samples = len(dataset)
@@ -323,10 +307,7 @@ def prepare_deepflux_dataset(base_dir, seed=42):
     return full_dataset, train_indices, val_indices, test_indices
 
 def prepare_uadfV_dataset(base_dir, seed=42):
-    """
-    Prepares UADFV dataset for splitting.
-    Assumes that base_dir is the root of the UADFV folder.
-    """
+  
     if not os.path.exists(base_dir):
         raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
     temp_transform = transforms.Compose([transforms.ToTensor()])
@@ -777,161 +758,74 @@ def evaluate_accuracy_ddp(model, loader, device):
     return acc
 
 @torch.no_grad()
-@torch.no_grad()
-def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True, save_dir='.'):
+def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
-    
-    # لیست‌های محلی برای ذخیره اطلاعات
     local_preds = []
     local_labels = []
     local_weights = []
     local_memberships = []
     
-    # لیست‌های جدید برای ذخیره وضعیت آستانه
-    # used_cum: 1 یعنی از منطق تجمعی (cum) استفاده شده، 0 یعنی خیر
-    # num_models_used: تعداد مدل‌های فعال در آن نمونه
-    local_used_cum = []
-    local_num_models_used = []
-
-    for batch_idx, (images, labels) in enumerate(tqdm(loader, desc=f"Evaluating {name}", leave=True, disable=not is_main)):
+    for images, labels in tqdm(loader, desc=f"Evaluating {name}", leave=True, disable=not is_main):
         images = images.to(device)
         labels = labels.to(device)
-        
-        # دریافت خروجی با جزئیات
-        outputs, weights, memberships, _, active_counts_batch = model(images, return_details=True)
-        
-        # تشخیص اینکه در این بچ از cum استفاده شده یا خیر
-        # طبق منطق کد: اگر high_hesitancy_mask فعال باشد، cum استفاده نمی‌شود.
-        # پس اگر used_cum در خروجی نباشد (که نیست)، باید از hesitancy استنتاج کنیم.
-        # اما ما می‌توانیم از روی active_counts_batch و تعداد کل مدل‌ها حدس بزنیم.
-        # دقیق‌ترین راه این است که در کلاس مدل یک پرچم (flag) برگردانیم، 
-        # اما برای سادگی فعلاً از active_counts_batch و تعداد کل مدل‌ها استفاده می‌کنیم.
-        
-        # محاسبه تردید برای این بچ (دوباره)
-        # نکته: برای جلوگیری از محاسبه اضافه، فرض می‌کنیم اگر تعداد مدل‌های فعال مساوی کل مدل‌هاست،
-        # یعنی احتمالاً یا تردید بالا بوده یا وزن‌ها خیلی پخش شده.
-        # اما دقیق‌ترین راه این است که در کلاس مدل یک Flag اضافه کنیم.
-        
-        # بیایید یک راه ساده‌تر در تابع خودمان داشته باشیم:
-        # اگر active_count کمتر از num_models باشد یعنی حتماً cum استفاده شده (چون ماسک صفر شده).
-        # اگر active_count برابر num_models باشد، دو حالت دارد: یا تردید بالا (بدون cum) یا تردید پایین ولی همه وزن‌ها لازم بوده (با cum).
-        
-        # برای تفکیک دقیق "بدون cum" و "با cum (ولی همه مدل‌ها فعال)"،
-        # باید کلاس FuzzyHesitantEnsemble را کمی تغییر دهیم تا پرچم "used_cum" را برگرداند.
-        
-        # فعلاً فعلی‌ترین اطلاعات را ذخیره می‌کنیم:
-        # 1. تعداد مدل‌های فعال
-        # 2. وزن‌ها
-        # 3. لیبل‌ها
-        
+        outputs, weights, memberships, _ = model(images, return_details=True)
         pred = (outputs.squeeze(1) > 0).long()
         
         local_preds.append(pred)
         local_labels.append(labels)
         local_weights.append(weights)
         local_memberships.append(memberships)
-        
-        # ذخیره تعداد مدل‌های فعال برای هر نمونه در بچ
-        if active_counts_batch:
-            local_num_models_used.extend(active_counts_batch)
-            # اگر تعداد فعال کمتر از کل مدل‌ها باشد، یعنی ۱۰۰٪ cum استفاده شده
-            batch_used_cum = [1 if c < model.num_models else 0 for c in active_counts_batch]
-            local_used_cum.extend(batch_used_cum)
-        else:
-            # اگر لیست خالی بود (نباید پیش بیاید)، مقدار پیش‌فرض
-            local_num_models_used.extend([model.num_models] * images.size(0))
-            local_used_cum.extend([0] * images.size(0))
 
-    # --- Gather کردن اطلاعات از تمام GPUها ---
     local_preds_tensor = torch.cat(local_preds)
     local_labels_tensor = torch.cat(local_labels)
     local_weights_tensor = torch.cat(local_weights)
-    
-    # تبدیل لیست‌های پایتونی به تانسور برای جابجایی راحت‌تر (یا با json object)
-    # برای سادگی، فقط روند اصلی را ادامه می‌دهیم.
-    
+    local_memberships_tensor = torch.cat(local_memberships)
+
     world_size = dist.get_world_size()
     if is_main:
         gathered_preds = [torch.zeros_like(local_preds_tensor) for _ in range(world_size)]
         gathered_labels = [torch.zeros_like(local_labels_tensor) for _ in range(world_size)]
         gathered_weights = [torch.zeros_like(local_weights_tensor) for _ in range(world_size)]
+        gathered_memberships = [torch.zeros_like(local_memberships_tensor) for _ in range(world_size)]
     else:
         gathered_preds = None
         gathered_labels = None
         gathered_weights = None
+        gathered_memberships = None
 
+    # اصلاح: انتقال تانسورها به دستگاه مناسب قبل از gather
     dist.gather(local_preds_tensor, gathered_preds, dst=0)
     dist.gather(local_labels_tensor, gathered_labels, dst=0)
     dist.gather(local_weights_tensor, gathered_weights, dst=0)
+    dist.gather(local_memberships_tensor, gathered_memberships, dst=0)
 
-    # --- پردازش و چاپ نهایی در پردازنده اصلی ---
     if is_main:
-        # ترکیب داده‌ها
         all_preds = torch.cat(gathered_preds).cpu().numpy()
         all_labels = torch.cat(gathered_labels).cpu().numpy()
         all_weights = torch.cat(gathered_weights).cpu().numpy()
+        all_memberships = torch.cat(gathered_memberships).cpu().numpy()
         
-        # آمار کلی
         acc = 100. * np.mean(all_preds == all_labels)
-        
-        # تحلیل استفاده از Cum
-        # نکته: local_used_cum و local_num_models_used فقط روی GPU لوکال هستند.
-        # برای دقت ۱۰۰٪ باید این لیست‌ها را هم از همه GPUها جمع کنیم.
-        # اما چون دیتاست استرتیفای شده و تقریبا均衡 است، آمار GPU لوکال نماینده کل است.
-        
-        used_cum_count = sum(local_used_cum)
-        total_samples = len(local_num_models_used)
-        no_cum_count = total_samples - used_cum_count
+        avg_weights = all_weights.mean(axis=0)
+        activation_counts = (all_weights > 1e-4).sum(axis=0)
+        total_samples = all_weights.shape[0]
+        activation_percentages = (activation_counts / total_samples) * 100
         
         print(f"\n{'='*70}")
-        print(f"AGGREGATION LOGIC ANALYSIS ({name.upper()})")
+        print(f"{name.upper()} SET RESULTS")
         print(f"{'='*70}")
-        print(f"Total Samples Processed: {total_samples}")
-        print(f"1. Used Cumulative Threshold (Active Models < Total): {used_cum_count} ({100*used_cum_count/total_samples:.2f}%)")
-        print(f"2. Did NOT use Cum Threshold (High Hesitancy OR Full Active): {no_cum_count} ({100*no_cum_count/total_samples:.2f}%)")
-        
-        # میانگین تعداد مدل‌ها در هر دو حالت
-        avg_models_cum = np.mean([local_num_models_used[i] for i in range(total_samples) if local_used_cum[i] == 1])
-        avg_models_no_cum = np.mean([local_num_models_used[i] for i in range(total_samples) if local_used_cum[i] == 0])
-        
-        print(f"\n   -> Avg models when CUM used: {avg_models_cum:.2f}")
-        print(f"   -> Avg models when CUM NOT used: {avg_models_no_cum:.2f}")
-        print(f"{'='*70}")
-        
-        # --- ذخیره لاگ جزئیات در فایل CSV ---
-        # برای اینکه دقیقاً بدانیم کدام ایندکس چی بوده است، باید ایندکس‌ها را هم داشته باشیم.
-        # چون ایندکس‌ها را نداریم، فعلاً فقط وضعیت‌ها را ذخیره می‌کنیم.
-        
-        import csv
-        log_path = os.path.join(save_dir, 'aggregation_logic_log.csv')
-        
-        with open(log_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Sample_Index_Global', 'Used_Cum', 'Num_Active_Models', 'Pred', 'Label'] + [f'Weight_{i}' for i in range(len(model_names))])
-            
-            # نکته: چون ایندکس‌های گلوبال را نداریم (چون سابسمپل شده)، ایندکس نسبی لوکال می‌نویسیم.
-            # برای اصلاح کامل باید سابسمپل را هم برمی‌گرداندیم.
-            for i in range(len(local_labels)):
-                writer.writerow([
-                    i, 
-                    local_used_cum[i], 
-                    local_num_models_used[i], 
-                    local_preds[i].item(), 
-                    local_labels[i].item()
-                ] + [w for w in all_weights[i]]) # هشدار: all_weights شامل همه GPUهاست اما ایندکس‌ها جور نیستند. فعلاً لوکال می‌نویسیم.
-        
-        print(f"Detailed log saved to: {log_path}")
-
-        # ادامه چاپ نتایج عادی...
-        avg_weights = all_weights.mean(axis=0)
+        print(f" → Accuracy: {acc:.3f}%")
+        print(f" → Total Samples: {total_samples:,}")
         print(f"\nAverage Model Weights:")
-        for i, w in enumerate(avg_weights):
-            print(f" {i+1:2d}. {model_names[i]:<25}: {w:6.4f}")
+        for i, (w, name) in enumerate(zip(avg_weights, model_names)):
+            print(f" {i+1:2d}. {name:<25}: {w:6.4f} ({w*100:5.2f}%)")
+        print(f"\nActivation Frequency:")
+        for i, (perc, count, name) in enumerate(zip(activation_percentages, activation_counts, model_names)):
+            print(f" {i+1:2d}. {name:<25}: {perc:6.2f}% active ({int(count):,} / {total_samples:,} samples)")
         print(f"{'='*70}")
-        
-        return acc, avg_weights.tolist(), [], []
+        return acc, avg_weights.tolist(), all_memberships.mean(axis=0).tolist(), activation_percentages.tolist()
     
-    return 0.0, [0.0]*len(model_names), [], []
+    return 0.0, [0.0]*len(model_names), [[0.0]*3]*len(model_names), [0.0]*len(model_names)
 
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr, device, save_dir, local_rank):
     os.makedirs(save_dir, exist_ok=True)
@@ -1368,7 +1262,6 @@ def main():
         print(f"Combined visualizations saved to: {combined_dir}")
         print("="*70)
     
-    # پاک‌سازی محیط توزیع‌شده
     cleanup_distributed()
 
 if __name__ == "__main__":
