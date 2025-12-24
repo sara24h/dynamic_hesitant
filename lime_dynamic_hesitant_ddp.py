@@ -20,9 +20,12 @@ import cv2
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 warnings.filterwarnings("ignore")
+
+# اضافه کردن کتابخانه LIME
 from lime import lime_image
 from skimage.segmentation import mark_boundaries
 
+# کلاس UADFVDataset بدون تغییر باقی می‌ماند
 class UADFVDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
@@ -89,32 +92,44 @@ class GradCAM:
         weights = gradients.mean(dim=[1, 2], keepdim=True)
         cam = (weights * activations).sum(dim=0)
         cam = F.relu(cam)
-        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), size=(activations.shape[2], activations.shape[3]), mode='bilinear', align_corners=False)
+        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), activations.shape[1:], mode='bilinear', align_corners=False)
         cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
         return cam.squeeze().cpu().numpy()
 
 # تابع جدید برای تولید توضیحات LIME
 def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256)):
+    """
+    Generate LIME explanation for a given image and model.
+    
+    Args:
+        model: The model to explain
+        image_tensor: Input image tensor
+        device: Device to run computations on
+        target_size: Target size for the explanation
+        
+    Returns:
+        LIME explanation image
+    """
+    # Convert tensor to numpy and ensure it's in the right format
     img_np = image_tensor[0].cpu().permute(1, 2, 0).numpy()
     img_np = (img_np * 255).astype(np.uint8)
     
+    # Create LIME explainer
     explainer = lime_image.LimeImageExplainer()
     
+    # Define prediction function for LIME
     def predict_fn(images):
         batch = torch.from_numpy(images.transpose(0, 3, 1, 2)).float() / 255.0
         batch = batch.to(device)
         
         with torch.no_grad():
-            model_out = model(batch)
-            if isinstance(model_out, tuple):
-                outputs, _ = model_out
-            else:
-                outputs = model_out
-            
+            outputs, _ = model(batch)
             probs = torch.sigmoid(outputs).cpu().numpy()
             
+        # Return probabilities for both classes
         return np.hstack([1 - probs, probs])
     
+    # Generate explanation
     explanation = explainer.explain_instance(
         img_np, 
         predict_fn, 
@@ -123,6 +138,7 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         num_samples=1000
     )
     
+    # Get the explanation for the predicted class
     temp, mask = explanation.get_image_and_mask(
         explanation.top_labels[0], 
         positive_only=True, 
@@ -130,12 +146,15 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         hide_rest=True
     )
     
+    # Create the explanation image
     lime_img = mark_boundaries(temp / 255.0, mask)
+    
+    # Resize to match original image
     lime_img = cv2.resize(lime_img, target_size)
     
     return lime_img
 
-# توابع کمکی
+# توابع کمکی بدون تغییر باقی می‌مانند
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -145,6 +164,7 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
     if dist.is_initialized():
+        # Only print on the main process to avoid clutter
         if dist.get_rank() == 0:
             print(f"[SEED] All random seeds set to: {seed}")
     else:
@@ -156,73 +176,185 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 def create_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    """
+    Create reproducible train/val/test splits from a dataset
+    """
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
+  
     num_samples = len(dataset)
     indices = list(range(num_samples))
+  
+    # Get labels for stratified split
     labels = [dataset.samples[i][1] for i in indices]
-    train_val_indices, test_indices = train_test_split(indices, test_size=test_ratio, random_state=seed, stratify=labels)
+  
+    # First split: separate test set
+    train_val_indices, test_indices = train_test_split(
+        indices,
+        test_size=test_ratio,
+        random_state=seed,
+        stratify=labels
+    )
+  
+    # Second split: separate train and val
     train_val_labels = [labels[i] for i in train_val_indices]
     val_size = val_ratio / (train_ratio + val_ratio)
-    train_indices, val_indices = train_test_split(train_val_indices, test_size=val_size, random_state=seed, stratify=train_val_labels)
+  
+    train_indices, val_indices = train_test_split(
+        train_val_indices,
+        test_size=val_size,
+        random_state=seed,
+        stratify=train_val_labels
+    )
+  
     return train_indices, val_indices, test_indices
 
 def prepare_real_fake_dataset(base_dir, seed=42):
-    if os.path.exists(os.path.join(base_dir, 'training_fake')) and os.path.exists(os.path.join(base_dir, 'training_real')):
+    if os.path.exists(os.path.join(base_dir, 'training_fake')) and \
+       os.path.exists(os.path.join(base_dir, 'training_real')):
         real_fake_dir = base_dir
     elif os.path.exists(os.path.join(base_dir, 'real_and_fake_face')):
         real_fake_dir = os.path.join(base_dir, 'real_and_fake_face')
     else:
-        raise FileNotFoundError(f"Could not find training_fake/training_real in:\n - {base_dir}\n - {os.path.join(base_dir, 'real_and_fake_face')}")
+        raise FileNotFoundError(
+            f"Could not find training_fake/training_real in:\n"
+            f" - {base_dir}\n"
+            f" - {os.path.join(base_dir, 'real_and_fake_face')}"
+        )
+  
     temp_transform = transforms.Compose([transforms.ToTensor()])
     full_dataset = datasets.ImageFolder(real_fake_dir, transform=temp_transform)
+  
     if dist.get_rank() == 0:
         print(f"\n[Dataset Info - Real/Fake]")
         print(f"Total samples: {len(full_dataset)}")
-    train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=seed)
+        print(f"Classes: {full_dataset.classes}")
+        print(f"Class to index: {full_dataset.class_to_idx}")
+  
+    train_indices, val_indices, test_indices = create_reproducible_split(
+        full_dataset,
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15,
+        seed=seed
+    )
+  
+    if dist.get_rank() == 0:
+        print(f"\n[Split Statistics]")
+        print(f"Train: {len(train_indices)} samples ({len(train_indices)/len(full_dataset)*100:.1f}%)")
+        print(f"Valid: {len(val_indices)} samples ({len(val_indices)/len(full_dataset)*100:.1f}%)")
+        print(f"Test: {len(test_indices)} samples ({len(test_indices)/len(full_dataset)*100:.1f}%)")
+  
     return full_dataset, train_indices, val_indices, test_indices
 
 def prepare_hard_fake_real_dataset(base_dir, seed=42):
-    if os.path.exists(os.path.join(base_dir, 'fake')) and os.path.exists(os.path.join(base_dir, 'real')):
+    if os.path.exists(os.path.join(base_dir, 'fake')) and \
+       os.path.exists(os.path.join(base_dir, 'real')):
         dataset_dir = base_dir
     elif os.path.exists(os.path.join(base_dir, 'hardfakevsrealfaces')):
         dataset_dir = os.path.join(base_dir, 'hardfakevsrealfaces')
     else:
-        raise FileNotFoundError(f"Could not find fake/real folders in:\n - {base_dir}\n - {os.path.join(base_dir, 'hardfakevsrealfaces')}")
+        raise FileNotFoundError(
+            f"Could not find fake/real folders in:\n"
+            f" - {base_dir}\n"
+            f" - {os.path.join(base_dir, 'hardfakevsrealfaces')}"
+        )
+  
     temp_transform = transforms.Compose([transforms.ToTensor()])
     full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
+  
     if dist.get_rank() == 0:
         print(f"\n[Dataset Info - HardFakeVsReal]")
         print(f"Total samples: {len(full_dataset)}")
-    train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=seed)
+        print(f"Classes: {full_dataset.classes}")
+        print(f"Class to index: {full_dataset.class_to_idx}")
+  
+    train_indices, val_indices, test_indices = create_reproducible_split(
+        full_dataset,
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15,
+        seed=seed
+    )
+  
+    if dist.get_rank() == 0:
+        print(f"\n[Split Statistics]")
+        print(f"Train: {len(train_indices)} samples ({len(train_indices)/len(full_dataset)*100:.1f}%)")
+        print(f"Valid: {len(val_indices)} samples ({len(val_indices)/len(full_dataset)*100:.1f}%)")
+        print(f"Test: {len(test_indices)} samples ({len(test_indices)/len(full_dataset)*100:.1f}%)")
+  
     return full_dataset, train_indices, val_indices, test_indices
 
 def prepare_deepflux_dataset(base_dir, seed=42):
-    if os.path.exists(os.path.join(base_dir, 'Fake')) and os.path.exists(os.path.join(base_dir, 'Real')):
+    if os.path.exists(os.path.join(base_dir, 'Fake')) and \
+       os.path.exists(os.path.join(base_dir, 'Real')):
         dataset_dir = base_dir
     elif os.path.exists(os.path.join(base_dir, 'DeepFLUX')):
         dataset_dir = os.path.join(base_dir, 'DeepFLUX')
     else:
-        raise FileNotFoundError(f"Could not find Fake/Real folders in:\n - {base_dir}\n - {os.path.join(base_dir, 'DeepFLUX')}")
+        raise FileNotFoundError(
+            f"Could not find Fake/Real folders in:\n"
+            f" - {base_dir}\n"
+            f" - {os.path.join(base_dir, 'DeepFLUX')}"
+        )
+  
     temp_transform = transforms.Compose([transforms.ToTensor()])
     full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
+  
     if dist.get_rank() == 0:
         print(f"\n[Dataset Info - DeepFLUX]")
         print(f"Total samples: {len(full_dataset)}")
-    train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=seed)
+        print(f"Classes: {full_dataset.classes}")
+        print(f"Class to index: {full_dataset.class_to_idx}")
+  
+    train_indices, val_indices, test_indices = create_reproducible_split(
+        full_dataset,
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15,
+        seed=seed
+    )
+  
+    if dist.get_rank() == 0:
+        print(f"\n[Split Statistics]")
+        print(f"Train: {len(train_indices)} samples ({len(train_indices)/len(full_dataset)*100:.1f}%)")
+        print(f"Valid: {len(val_indices)} samples ({len(val_indices)/len(full_dataset)*100:.1f}%)")
+        print(f"Test: {len(test_indices)} samples ({len(test_indices)/len(full_dataset)*100:.1f}%)")
+  
     return full_dataset, train_indices, val_indices, test_indices
 
 def prepare_uadfV_dataset(base_dir, seed=42):
+    """
+    Prepares UADFV dataset for splitting.
+    Assumes that base_dir is the root of the UADFV folder.
+    """
     if not os.path.exists(base_dir):
         raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
     temp_transform = transforms.Compose([transforms.ToTensor()])
     full_dataset = UADFVDataset(base_dir, transform=temp_transform)
+    
     if dist.get_rank() == 0:
         print(f"\n[Dataset Info - UADFV]")
         print(f"Total samples: {len(full_dataset)}")
-    train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=seed)
+        print(f"Classes: {full_dataset.classes}")
+        print(f"Class to index: {full_dataset.class_to_idx}")
+    
+    train_indices, val_indices, test_indices = create_reproducible_split(
+        full_dataset,
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15,
+        seed=seed
+    )
+    
+    if dist.get_rank() == 0:
+        print(f"\n[Split Statistics]")
+        print(f"Train: {len(train_indices)} samples ({len(train_indices)/len(full_dataset)*100:.1f}%)")
+        print(f"Valid: {len(val_indices)} samples ({len(val_indices)/len(full_dataset)*100:.1f}%)")
+        print(f"Test: {len(test_indices)} samples ({len(test_indices)/len(full_dataset)*100:.1f}%)")
+    
     return full_dataset, train_indices, val_indices, test_indices
 
-# کلاس‌های مدل
+# کلاس‌های مدل بدون تغییر باقی می‌مانند
 class HesitantFuzzyMembership(nn.Module):
     def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, dropout: float = 0.3):
         super().__init__()
@@ -282,9 +414,6 @@ class FuzzyHesitantEnsemble(nn.Module):
         )
         self.cum_weight_threshold = cum_weight_threshold
         self.hesitancy_threshold = hesitancy_threshold
-        
-        # --- تغییر جدید: شمارنده برای تعداد دفعات استفاده از آستانه تجمعی ---
-        self.threshold_check_count = 0
       
         if freeze_models:
             for model in self.models:
@@ -304,24 +433,14 @@ class FuzzyHesitantEnsemble(nn.Module):
         sorted_weights, sorted_indices = torch.sort(final_weights, dim=1, descending=True)
         cum_weights = torch.cumsum(sorted_weights, dim=1)
       
-        # --- تغییر جدید: لیستی برای ذخیره تعداد مدل‌های فعال در هر بچ ---
-        batch_active_models_count = [] 
-      
         for b in range(x.size(0)):
             if high_hesitancy_mask[b]:
-                pass 
-            else:
-                # --- اینجا آستانه بررسی می‌شود ---
-                self.threshold_check_count += 1
-                
-                active_count = torch.sum(cum_weights[b] < self.cum_weight_threshold) + 1
-                top_indices = sorted_indices[b, :active_count]
-                sample_mask = torch.zeros(self.num_models, device=x.device)
-                sample_mask[top_indices] = 1.0
-                mask[b] = sample_mask
-                
-                # --- ذخیره تعداد مدل‌های فعال ---
-                batch_active_models_count.append(active_count.item())
+                continue
+            active_count = torch.sum(cum_weights[b] < self.cum_weight_threshold) + 1
+            top_indices = sorted_indices[b, :active_count]
+            sample_mask = torch.zeros(self.num_models, device=x.device)
+            sample_mask[top_indices] = 1.0
+            mask[b] = sample_mask
       
         final_weights = final_weights * mask
         final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
@@ -343,27 +462,15 @@ class FuzzyHesitantEnsemble(nn.Module):
         final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
       
         if return_details:
-            # --- تغییر جدید: برگرداندن لیست ---
-            return final_output, final_weights, all_memberships, outputs, batch_active_models_count
+            return final_output, final_weights, all_memberships, outputs
         return final_output, final_weights
     
 def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.Module]:
     try:
         from model.pruned_model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     except ImportError:
-        # Dummy model for safety
-        print("Warning: Could not import ResNet_pruned. Using a dummy model for structure.")
-        class ResNet_50_pruned_hardfakevsreal(nn.Module):
-            def __init__(self, masks=None):
-                super().__init__()
-                self.layer4 = nn.ModuleList([nn.Module()])
-                self.layer4.append(nn.Module())
-                self.layer4[0] = nn.Sequential(nn.Conv2d(64, 128, 3), nn.ReLU())
-                self.layer4[2] = type('obj', (object,), {'conv3': nn.Conv2d(128, 1, 1)})()
-                self.fc = nn.Linear(128, 1)
-            def forward(self, x):
-                return self.fc(x.mean(dim=[2,3]))
-
+        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal. Ensure model.pruned_model.ResNet_pruned is available.")
+  
     models = []
     if dist.get_rank() == 0:
         print(f"Loading {len(model_paths)} pruned models...")
@@ -379,9 +486,14 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
     
         try:
             ckpt = torch.load(path, map_location='cpu', weights_only=False)
-            model = ResNet_50_pruned_hardfakevsreal(masks=ckpt.get('masks'))
+            model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
             model.load_state_dict(ckpt['model_state_dict'])
             model = model.to(device).eval()
+        
+            param_count = sum(p.numel() for p in model.parameters())
+            if dist.get_rank() == 0:
+                print(f" → Parameters: {param_count:,}")
+        
             models.append(model)
         except Exception as e:
             if dist.get_rank() == 0:
@@ -429,96 +541,180 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         transforms.ToTensor(),
     ])
   
-    # --- حالت wild ---
     if dataset_type == 'wild':
         splits = ['train', 'valid', 'test']
         datasets_dict = {}
+      
         for split in splits:
             path = os.path.join(base_dir, split)
-            if not os.path.exists(path): raise FileNotFoundError(f"Folder not found: {path}")
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Folder not found: {path}")
+        
+            if dist.get_rank() == 0:
+                print(f"{split.capitalize():5}: {path}")
+        
             transform = train_transform if split == 'train' else val_test_transform
             datasets_dict[split] = datasets.ImageFolder(path, transform=transform)
-        
+      
+        if dist.get_rank() == 0:
+            print(f"\nDataset Stats:")
+            for split, ds in datasets_dict.items():
+                print(f" {split.capitalize():5}: {len(ds):,} images | Classes: {ds.classes}")
+            print(f" Class → Index: {datasets_dict['train'].class_to_idx}\n")
+      
+        # ایجاد DistributedSampler برای آموزش موازی
         train_sampler = DistributedSampler(datasets_dict['train']) if is_distributed else None
         val_sampler = DistributedSampler(datasets_dict['valid'], shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(datasets_dict['test'], shuffle=False) if is_distributed else None
         
-        train_loader = DataLoader(datasets_dict['train'], batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True, worker_init_fn=worker_init_fn)
-        val_loader = DataLoader(datasets_dict['valid'], batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
-        test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
-        
-    # --- حالت real_fake ---
+        train_loader = DataLoader(datasets_dict['train'], batch_size=batch_size, shuffle=(train_sampler is None),
+                                 sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True,
+                                 worker_init_fn=worker_init_fn)
+        val_loader = DataLoader(datasets_dict['valid'], batch_size=batch_size, shuffle=False,
+                               sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
+                               worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size, shuffle=False,
+                                sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
+                                worker_init_fn=worker_init_fn)
+  
     elif dataset_type == 'real_fake':
         print(f"Processing real-fake dataset from: {base_dir}")
         full_dataset, train_indices, val_indices, test_indices = prepare_real_fake_dataset(base_dir, seed=42)
+      
+        if os.path.exists(os.path.join(base_dir, 'training_fake')) and \
+           os.path.exists(os.path.join(base_dir, 'training_real')):
+            dataset_dir = base_dir
+        elif os.path.exists(os.path.join(base_dir, 'real_and_fake_face')):
+            dataset_dir = os.path.join(base_dir, 'real_and_fake_face')
+        else:
+            raise FileNotFoundError(f"Could not find training folders in {base_dir}")
+      
+        temp_transform = transforms.Compose([transforms.ToTensor()])
+        full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
+      
+        train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=42)
+      
         train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
-        
+      
+        # ایجاد DistributedSampler برای آموزش موازی
         train_sampler = DistributedSampler(train_dataset) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
         
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True, worker_init_fn=worker_init_fn)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
+                                 sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True,
+                                 worker_init_fn=worker_init_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                               sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
+                               worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                                sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
+                                worker_init_fn=worker_init_fn)
                                 
-    # --- حالت hard_fake_real ---
     elif dataset_type == 'hard_fake_real':
         print(f"Processing hardfakevsrealfaces dataset from: {base_dir}")
         full_dataset, train_indices, val_indices, test_indices = prepare_hard_fake_real_dataset(base_dir, seed=42)
+      
+        if os.path.exists(os.path.join(base_dir, 'fake')) and \
+           os.path.exists(os.path.join(base_dir, 'real')):
+            dataset_dir = base_dir
+        elif os.path.exists(os.path.join(base_dir, 'hardfakevsrealfaces')):
+            dataset_dir = os.path.join(base_dir, 'hardfakevsrealfaces')
+        else:
+            raise FileNotFoundError(f"Could not find fake/real folders in {base_dir}")
+      
+        temp_transform = transforms.Compose([transforms.ToTensor()])
+        full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
+        train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=42)
+      
         train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
-        
+      
+        # ایجاد DistributedSampler برای آموزش موازی
         train_sampler = DistributedSampler(train_dataset) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
         
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True, worker_init_fn=worker_init_fn)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
+                                 sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True,
+                                 worker_init_fn=worker_init_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                               sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
+                               worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                                sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
+                                worker_init_fn=worker_init_fn)
                                 
-    # --- حالت deepflux ---
     elif dataset_type == 'deepflux':
         print(f"Processing DeepFLUX dataset from: {base_dir}")
         full_dataset, train_indices, val_indices, test_indices = prepare_deepflux_dataset(base_dir, seed=42)
+      
+        if os.path.exists(os.path.join(base_dir, 'Fake')) and \
+           os.path.exists(os.path.join(base_dir, 'Real')):
+            dataset_dir = base_dir
+        elif os.path.exists(os.path.join(base_dir, 'DeepFLUX')):
+            dataset_dir = os.path.join(base_dir, 'DeepFLUX')
+        else:
+            raise FileNotFoundError(f"Could not find Fake/Real folders in {base_dir}")
+      
+        temp_transform = transforms.Compose([transforms.ToTensor()])
+        full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
+        train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=42)
+      
         train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
-        
+      
+        # ایجاد DistributedSampler برای آموزش موازی
         train_sampler = DistributedSampler(train_dataset) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
         
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True, worker_init_fn=worker_init_fn)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
+                                 sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True,
+                                 worker_init_fn=worker_init_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                               sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
+                               worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                                sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
+                                worker_init_fn=worker_init_fn)
                                 
-    # --- حالت uadfV ---
     elif dataset_type == 'uadfV':
         print(f"Processing UADFV dataset from: {base_dir}")
         full_dataset, train_indices, val_indices, test_indices = prepare_uadfV_dataset(base_dir, seed=42)
         
-        # برای UADFV چون کلاس سفارشی است، سابست‌ها را مستقیم می‌سازیم
+        temp_transform = transforms.Compose([transforms.ToTensor()])
+        full_dataset = UADFVDataset(base_dir, transform=temp_transform)
+        train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=42)
+        
         train_dataset = Subset(full_dataset, train_indices)
         val_dataset = Subset(full_dataset, val_indices)
         test_dataset = Subset(full_dataset, test_indices)
         
-        # اعمال ترنسفرم
         train_dataset.dataset.transform = train_transform
         val_dataset.dataset.transform = val_test_transform
         test_dataset.dataset.transform = val_test_transform
         
+        # ایجاد DistributedSampler برای آموزش موازی
         train_sampler = DistributedSampler(train_dataset) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
         
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True, worker_init_fn=worker_init_fn)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None),
+                                 sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True,
+                                 worker_init_fn=worker_init_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                               sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
+                               worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                                sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False,
+                                worker_init_fn=worker_init_fn)
     else:
-        raise ValueError(f"Unknown dataset_type: {dataset_type}")
+        raise ValueError(f"Unknown dataset_type: {dataset_type}. Use 'wild', 'real_fake', 'hard_fake_real', 'deepflux', or 'uadfV'")
   
     if dist.get_rank() == 0:
         print(f"DataLoaders ready! Batch size: {batch_size}")
@@ -526,10 +722,12 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         print("="*70 + "\n")
     return train_loader, val_loader, test_loader
 
-# === توابع ارزیابی ===
+# === توابع ارزیابی اصلاح شده برای DDP ===
 
 @torch.no_grad()
-def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device, name: str, mean: Tuple[float], std: Tuple[float], is_main: bool) -> float:
+def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device, 
+                              name: str, mean: Tuple[float, float, float], 
+                              std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device) 
     correct = 0
@@ -544,12 +742,16 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
+    # جمع‌آوری نتایج از تمام GPUها
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
 
-    acc = 100. * correct_tensor.item() / total_tensor.item()
+    total_correct = correct_tensor.item()
+    total_samples = total_tensor.item()
+    acc = 100. * total_correct / total_samples
+
     if is_main:
         print(f" {name}: {acc:.2f}%")
     return acc
@@ -570,36 +772,28 @@ def evaluate_accuracy_ddp(model, loader, device):
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    
     acc = 100. * correct_tensor.item() / total_tensor.item()
     return acc
 
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
-    
     local_preds = []
     local_labels = []
     local_weights = []
     local_memberships = []
     
-    # --- تغییر جدید: جمع‌آوری تعداد مدل‌های فعال ---
-    local_active_counts = []
-
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", leave=True, disable=not is_main):
         images = images.to(device)
         labels = labels.to(device)
-        
-        outputs, weights, memberships, _, active_counts_batch = model(images, return_details=True)
-        
+        outputs, weights, memberships, _ = model(images, return_details=True)
         pred = (outputs.squeeze(1) > 0).long()
         
         local_preds.append(pred)
         local_labels.append(labels)
         local_weights.append(weights)
         local_memberships.append(memberships)
-        
-        if active_counts_batch:
-            local_active_counts.extend(active_counts_batch)
 
     local_preds_tensor = torch.cat(local_preds)
     local_labels_tensor = torch.cat(local_labels)
@@ -618,30 +812,17 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         gathered_weights = None
         gathered_memberships = None
 
+    # اصلاح: انتقال تانسورها به دستگاه مناسب قبل از gather
     dist.gather(local_preds_tensor, gathered_preds, dst=0)
     dist.gather(local_labels_tensor, gathered_labels, dst=0)
     dist.gather(local_weights_tensor, gathered_weights, dst=0)
     dist.gather(local_memberships_tensor, gathered_memberships, dst=0)
 
     if is_main:
-        # --- محاسبه و چاپ آمار آستانه ---
-        total_threshold_checks_list = [torch.tensor(0, device=device) for _ in range(world_size)]
-        dist.all_gather(total_threshold_checks_list, torch.tensor(model.threshold_check_count, device=device))
-        total_threshold_checks = sum([x.item() for x in total_threshold_checks_list])
-
         all_preds = torch.cat(gathered_preds).cpu().numpy()
         all_labels = torch.cat(gathered_labels).cpu().numpy()
         all_weights = torch.cat(gathered_weights).cpu().numpy()
         all_memberships = torch.cat(gathered_memberships).cpu().numpy()
-        
-        print(f"\n{'='*70}")
-        print(f"THRESHOLD & AGGREGATION STATISTICS ({name.upper()})")
-        print(f"{'='*70}")
-        print(f"Total times Cumulative Threshold was evaluated: {total_threshold_checks}")
-        if local_active_counts:
-             avg_active = np.mean(local_active_counts)
-             print(f"Average active models (local estimate): {avg_active:.2f}")
-        print(f"{'='*70}")
         
         acc = 100. * np.mean(all_preds == all_labels)
         avg_weights = all_weights.mean(axis=0)
@@ -655,11 +836,11 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Samples: {total_samples:,}")
         print(f"\nAverage Model Weights:")
-        for i, (w, name_m) in enumerate(zip(avg_weights, model_names)):
-            print(f" {i+1:2d}. {name_m:<25}: {w:6.4f} ({w*100:5.2f}%)")
+        for i, (w, name) in enumerate(zip(avg_weights, model_names)):
+            print(f" {i+1:2d}. {name:<25}: {w:6.4f} ({w*100:5.2f}%)")
         print(f"\nActivation Frequency:")
-        for i, (perc, count, name_m) in enumerate(zip(activation_percentages, activation_counts, model_names)):
-            print(f" {i+1:2d}. {name_m:<25}: {perc:6.2f}% active ({int(count):,} / {total_samples:,} samples)")
+        for i, (perc, count, name) in enumerate(zip(activation_percentages, activation_counts, model_names)):
+            print(f" {i+1:2d}. {name:<25}: {perc:6.2f}% active ({int(count):,} / {total_samples:,} samples)")
         print(f"{'='*70}")
         return acc, avg_weights.tolist(), all_memberships.mean(axis=0).tolist(), activation_percentages.tolist()
     
@@ -671,8 +852,11 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
+  
     best_val_acc = 0.0
     history = {'train_loss': [], 'train_acc': [], 'val_acc': [], 'membership_variance': []}
+  
+    # فقط در پردازش اصلی (rank 0) اطلاعات را چاپ می‌کنیم
     is_main = local_rank == 0
   
     if is_main:
@@ -680,22 +864,23 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         print("Training Fuzzy Hesitant Network")
         print("="*70)
         print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
+        print(f"Epochs: {num_epochs} | Initial LR: {lr}")
+        print(f"Hesitant memberships per model: {hesitant_net.num_memberships}\n")
   
     for epoch in range(num_epochs):
+        # تنظیم sampler برای هر epoch
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
+            
         ensemble_model.train()
         train_loss = train_correct = train_total = 0.0
         membership_vars = []
     
         for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]', disable=not is_main):
             images, labels = images.to(device), labels.to(device).float()
+        
             optimizer.zero_grad()
-            
-            # --- اصلاح شده: دریافت ۵ مقدار به جای ۴ ---
-            # متغیر پنجم (_) مربوط به تعداد مدل‌های فعال است که در آموزش به آن نیاز نداریم
-            outputs, weights, memberships, _, _ = ensemble_model(images, return_details=True)
-            
+            outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
             optimizer.step()
@@ -722,17 +907,27 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             print(f"\nEpoch {epoch+1}:")
             print(f" Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
             print(f" Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
+            print(f" Membership Variance (Hesitancy): {avg_membership_var:.4f}")
           
+        # فقط در پردازش اصلی مدل را ذخیره می‌کنیم
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
+            tmp_path = os.path.join(save_dir, 'best_tmp.pt')
             final_path = os.path.join(save_dir, 'best_hesitant_fuzzy.pt')
-            torch.save({
-                'epoch': epoch + 1,
-                'hesitant_state_dict': hesitant_net.state_dict(),
-                'val_acc': val_acc,
-                'history': history
-            }, final_path)
-            print(f" Best model saved → {val_acc:.2f}%")
+              
+            try:
+                torch.save({
+                    'epoch': epoch + 1,
+                    'hesitant_state_dict': hesitant_net.state_dict(),
+                    'val_acc': val_acc,
+                    'history': history
+                }, tmp_path)
+                  
+                if os.path.exists(tmp_path):
+                    shutil.move(tmp_path, final_path)
+                    print(f" Best model saved → {val_acc:.2f}%")
+            except Exception as e:
+                print(f" [ERROR] Failed to save model: {e}")
           
         if is_main:
             print("-" * 70)
@@ -742,6 +937,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     return best_val_acc, history
 
 def setup_distributed():
+    """تابع برای راه‌اندازی محیط توزیع‌شده"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ['WORLD_SIZE'])
@@ -758,43 +954,76 @@ def setup_distributed():
         return device, 0, 0, 1
 
 def cleanup_distributed():
+    """تابع برای پاک‌سازی محیط توزیع‌شده"""
     if dist.is_initialized():
         dist.destroy_process_group()
 
 def main():
     SEED = 42
     set_seed(SEED)
+  
+    # راه‌اندازی محیط توزیع‌شده
     device, local_rank, rank, world_size = setup_distributed()
-    is_main = rank == 0
+    is_main = rank == 0  # فقط در پردازش اصلی چاپ می‌کنیم
   
     parser = argparse.ArgumentParser(description="Train Fuzzy Hesitant Ensemble")
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--num_memberships', type=int, default=3)
-    parser.add_argument('--dataset', type=str, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'], required=True)
-    parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
-    parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
-    parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--model_paths', type=str, nargs='+', required=True)
-    parser.add_argument('--model_names', type=str, nargs='+', required=True)
+    parser.add_argument('--num_memberships', type=int, default=3, help='Number of membership values per model')
+    parser.add_argument('--num_grad_cam_samples', type=int, default=5, help='Number of samples for GradCAM visualization')
+    parser.add_argument('--num_lime_samples', type=int, default=5, help='Number of samples for LIME visualization')
+    parser.add_argument('--dataset', type=str, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'], required=True,
+                       help='Dataset type')
+    parser.add_argument('--cum_weight_threshold', type=float, default=0.9, 
+                   help='Cumulative weight threshold for model selection (default: 0.9)')
+    parser.add_argument('--hesitancy_threshold', type=float, default=0.2, 
+                   help='Hesitancy threshold for high uncertainty detection (default: 0.2)')
+    parser.add_argument('--data_dir', type=str, required=True, help='Base directory of dataset')
+    parser.add_argument('--model_paths', type=str, nargs='+', required=True, help='Paths to pruned model checkpoints')
+    parser.add_argument('--model_names', type=str, nargs='+', required=True, help='Names for each model')
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/')
-    parser.add_argument('--seed', type=int, default=SEED)
+    parser.add_argument('--seed', type=int, default=SEED, help='Random seed for reproducibility')
   
     args = parser.parse_args()
+  
     if len(args.model_names) != len(args.model_paths):
         raise ValueError(f"Number of model_names ({len(args.model_names)}) must match model_paths ({len(args.model_paths)})")
   
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+  
     MEANS = MEANS[:len(args.model_paths)]
     STDS = STDS[:len(args.model_paths)]
   
     if args.seed != SEED:
         set_seed(args.seed)
   
+    if is_main:
+        print("="*70)
+        print(f"Distributed Data Parallel Training on {world_size} GPUs | SEED: {args.seed}")
+        print("="*70)
+        print(f"Device: {device}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Dataset: {args.dataset}")
+        print(f"Data directory: {args.data_dir}")
+        print(f"\nUsing normalization parameters:")
+        print(f" MEANS: {MEANS}")
+        print(f" STDS: {STDS}")
+        print(f"\nModels to load:")
+        for i, (path, name) in enumerate(zip(args.model_paths, args.model_names)):
+            print(f" {i+1}. {name}: {path}")
+        print("="*70 + "\n")
+  
     base_models = load_pruned_models(args.model_paths, device)
-    MODEL_NAMES = args.model_names[:len(base_models)]
+    if len(base_models) != len(args.model_paths):
+        if is_main:
+            print(f"[WARNING] Only {len(base_models)}/{len(args.model_paths)} models loaded. Adjusting parameters.")
+        MEANS = MEANS[:len(base_models)]
+        STDS = STDS[:len(base_models)]
+        MODEL_NAMES = args.model_names[:len(base_models)]
+    else:
+        MODEL_NAMES = args.model_names
   
     ensemble = FuzzyHesitantEnsemble(
         base_models, MEANS, STDS,
@@ -803,19 +1032,34 @@ def main():
         cum_weight_threshold=args.cum_weight_threshold,
         hesitancy_threshold=args.hesitancy_threshold
     ).to(device)
+    
+
     ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
     
+    hesitant_net = ensemble.module.hesitant_fuzzy
+    trainable = sum(p.numel() for p in hesitant_net.parameters())
+    total_params = sum(p.numel() for p in ensemble.parameters())
+    if is_main:
+        print(f"Total params: {total_params:,} | Trainable: {trainable:,} | Frozen: {total_params - trainable:,}\n")
+  
+    # ایجاد DataLoader با DistributedSampler
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset, is_distributed=True
     )
     
+    # ارزیابی مدل‌های فردی با تابع DDP
     if is_main:
-        print("\nEVALUATING INDIVIDUAL MODELS ON TEST SET (Before Training)")
+        print("\n" + "="*70)
+        print("EVALUATING INDIVIDUAL MODELS ON TEST SET (Before Training)")
+        print("="*70)
     individual_accs = []
     for i, model in enumerate(base_models):
-        acc = evaluate_single_model_ddp(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i], is_main)
+        acc = evaluate_single_model_ddp(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i],is_main)
         individual_accs.append(acc)
     best_single = max(individual_accs)
+    best_idx = individual_accs.index(best_single)
+    if is_main:
+        print(f"\nBest Single Model: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
   
     best_val_acc, history = train_hesitant_fuzzy(
         ensemble, train_loader, val_loader,
@@ -837,6 +1081,207 @@ def main():
         ensemble.module, test_loader, device, "Test", MODEL_NAMES, is_main
     )
     
+    if is_main:
+        print("\n" + "="*70)
+        print("FINAL COMPARISON")
+        print("="*70)
+        print(f"Best Single Model Acc : {best_single:.2f}%")
+        print(f"Hesitant Ensemble Acc : {ensemble_test_acc:.2f}%")
+        improvement = ensemble_test_acc - best_single
+        print(f"Improvement : {improvement:+.2f}%")
+        
+        # Save final results
+        final_results = {
+            'best_single_model': {
+                'name': MODEL_NAMES[best_idx],
+                'accuracy': best_single
+            },
+            'ensemble': {
+                'test_accuracy': ensemble_test_acc,
+                'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)},
+                'activation_percentages': {name: float(p) for name, p in zip(MODEL_NAMES, activation_percentages)}
+            },
+            'improvement': float(improvement),
+            'training_history': history
+        }
+        
+        results_path = os.path.join(args.save_dir, 'final_results.json')
+        with open(results_path, 'w') as f:
+            json.dump(final_results, f, indent=4)
+        print(f"\nResults saved to: {results_path}")
+        
+        # Save final model
+        final_model_path = os.path.join(args.save_dir, 'final_ensemble_model.pt')
+        torch.save({
+            'ensemble_state_dict': ensemble.module.state_dict(),
+            'hesitant_fuzzy_state_dict': ensemble.module.hesitant_fuzzy.state_dict(),
+            'test_accuracy': ensemble_test_acc,
+            'model_names': MODEL_NAMES,
+            'means': MEANS,
+            'stds': STDS
+        }, final_model_path)
+        print(f"Final model saved: {final_model_path}")
+
+        # GradCAM and LIME Visualization - فقط در پردازش اصلی اجرا می‌شود
+        print("="*70)
+        print("GENERATING GRADCAM AND LIME VISUALIZATIONS FOR ENSEMBLE OUTPUT")
+        print("="*70)
+
+        ensemble.module.eval()
+        vis_dir = os.path.join(args.save_dir, 'visualizations')
+        gradcam_dir = os.path.join(vis_dir, 'gradcam')
+        lime_dir = os.path.join(vis_dir, 'lime')
+        combined_dir = os.path.join(vis_dir, 'combined')
+        os.makedirs(gradcam_dir, exist_ok=True)
+        os.makedirs(lime_dir, exist_ok=True)
+        os.makedirs(combined_dir, exist_ok=True)
+
+        if args.dataset == 'wild':
+            # در حالت 'wild'، مستقیماً از ImageFolder استفاده می‌کنیم
+            full_test_dataset = test_loader.dataset
+            # ایجاد شاخص‌های تصادفی برای نمونه‌برداری
+            total_samples = len(full_test_dataset)
+            vis_indices = list(range(total_samples))
+            random.shuffle(vis_indices)
+            vis_indices = vis_indices[:max(args.num_grad_cam_samples, args.num_lime_samples)]
+            vis_dataset = Subset(full_test_dataset, vis_indices)
+        else:
+            # برای حالت‌های دیگر که از Subset استفاده می‌کنند
+            test_indices = test_loader.dataset.indices
+            vis_indices = test_indices.copy()
+            random.shuffle(vis_indices)
+            vis_indices = vis_indices[:max(args.num_grad_cam_samples, args.num_lime_samples)]
+            vis_dataset = Subset(test_loader.dataset.dataset, vis_indices)
+
+        vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
+
+        # در حلقه، از شاخص صحیح برای استخراج مسیر و لیبل استفاده کنید
+        for idx, (image, label_from_loader) in enumerate(vis_loader):
+            image = image.to(device)
+            
+            # شاخص واقعی این نمونه در مجموعه داده اصلی
+            original_full_dataset_index = vis_indices[idx]
+            
+            # مسیر و لیبل واقعی را با استفاده از شاخص صحیح استخراج کنید
+            if args.dataset == 'wild':
+                # در حالت 'wild'، مستقیماً از ImageFolder استفاده می‌کنیم
+                img_path, true_label = full_test_dataset.samples[original_full_dataset_index]
+            else:
+                # برای حالت‌های دیگر
+                img_path, true_label = test_loader.dataset.dataset.samples[original_full_dataset_index]
+
+            print(f"\n[Visualization {idx+1}/{len(vis_loader)}]")
+            print(f"  Original image path: {img_path}")
+            print(f"  True label: {'real' if true_label == 1 else 'fake'} (label={true_label})")
+
+            # پیش‌بینی انسامبل
+            with torch.no_grad():
+                output, weights, _, _ = ensemble.module(image, return_details=True)
+            pred = 1 if output.squeeze().item() > 0 else 0
+            print(f"  Predicted: {'real' if pred == 1 else 'fake'}")
+
+            # تولید GradCAM
+            if idx < args.num_grad_cam_samples:
+                active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
+                combined_cam = None
+                for i in active_models:
+                    model = ensemble.module.models[i]
+                    for p in model.parameters():
+                        p.requires_grad_(True)
+                    target_layer = model.layer4[2].conv3
+                    gradcam = GradCAM(model, target_layer)
+                    with torch.enable_grad():
+                        x_n = ensemble.module.normalizations(image, i)
+                        model_out = model(x_n)
+                        if isinstance(model_out, (tuple, list)):
+                            model_out = model_out[0]
+                        model_out = model_out.squeeze()
+                        score = model_out if pred == 1 else -model_out
+                        cam = gradcam.generate(score)
+                    weight = weights[0, i].item()
+                    if combined_cam is None:
+                        combined_cam = weight * cam
+                    else:
+                        combined_cam += weight * cam
+                    for p in model.parameters():
+                        p.requires_grad_(False)
+
+                if combined_cam is not None:
+                    combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
+                    img_np = image[0].cpu().permute(1, 2, 0).numpy()
+                    img_h, img_w = img_np.shape[:2]
+                    combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h))
+
+                    heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
+                    heatmap = np.float32(heatmap) / 255
+                    overlay = heatmap + img_np
+                    overlay = overlay / overlay.max()
+
+                    gradcam_save_path = os.path.join(gradcam_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+                    
+                    plt.figure(figsize=(10, 10))
+                    plt.imshow(overlay)
+                    plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+                    plt.axis('off')
+                    plt.savefig(gradcam_save_path, bbox_inches='tight', dpi=200)
+                    plt.close()
+                    
+                    print(f"  GradCAM saved: {gradcam_save_path}")
+
+            # تولید LIME
+            if idx < args.num_lime_samples:
+                try:
+                    lime_img = generate_lime_explanation(ensemble.module, image, device)
+                    
+                    lime_save_path = os.path.join(lime_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+                    
+                    plt.figure(figsize=(10, 10))
+                    plt.imshow(lime_img)
+                    plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+                    plt.axis('off')
+                    plt.savefig(lime_save_path, bbox_inches='tight', dpi=200)
+                    plt.close()
+                    
+                    print(f"  LIME saved: {lime_save_path}")
+                    
+                    # ایجاد تصویر ترکیبی از GradCAM و LIME
+                    if idx < args.num_grad_cam_samples and 'combined_cam' in locals():
+                        combined_save_path = os.path.join(combined_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+                        
+                        fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+                        
+                        # تصویر اصلی
+                        axes[0].imshow(img_np)
+                        axes[0].set_title("Original Image")
+                        axes[0].axis('off')
+                        
+                        # GradCAM
+                        axes[1].imshow(overlay)
+                        axes[1].set_title("GradCAM")
+                        axes[1].axis('off')
+                        
+                        # LIME
+                        axes[2].imshow(lime_img)
+                        axes[2].set_title("LIME")
+                        axes[2].axis('off')
+                        
+                        plt.suptitle(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+                        plt.tight_layout()
+                        plt.savefig(combined_save_path, bbox_inches='tight', dpi=200)
+                        plt.close()
+                        
+                        print(f"  Combined visualization saved: {combined_save_path}")
+                except Exception as e:
+                    print(f"  Error generating LIME: {e}")
+
+        print("="*70)
+        print("Visualizations completed!")
+        print(f"GradCAM visualizations saved to: {gradcam_dir}")
+        print(f"LIME visualizations saved to: {lime_dir}")
+        print(f"Combined visualizations saved to: {combined_dir}")
+        print("="*70)
+    
+    # پاک‌سازی محیط توزیع‌شده
     cleanup_distributed()
 
 if __name__ == "__main__":
