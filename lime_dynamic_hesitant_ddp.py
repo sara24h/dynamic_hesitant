@@ -691,7 +691,11 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]', disable=not is_main):
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
-            outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
+            
+            # --- اصلاح شده: دریافت ۵ مقدار به جای ۴ ---
+            # متغیر پنجم (_) مربوط به تعداد مدل‌های فعال است که در آموزش به آن نیاز نداریم
+            outputs, weights, memberships, _, _ = ensemble_model(images, return_details=True)
+            
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
             optimizer.step()
