@@ -981,10 +981,23 @@ def main():
     # ==========================================
     #  محاسبه تنوع مدل‌های پایه (Kappa)
     # ==========================================
+        # ==========================================
+    #  محاسبه تنوع مدل‌های پایه (Kappa) - اصلاح شده
+    # ==========================================
     if is_main:
-        print("\n[INFO] Calculating pairwise diversity using Cohen's Kappa...")
+        print("\n[INFO] Calculating pairwise diversity using Cohen's Kappa on FULL dataset...")
+        
+
+        kappa_test_loader = DataLoader(
+            test_loader.dataset, 
+            batch_size=64, 
+            shuffle=False, 
+            num_workers=2, 
+            pin_memory=True
+        )
+        
         kappa_matrix = calculate_kappa_diversity(
-            base_models, test_loader, device, MODEL_NAMES
+            base_models, kappa_test_loader, device, MODEL_NAMES
         )
     else:
         kappa_matrix = None
