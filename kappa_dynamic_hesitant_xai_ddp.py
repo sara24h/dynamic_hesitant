@@ -14,7 +14,6 @@ import shutil
 import json
 import random
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import cohen_kappa_score
 from PIL import Image
 import matplotlib.pyplot as plt
 import cv2
@@ -22,87 +21,11 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 warnings.filterwarnings("ignore")
 
+# اضافه کردن کتابخانه LIME
+from lime import lime_image
+from skimage.segmentation import mark_boundaries
 
-# ============================================================================
-# Kappa Diversity Calculator
-# ============================================================================
-
-class KappaDiversityCalculator:
-    """محاسبه diversity با Cohen's Kappa"""
-    
-    @staticmethod
-    def calculate_pairwise_kappa(predictions: torch.Tensor) -> torch.Tensor:
-        batch_size, num_models = predictions.shape
-        predictions_np = predictions.cpu().numpy()
-        kappa_matrix = np.ones((num_models, num_models))
-        
-        for i in range(num_models):
-            for j in range(i + 1, num_models):
-                try:
-                    kappa = cohen_kappa_score(predictions_np[:, i], predictions_np[:, j])
-                    kappa_matrix[i, j] = kappa
-                    kappa_matrix[j, i] = kappa
-                except:
-                    kappa_matrix[i, j] = 1.0
-                    kappa_matrix[j, i] = 1.0
-        
-        return torch.tensor(kappa_matrix, dtype=torch.float32)
-    
-    @staticmethod
-    def calculate_diversity_score(predictions: torch.Tensor) -> torch.Tensor:
-        """
-        محاسبه diversity score برای هر نمونه با استفاده از Kappa
-        
-        برای هر sample، میانگین Kappa بین همه جفت مدل‌ها را محاسبه می‌کنیم
-        diversity = 1 - kappa (کم‌تر Kappa = بیشتر diversity)
-        
-        Returns:
-            diversity_scores: (batch_size,) - بالاتر = diversity بیشتر
-        """
-        batch_size, num_models = predictions.shape
-        diversity_scores = []
-        predictions_np = predictions.cpu().numpy()
-        
-        for b in range(batch_size):
-            sample_preds = predictions_np[b, :]
-            
-            # اگر همه مدل‌ها یک جواب دادند، diversity = 0
-            if len(np.unique(sample_preds)) == 1:
-                diversity_scores.append(0.0)
-                continue
-            
-            # محاسبه Kappa-based agreement بین همه جفت مدل‌ها
-            # برای یک sample، agreement ساده است: موافق یا مخالف
-            agreements = []
-            for i in range(num_models):
-                for j in range(i + 1, num_models):
-                    if sample_preds[i] == sample_preds[j]:
-                        agreements.append(1.0)  # موافقت
-                    else:
-                        agreements.append(0.0)  # عدم موافقت
-            
-            # میانگین agreement (شبیه به Kappa ساده‌شده)
-            avg_agreement = np.mean(agreements) if agreements else 1.0
-            
-            # تبدیل به diversity: agreement بالا → diversity پایین
-            diversity = 1.0 - avg_agreement
-            diversity_scores.append(diversity)
-        
-        return torch.tensor(diversity_scores, dtype=torch.float32)
-    
-    @staticmethod
-    def calculate_average_kappa(predictions: torch.Tensor) -> float:
-        kappa_matrix = KappaDiversityCalculator.calculate_pairwise_kappa(predictions)
-        num_models = kappa_matrix.shape[0]
-        mask = torch.triu(torch.ones(num_models, num_models), diagonal=1).bool()
-        avg_kappa = kappa_matrix[mask].mean().item()
-        return avg_kappa
-
-
-# ============================================================================
-# Dataset Classes
-# ============================================================================
-
+# کلاس UADFVDataset بدون تغییر باقی می‌ماند
 class UADFVDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
@@ -110,7 +33,7 @@ class UADFVDataset(Dataset):
         self.samples = []
         self.class_to_idx = {'fake': 0, 'real': 1}
         self.classes = list(self.class_to_idx.keys())
-        
+        # Load fake images
         fake_frames_dir = os.path.join(self.root_dir, 'fake', 'frames')
         if os.path.exists(fake_frames_dir):
             for subdir in os.listdir(fake_frames_dir):
@@ -121,6 +44,7 @@ class UADFVDataset(Dataset):
                         if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
                             self.samples.append((img_path, self.class_to_idx['fake']))
        
+        # Load real images
         real_frames_dir = os.path.join(self.root_dir, 'real', 'frames')
         if os.path.exists(real_frames_dir):
             for subdir in os.listdir(real_frames_dir):
@@ -130,10 +54,8 @@ class UADFVDataset(Dataset):
                         img_path = os.path.join(subdir_path, img_file)
                         if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
                             self.samples.append((img_path, self.class_to_idx['real']))
-    
     def __len__(self):
         return len(self.samples)
-    
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
         image = Image.open(img_path).convert('RGB')
@@ -141,21 +63,7 @@ class UADFVDataset(Dataset):
             image = self.transform(image)
         return image, label
 
-
-class TransformSubset(Subset):
-    """✅ کلاس اضافه شده"""
-    def __init__(self, dataset, indices, transform):
-        super().__init__(dataset, indices)
-        self.transform = transform
-  
-    def __getitem__(self, idx):
-        img, label = self.dataset.samples[self.indices[idx]]
-        img = self.dataset.loader(img)
-        if self.transform:
-            img = self.transform(img)
-        return img, label
-
-
+# کلاس GradCAM سفارشی
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -178,21 +86,55 @@ class GradCAM:
         self.model.zero_grad()
         score.backward()
         if self.gradients is None:
-            raise ValueError("Gradients not captured")
+            raise ValueError("Gradients not captured - ensure forward pass happened after hooking.")
         gradients = self.gradients[0]
         activations = self.activations[0]
         weights = gradients.mean(dim=[1, 2], keepdim=True)
         cam = (weights * activations).sum(dim=0)
         cam = F.relu(cam)
-        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), activations.shape[1:], 
-                           mode='bilinear', align_corners=False)
+        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), activations.shape[1:], mode='bilinear', align_corners=False)
         cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
         return cam.squeeze().cpu().numpy()
 
-
-# ============================================================================
-# Helper Functions
-# ============================================================================
+# تابع جدید برای تولید توضیحات LIME
+def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256)):
+    """
+    Generate LIME explanation for a given image and model.
+    """
+    img_np = image_tensor[0].cpu().permute(1, 2, 0).numpy()
+    img_np = (img_np * 255).astype(np.uint8)
+    
+    explainer = lime_image.LimeImageExplainer()
+    
+    def predict_fn(images):
+        batch = torch.from_numpy(images.transpose(0, 3, 1, 2)).float() / 255.0
+        batch = batch.to(device)
+        
+        with torch.no_grad():
+            outputs, _ = model(batch)
+            probs = torch.sigmoid(outputs).cpu().numpy()
+            
+        return np.hstack([1 - probs, probs])
+    
+    explanation = explainer.explain_instance(
+        img_np, 
+        predict_fn, 
+        top_labels=1, 
+        hide_color=0, 
+        num_samples=1000
+    )
+    
+    temp, mask = explanation.get_image_and_mask(
+        explanation.top_labels[0], 
+        positive_only=True, 
+        num_features=10, 
+        hide_rest=True
+    )
+    
+    lime_img = mark_boundaries(temp / 255.0, mask)
+    lime_img = cv2.resize(lime_img, target_size)
+    
+    return lime_img
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -202,7 +144,10 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
-    if dist.is_initialized() and dist.get_rank() == 0:
+    if dist.is_initialized():
+        if dist.get_rank() == 0:
+            print(f"[SEED] All random seeds set to: {seed}")
+    else:
         print(f"[SEED] All random seeds set to: {seed}")
 
 def worker_init_fn(worker_id):
@@ -211,26 +156,20 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 def create_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     num_samples = len(dataset)
     indices = list(range(num_samples))
     labels = [dataset.samples[i][1] for i in indices]
-    
     train_val_indices, test_indices = train_test_split(
         indices, test_size=test_ratio, random_state=seed, stratify=labels
     )
-    
     train_val_labels = [labels[i] for i in train_val_indices]
     val_size = val_ratio / (train_ratio + val_ratio)
-    
     train_indices, val_indices = train_test_split(
         train_val_indices, test_size=val_size, random_state=seed, stratify=train_val_labels
     )
-    
     return train_indices, val_indices, test_indices
 
-
-# Dataset preparation functions
 def prepare_real_fake_dataset(base_dir, seed=42):
     if os.path.exists(os.path.join(base_dir, 'training_fake')) and \
        os.path.exists(os.path.join(base_dir, 'training_real')):
@@ -238,24 +177,15 @@ def prepare_real_fake_dataset(base_dir, seed=42):
     elif os.path.exists(os.path.join(base_dir, 'real_and_fake_face')):
         real_fake_dir = os.path.join(base_dir, 'real_and_fake_face')
     else:
-        raise FileNotFoundError(f"Could not find training_fake/training_real in {base_dir}")
+        raise FileNotFoundError(f"Could not find training_fake/training_real in: {base_dir}")
   
     temp_transform = transforms.Compose([transforms.ToTensor()])
     full_dataset = datasets.ImageFolder(real_fake_dir, transform=temp_transform)
-  
     if dist.get_rank() == 0:
         print(f"\n[Dataset Info - Real/Fake]")
         print(f"Total samples: {len(full_dataset)}")
-        print(f"Classes: {full_dataset.classes}")
   
-    train_indices, val_indices, test_indices = create_reproducible_split(
-        full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
-    )
-  
-    if dist.get_rank() == 0:
-        print(f"\n[Split Statistics]")
-        print(f"Train: {len(train_indices)} | Valid: {len(val_indices)} | Test: {len(test_indices)}")
-  
+    train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=seed)
     return full_dataset, train_indices, val_indices, test_indices
 
 def prepare_hard_fake_real_dataset(base_dir, seed=42):
@@ -265,18 +195,13 @@ def prepare_hard_fake_real_dataset(base_dir, seed=42):
     elif os.path.exists(os.path.join(base_dir, 'hardfakevsrealfaces')):
         dataset_dir = os.path.join(base_dir, 'hardfakevsrealfaces')
     else:
-        raise FileNotFoundError(f"Could not find fake/real folders in {base_dir}")
-  
+        raise FileNotFoundError(f"Could not find fake/real folders in: {base_dir}")
     temp_transform = transforms.Compose([transforms.ToTensor()])
     full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
-  
     if dist.get_rank() == 0:
         print(f"\n[Dataset Info - HardFakeVsReal]")
         print(f"Total samples: {len(full_dataset)}")
-  
-    train_indices, val_indices, test_indices = create_reproducible_split(
-        full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
-    )
+    train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=seed)
     return full_dataset, train_indices, val_indices, test_indices
 
 def prepare_deepflux_dataset(base_dir, seed=42):
@@ -286,18 +211,13 @@ def prepare_deepflux_dataset(base_dir, seed=42):
     elif os.path.exists(os.path.join(base_dir, 'DeepFLUX')):
         dataset_dir = os.path.join(base_dir, 'DeepFLUX')
     else:
-        raise FileNotFoundError(f"Could not find Fake/Real folders in {base_dir}")
-  
+        raise FileNotFoundError(f"Could not find Fake/Real folders in: {base_dir}")
     temp_transform = transforms.Compose([transforms.ToTensor()])
     full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
-  
     if dist.get_rank() == 0:
         print(f"\n[Dataset Info - DeepFLUX]")
         print(f"Total samples: {len(full_dataset)}")
-  
-    train_indices, val_indices, test_indices = create_reproducible_split(
-        full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
-    )
+    train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=seed)
     return full_dataset, train_indices, val_indices, test_indices
 
 def prepare_uadfV_dataset(base_dir, seed=42):
@@ -305,16 +225,217 @@ def prepare_uadfV_dataset(base_dir, seed=42):
         raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
     temp_transform = transforms.Compose([transforms.ToTensor()])
     full_dataset = UADFVDataset(base_dir, transform=temp_transform)
-    
     if dist.get_rank() == 0:
         print(f"\n[Dataset Info - UADFV]")
         print(f"Total samples: {len(full_dataset)}")
-    
-    train_indices, val_indices, test_indices = create_reproducible_split(
-        full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
-    )
+    train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=seed)
     return full_dataset, train_indices, val_indices, test_indices
 
+# تابع کمکی برای محاسبه Cohen's Kappa برای یک دسته (Batch)
+def cohen_kappa_batch(pred1, pred2):
+    """
+    Calculate Cohen's Kappa for binary predictions.
+    pred1, pred2: [Batch, 1] or [Batch] tensors with 0/1 values.
+    Returns: [Batch] tensor of Kappa scores.
+    """
+    pred1 = pred1.flatten()
+    pred2 = pred2.flatten()
+    
+    # Confusion Matrix elements
+    # p1=1, p2=1 (True Positive agreement)
+    tp_agree = (pred1 * pred2).float()
+    # p1=0, p2=0 (True Negative agreement)
+    tn_agree = ((1 - pred1) * (1 - pred2)).float()
+    
+    # Total agreements
+    po = (tp_agree + tn_agree)
+    
+    # Probabilities
+    p1_yes = pred1.float()
+    p1_no = 1 - p1_yes
+    p2_yes = pred2.float()
+    p2_no = 1 - p2_yes
+    
+    # Expected agreement
+    pe_yes = p1_yes * p2_yes
+    pe_no = p1_no * p2_no
+    pe = pe_yes + pe_no
+    
+    # Kappa
+    # Handle case where pe == 1 (perfect random agreement) or pe == 0
+    kappa = torch.zeros_like(po)
+    mask = pe < 1.0
+    
+    kappa[mask] = (po[mask] - pe[mask]) / (1.0 - pe[mask] + 1e-8)
+    return kappa
+
+class HesitantFuzzyMembership(nn.Module):
+    def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, dropout: float = 0.3):
+        super().__init__()
+        self.num_models = num_models
+        self.num_memberships = num_memberships
+    
+        self.feature_net = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1)
+        )
+    
+        self.membership_generator = nn.Sequential(
+            nn.Linear(128, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_models * num_memberships)
+        )
+        self.aggregation_weights = nn.Parameter(torch.ones(num_memberships) / num_memberships)
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        features = self.feature_net(x).flatten(1)
+        memberships = self.membership_generator(features)
+        memberships = memberships.view(-1, self.num_models, self.num_memberships)
+        memberships = torch.sigmoid(memberships)
+        agg_weights = F.softmax(self.aggregation_weights, dim=0)
+        final_weights = (memberships * agg_weights.view(1, 1, -1)).sum(dim=2)
+        final_weights = F.softmax(final_weights, dim=1)
+        return final_weights, memberships
+    
+class MultiModelNormalization(nn.Module):
+    def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
+        super().__init__()
+        for i, (m, s) in enumerate(zip(means, stds)):
+            self.register_buffer(f'mean_{i}', torch.tensor(m).view(1, 3, 1, 1))
+            self.register_buffer(f'std_{i}', torch.tensor(s).view(1, 3, 1, 1))
+  
+    def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
+        return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
+    
+class FuzzyHesitantEnsemble(nn.Module):
+    def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
+                 stds: List[Tuple[float]], num_memberships: int = 3, freeze_models: bool = True,
+                 min_agreement_kappa: float = 0.0): # تغییر پارامترها: حذف cum و hesitancy، اضافه شدن kappa
+        super().__init__()
+        self.num_models = len(models)
+        self.models = nn.ModuleList(models)
+        self.normalizations = MultiModelNormalization(means, stds)
+        self.hesitant_fuzzy = HesitantFuzzyMembership(
+            input_dim=128,
+            num_models=self.num_models,
+            num_memberships=num_memberships
+        )
+        
+        # استفاده از Kappa به عنوان معیار تنوع/توافق
+        self.min_agreement_kappa = min_agreement_kappa
+      
+        if freeze_models:
+            for model in self.models:
+                model.eval()
+                for p in model.parameters():
+                    p.requires_grad = False
+  
+    def forward(self, x: torch.Tensor, return_details: bool = False):
+        final_weights, all_memberships = self.hesitant_fuzzy(x)
+      
+        # 1. محاسبه خروجی‌های اولیه تمام مدل‌ها (از آنجا که ما باید کاپا را بررسی کنیم، به خروجی همه نیاز داریم)
+        outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
+        
+        for i in range(self.num_models):
+            x_n = self.normalizations(x, i)
+            with torch.no_grad():
+                out = self.models[i](x_n)
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+            outputs[:, i] = out
+      
+        # 2. تبدیل خروجی‌ها به پیش‌بینی باینری (0 یا 1)
+        preds = (outputs.squeeze(-1) > 0).long()
+        
+        # 3. محاسبه پیش‌بینی وزن‌دار اولیه (Consensus) برای مقایسه
+        # توجه: این پیش‌بینی برای محاسبه کاپا استفاده می‌شود
+        weighted_logits = (outputs.squeeze(-1) * final_weights).sum(dim=1, keepdim=True)
+        consensus_pred = (weighted_logits > 0).long()
+        
+        # 4. محاسبه Kappa بین هر مدل و توافق جمعی (Consensus)
+        mask = torch.ones_like(final_weights)
+        
+        for i in range(self.num_models):
+            # محاسبه کاپا برای هر نمونه در بچ بین مدل i و کلیت
+            kappa_scores = cohen_kappa_batch(preds[:, i], consensus_pred.squeeze(1))
+            
+            # اگر کاپا کمتر از حد آستانه بود، یعنی مدل با جمع مخالفت می‌کند (نویز/خطا)
+            # و باید حذف شود
+            mask[kappa_scores < self.min_agreement_kappa, i] = 0.0
+            
+        # 5. اعمال ماسک و نرمال‌سازی مجدد وزن‌ها
+        final_weights = final_weights * mask
+        final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
+      
+        # محاسبه خروجی نهایی با وزن‌های اصلاح شده
+        final_output = (outputs.squeeze(-1) * final_weights).sum(dim=1, keepdim=True)
+      
+        if return_details:
+            # بازگرداندن وزن‌های نهایی برای تحلیل
+            # برای سازگاری با خروجی قبلی، خروجی‌های خام و عضویت‌ها را هم برمی‌گردانیم
+            return final_output, final_weights, all_memberships, outputs
+        return final_output, final_weights
+    
+def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.Module]:
+    try:
+        from model.pruned_model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
+    except ImportError:
+        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal. Ensure model.pruned_model.ResNet_pruned is available.")
+  
+    models = []
+    if dist.get_rank() == 0:
+        print(f"Loading {len(model_paths)} pruned models...")
+    
+    for i, path in enumerate(model_paths):
+        if not os.path.exists(path):
+            if dist.get_rank() == 0:
+                print(f" [WARNING] File not found: {path}")
+            continue
+    
+        if dist.get_rank() == 0:
+            print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
+    
+        try:
+            ckpt = torch.load(path, map_location='cpu', weights_only=False)
+            model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
+            model.load_state_dict(ckpt['model_state_dict'])
+            model = model.to(device).eval()
+        
+            param_count = sum(p.numel() for p in model.parameters())
+            if dist.get_rank() == 0:
+                print(f" → Parameters: {param_count:,}")
+        
+            models.append(model)
+        except Exception as e:
+            if dist.get_rank() == 0:
+                print(f" [ERROR] Failed to load {path}: {e}")
+            continue
+    
+    if len(models) == 0:
+        raise ValueError("No models loaded!")
+    
+    if dist.get_rank() == 0:
+        print(f"All {len(models)} models loaded!\n")
+    
+    return models
+
+class TransformSubset(Subset):
+    def __init__(self, dataset, indices, transform):
+        super().__init__(dataset, indices)
+        self.transform = transform
+  
+    def __getitem__(self, idx):
+        img, label = self.dataset.samples[self.indices[idx]]
+        img = self.dataset.loader(img)
+        if self.transform:
+            img = self.transform(img)
+        return img, label
 
 def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dataset_type: str = 'wild', is_distributed=False):
     if dist.get_rank() == 0:
@@ -358,7 +479,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
                 print(f" {split.capitalize():5}: {len(ds):,} images | Classes: {ds.classes}")
             print(f" Class → Index: {datasets_dict['train'].class_to_idx}\n")
       
-        # ایجاد DistributedSampler برای آموزش موازی
         train_sampler = DistributedSampler(datasets_dict['train']) if is_distributed else None
         val_sampler = DistributedSampler(datasets_dict['valid'], shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(datasets_dict['test'], shuffle=False) if is_distributed else None
@@ -394,7 +514,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
       
-        # ایجاد DistributedSampler برای آموزش موازی
         train_sampler = DistributedSampler(train_dataset) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
@@ -429,7 +548,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
       
-        # ایجاد DistributedSampler برای آموزش موازی
         train_sampler = DistributedSampler(train_dataset) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
@@ -464,7 +582,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
       
-        # ایجاد DistributedSampler برای آموزش موازی
         train_sampler = DistributedSampler(train_dataset) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
@@ -495,7 +612,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         val_dataset.dataset.transform = val_test_transform
         test_dataset.dataset.transform = val_test_transform
         
-        # ایجاد DistributedSampler برای آموزش موازی
         train_sampler = DistributedSampler(train_dataset) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
@@ -518,379 +634,237 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         print("="*70 + "\n")
     return train_loader, val_loader, test_loader
 
+@torch.no_grad()
+def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device, 
+                              name: str, mean: Tuple[float, float, float], 
+                              std: Tuple[float, float, float], is_main: bool) -> float:
+    model.eval()
+    normalizer = MultiModelNormalization([mean], [std]).to(device) 
+    correct = 0
+    total = 0
+    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
+        images, labels = images.to(device), labels.to(device).float()
+        images = normalizer(images, 0)
+        out = model(images)
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        pred = (out.squeeze(1) > 0).long()
+        total += labels.size(0)
+        correct += pred.eq(labels.long()).sum().item()
 
+    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
 
-# ============================================================================
-# Model Classes
-# ============================================================================
+    total_correct = correct_tensor.item()
+    total_samples = total_tensor.item()
+    acc = 100. * total_correct / total_samples
 
-class KappaAwareHesitantFuzzy(nn.Module):
-    def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, 
-                 dropout: float = 0.3, diversity_weight: float = 0.3):
-        super().__init__()
-        self.num_models = num_models
-        self.num_memberships = num_memberships
-        self.diversity_weight = diversity_weight
-        
-        self.feature_net = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1)
-        )
-        
-        self.membership_generator = nn.Sequential(
-            nn.Linear(128, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(128, num_models * num_memberships)
-        )
-        
-        self.diversity_modulator = nn.Sequential(
-            nn.Linear(128 + num_models, 64),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(64, num_models),
-            nn.Sigmoid()
-        )
-        
-        self.aggregation_weights = nn.Parameter(torch.ones(num_memberships) / num_memberships)
-    
-    def forward(self, x: torch.Tensor, model_outputs: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        features = self.feature_net(x).flatten(1)
-        
-        memberships = self.membership_generator(features)
-        memberships = memberships.view(-1, self.num_models, self.num_memberships)
-        memberships = torch.sigmoid(memberships)
-        
-        agg_weights = F.softmax(self.aggregation_weights, dim=0)
-        base_weights = (memberships * agg_weights.view(1, 1, -1)).sum(dim=2)
-        base_weights = F.softmax(base_weights, dim=1)
-        
-        if model_outputs is not None:
-            model_preds = (model_outputs > 0).float()
-            diversity_scores = KappaDiversityCalculator.calculate_diversity_score(model_preds)
-            diversity_scores = diversity_scores.unsqueeze(1).to(x.device)
-            
-            combined_features = torch.cat([features, model_preds], dim=1)
-            diversity_modulation = self.diversity_modulator(combined_features)
-            
-            final_weights = base_weights * (1 - self.diversity_weight) + \
-                           diversity_modulation * self.diversity_weight
-            
-            final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
-        else:
-            final_weights = base_weights
-            diversity_scores = torch.zeros(x.size(0), 1, device=x.device)
-        
-        return final_weights, memberships, diversity_scores
-
-
-class MultiModelNormalization(nn.Module):
-    def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
-        super().__init__()
-        for i, (m, s) in enumerate(zip(means, stds)):
-            self.register_buffer(f'mean_{i}', torch.tensor(m).view(1, 3, 1, 1))
-            self.register_buffer(f'std_{i}', torch.tensor(s).view(1, 3, 1, 1))
-  
-    def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
-        return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
-
-
-class KappaAwareFuzzyEnsemble(nn.Module):
-    def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
-                 stds: List[Tuple[float]], num_memberships: int = 3, 
-                 freeze_models: bool = True, diversity_weight: float = 0.3,
-                 min_diversity_threshold: float = 0.2):
-        super().__init__()
-        self.num_models = len(models)
-        self.models = nn.ModuleList(models)
-        self.normalizations = MultiModelNormalization(means, stds)
-        
-        self.hesitant_fuzzy = KappaAwareHesitantFuzzy(
-            input_dim=128,
-            num_models=self.num_models,
-            num_memberships=num_memberships,
-            diversity_weight=diversity_weight
-        )
-        
-        self.min_diversity_threshold = min_diversity_threshold
-        self.kappa_calculator = KappaDiversityCalculator()
-        
-        if freeze_models:
-            for model in self.models:
-                model.eval()
-                for p in model.parameters():
-                    p.requires_grad = False
-    
-    def forward(self, x: torch.Tensor, return_details: bool = False):
-        outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-        
-        for i in range(self.num_models):
-            x_n = self.normalizations(x, i)
-            with torch.no_grad():
-                out = self.models[i](x_n)
-                if isinstance(out, (tuple, list)):
-                    out = out[0]
-            outputs[:, i] = out
-        
-        final_weights, all_memberships, diversity_scores = self.hesitant_fuzzy(
-            x, outputs.squeeze(-1)
-        )
-        
-        mask = torch.ones_like(final_weights)
-        
-        for b in range(x.size(0)):
-            if diversity_scores[b] < self.min_diversity_threshold:
-                top_k = max(2, self.num_models // 2)
-                _, top_indices = torch.topk(final_weights[b], top_k)
-                sample_mask = torch.zeros(self.num_models, device=x.device)
-                sample_mask[top_indices] = 1.0
-                mask[b] = sample_mask
-        
-        final_weights = final_weights * mask
-        final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
-        
-        final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
-        
-        if return_details:
-            return final_output, final_weights, all_memberships, outputs, diversity_scores
-        return final_output, final_weights
-
-
-def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.Module]:
-    try:
-        from model.pruned_model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
-    except ImportError:
-        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
-  
-    models = []
-    if dist.get_rank() == 0:
-        print(f"Loading {len(model_paths)} pruned models...")
-    
-    for i, path in enumerate(model_paths):
-        if not os.path.exists(path):
-            if dist.get_rank() == 0:
-                print(f" [WARNING] File not found: {path}")
-            continue
-    
-        if dist.get_rank() == 0:
-            print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
-    
-        try:
-            ckpt = torch.load(path, map_location='cpu', weights_only=False)
-            model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
-            model.load_state_dict(ckpt['model_state_dict'])
-            model = model.to(device).eval()
-            models.append(model)
-        except Exception as e:
-            if dist.get_rank() == 0:
-                print(f" [ERROR] Failed to load {path}: {e}")
-            continue
-    
-    if len(models) == 0:
-        raise ValueError("No models loaded!")
-    
-    return models
-
-
-# ============================================================================
-# Training & Evaluation
-# ============================================================================
-
-def train_kappa_aware_ensemble(ensemble_model, train_loader, val_loader, num_epochs, 
-                               lr, device, save_dir, local_rank):
-    os.makedirs(save_dir, exist_ok=True)
-    hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
-    
-    optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-    criterion = nn.BCEWithLogitsLoss()
-    
-    best_val_acc = 0.0
-    history = {
-        'train_loss': [], 'train_acc': [], 'val_acc': [], 
-        'membership_variance': [], 'avg_diversity': [], 'avg_kappa': []
-    }
-    
-    is_main = local_rank == 0
-    
     if is_main:
-        print("="*70)
-        print("🆕 Training Kappa-Aware Fuzzy Hesitant Ensemble")
-        print("="*70)
-        print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
-        print(f"Diversity weight: {hesitant_net.diversity_weight}")
-        print("="*70 + "\n")
-    
-    for epoch in range(num_epochs):
-        if hasattr(train_loader.sampler, 'set_epoch'):
-            train_loader.sampler.set_epoch(epoch)
-        
-        ensemble_model.train()
-        train_loss = train_correct = train_total = 0.0
-        membership_vars = []
-        diversity_scores_epoch = []
-        kappa_scores_epoch = []
-        
-        for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main):
-            images, labels = images.to(device), labels.to(device).float()
-            
-            optimizer.zero_grad()
-            outputs, weights, memberships, all_outputs, diversity_scores = ensemble_model(
-                images, return_details=True
-            )
-            
-            loss = criterion(outputs.squeeze(1), labels)
-            loss.backward()
-            optimizer.step()
-            
-            batch_size = images.size(0)
-            train_loss += loss.item() * batch_size
-            pred = (outputs.squeeze(1) > 0).long()
-            train_correct += pred.eq(labels.long()).sum().item()
-            train_total += batch_size
-            
-            membership_vars.append(memberships.var(dim=2).mean().item())
-            diversity_scores_epoch.append(diversity_scores.mean().item())
-            
-            with torch.no_grad():
-                model_preds = (all_outputs.squeeze(-1) > 0).long()
-                avg_kappa = KappaDiversityCalculator.calculate_average_kappa(model_preds)
-                kappa_scores_epoch.append(avg_kappa)
-        
-        train_acc = 100. * train_correct / train_total
-        train_loss = train_loss / train_total
-        avg_membership_var = np.mean(membership_vars)
-        avg_diversity = np.mean(diversity_scores_epoch)
-        avg_kappa = np.mean(kappa_scores_epoch)
-        
-        val_acc = evaluate_kappa_aware(ensemble_model, val_loader, device, is_distributed=dist.is_initialized())
-        scheduler.step()
-        
-        history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
-        history['val_acc'].append(val_acc)
-        history['membership_variance'].append(avg_membership_var)
-        history['avg_diversity'].append(avg_diversity)
-        history['avg_kappa'].append(avg_kappa)
-        
-        if is_main:
-            print(f"\nEpoch {epoch+1}:")
-            print(f" Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-            print(f" Val Acc: {val_acc:.2f}%")
-            print(f" 🆕 Diversity Score: {avg_diversity:.4f} | Avg Kappa: {avg_kappa:.4f}")
-            print(f" (Lower Kappa = Higher Diversity = Better Ensemble)")
-            print("-" * 70)
-        
-        if is_main and val_acc > best_val_acc:
-            best_val_acc = val_acc
-            ckpt_path = os.path.join(save_dir, 'best_kappa_aware_ensemble.pt')
-            torch.save({
-                'epoch': epoch + 1,
-                'hesitant_state_dict': hesitant_net.state_dict(),
-                'val_acc': val_acc,
-                'history': history
-            }, ckpt_path)
-            print(f" ✓ Best model saved → {val_acc:.2f}%")
-    
-    return best_val_acc, history
-
+        print(f" {name}: {acc:.2f}%")
+    return acc
 
 @torch.no_grad()
-def evaluate_kappa_aware(model, loader, device, is_distributed=False):
-    """✅ ارزیابی با DDP support"""
+def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
-    correct = total = 0
-    
+    correct = 0
+    total = 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
         total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
+        
+    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     
-    if is_distributed:
-        correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-        total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-        correct = correct_tensor.item()
-        total = total_tensor.item()
-    
-    acc = 100. * correct / total
+    acc = 100. * correct_tensor.item() / total_tensor.item()
     return acc
 
-
 @torch.no_grad()
-def evaluate_ensemble_final_kappa(model, loader, device, name, model_names, is_main=True):
+def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
     local_preds = []
     local_labels = []
     local_weights = []
-    local_diversity = []
-    all_model_outputs = []
+    local_kappas = [] # تغییر: جایگزینی variance با kappa
     
-    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
+    for images, labels in tqdm(loader, desc=f"Evaluating {name}", leave=True, disable=not is_main):
         images = images.to(device)
         labels = labels.to(device)
-        outputs, weights, memberships, model_outs, diversity_scores = model(images, return_details=True)
-        pred = (outputs.squeeze(1) > 0).long()
+        outputs, weights, _, raw_outputs = model(images, return_details=True)
         
+        # محاسبه Kappa برای گزارش
+        preds = (raw_outputs.squeeze(-1) > 0).long()
+        weighted_logits = (raw_outputs.squeeze(-1) * weights).sum(dim=1, keepdim=True)
+        consensus_pred = (weighted_logits > 0).long()
+        
+        batch_kappas = []
+        for i in range(preds.shape[1]):
+            k = cohen_kappa_batch(preds[:, i], consensus_pred.squeeze(1))
+            batch_kappas.append(k.mean().item()) # میانگین کاپای مدل i در این بچ
+        
+        local_kappas.append(batch_kappas)
+        
+        pred = (outputs.squeeze(1) > 0).long()
         local_preds.append(pred)
         local_labels.append(labels)
         local_weights.append(weights)
-        local_diversity.append(diversity_scores)
-        all_model_outputs.append(model_outs)
-    
+
     local_preds_tensor = torch.cat(local_preds)
     local_labels_tensor = torch.cat(local_labels)
     local_weights_tensor = torch.cat(local_weights)
-    local_diversity_tensor = torch.cat(local_diversity)
-    all_model_outputs_tensor = torch.cat(all_model_outputs)
     
+    # میانگین‌گیری کاپاها از بچ‌های مختلف
+    avg_kappas = np.array(local_kappas).mean(axis=0)
+
+    world_size = dist.get_world_size()
     if is_main:
-        all_preds = local_preds_tensor.cpu().numpy()
-        all_labels = local_labels_tensor.cpu().numpy()
-        all_weights = local_weights_tensor.cpu().numpy()
-        all_diversity = local_diversity_tensor.cpu().numpy()
-        
-        model_predictions = (all_model_outputs_tensor.squeeze(-1) > 0).long()
-        avg_kappa = KappaDiversityCalculator.calculate_average_kappa(model_predictions)
+        gathered_preds = [torch.zeros_like(local_preds_tensor) for _ in range(world_size)]
+        gathered_labels = [torch.zeros_like(local_labels_tensor) for _ in range(world_size)]
+        gathered_weights = [torch.zeros_like(local_weights_tensor) for _ in range(world_size)]
+    else:
+        gathered_preds = None
+        gathered_labels = None
+        gathered_weights = None
+
+    dist.gather(local_preds_tensor, gathered_preds, dst=0)
+    dist.gather(local_labels_tensor, gathered_labels, dst=0)
+    dist.gather(local_weights_tensor, gathered_weights, dst=0)
+
+    if is_main:
+        all_preds = torch.cat(gathered_preds).cpu().numpy()
+        all_labels = torch.cat(gathered_labels).cpu().numpy()
+        all_weights = torch.cat(gathered_weights).cpu().numpy()
         
         acc = 100. * np.mean(all_preds == all_labels)
         avg_weights = all_weights.mean(axis=0)
         activation_counts = (all_weights > 1e-4).sum(axis=0)
         total_samples = all_weights.shape[0]
         activation_percentages = (activation_counts / total_samples) * 100
-        avg_diversity_score = all_diversity.mean()
         
         print(f"\n{'='*70}")
-        print(f"{name.upper()} SET RESULTS (🆕 WITH KAPPA DIVERSITY)")
+        print(f"{name.upper()} SET RESULTS")
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Samples: {total_samples:,}")
-        print(f" 🆕 → Avg Diversity Score: {avg_diversity_score:.4f}")
-        print(f" 🆕 → Avg Kappa: {avg_kappa:.4f} (Lower = More Diverse)")
         print(f"\nAverage Model Weights:")
         for i, (w, name) in enumerate(zip(avg_weights, model_names)):
             print(f" {i+1:2d}. {name:<25}: {w:6.4f} ({w*100:5.2f}%)")
         print(f"\nActivation Frequency:")
         for i, (perc, count, name) in enumerate(zip(activation_percentages, activation_counts, model_names)):
-            print(f" {i+1:2d}. {name:<25}: {perc:6.2f}% active ({int(count):,} / {total_samples:,})")
-        print(f"{'='*70}")
+            print(f" {i+1:2d}. {name:<25}: {perc:6.2f}% active ({int(count):,} / {total_samples:,} samples)")
         
-        return acc, avg_weights.tolist(), avg_diversity_score, avg_kappa, activation_percentages.tolist()
+        print(f"\nAgreement Score (Avg Kappa with Consensus):")
+        for i, (k, name) in enumerate(zip(avg_kappas, model_names)):
+            print(f" {i+1:2d}. {name:<25}: {k:.4f}")
+            
+        print(f"{'='*70}")
+        return acc, avg_weights.tolist(), avg_kappas.tolist(), activation_percentages.tolist()
     
-    return 0.0, [0.0]*len(model_names), 0.0, 0.0, [0.0]*len(model_names)
+    return 0.0, [0.0]*len(model_names), [0.0]*len(model_names), [0.0]*len(model_names)
 
-
-# ============================================================================
-# DDP Setup
-# ============================================================================
+def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr, device, save_dir, local_rank):
+    os.makedirs(save_dir, exist_ok=True)
+    hesitant_net = ensemble_model.module.hesitant_fuzzy
+    optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    criterion = nn.BCEWithLogitsLoss()
+  
+    best_val_acc = 0.0
+    # تغییر تاریخچه: حذف variance و اضافه شدن kappa
+    history = {'train_loss': [], 'train_acc': [], 'val_acc': [], 'avg_kappa': []}
+  
+    is_main = local_rank == 0
+  
+    if is_main:
+        print("="*70)
+        print("Training Fuzzy Hesitant Network (Kappa-based Selection)")
+        print("="*70)
+        print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
+        print(f"Epochs: {num_epochs} | Initial LR: {lr}")
+        print(f"Hesitant memberships per model: {hesitant_net.num_memberships}\n")
+  
+    for epoch in range(num_epochs):
+        if hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
+            
+        ensemble_model.train()
+        train_loss = train_correct = train_total = 0.0
+        batch_kappas = [] # ذخیره کاپای هر بچ
+    
+        for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]', disable=not is_main):
+            images, labels = images.to(device), labels.to(device).float()
+        
+            optimizer.zero_grad()
+            outputs, weights, _, raw_outputs = ensemble_model(images, return_details=True)
+            loss = criterion(outputs.squeeze(1), labels)
+            loss.backward()
+            optimizer.step()
+          
+            batch_size = images.size(0)
+            train_loss += loss.item() * batch_size
+            pred = (outputs.squeeze(1) > 0).long()
+            train_correct += pred.eq(labels.long()).sum().item()
+            train_total += batch_size
+            
+            # محاسبه میانگین کاپا برای این بچ
+            preds = (raw_outputs.squeeze(-1) > 0).long()
+            weighted_logits = (raw_outputs.squeeze(-1) * weights).sum(dim=1, keepdim=True)
+            consensus_pred = (weighted_logits > 0).long()
+            
+            model_kappas = []
+            for i in range(preds.shape[1]):
+                k = cohen_kappa_batch(preds[:, i], consensus_pred.squeeze(1))
+                model_kappas.append(k.mean().item())
+            batch_kappas.append(np.mean(model_kappas))
+      
+        train_acc = 100. * train_correct / train_total
+        train_loss = train_loss / train_total
+        avg_epoch_kappa = np.mean(batch_kappas) # تغییر: محاسبه میانگین کاپا
+        val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
+        scheduler.step()
+    
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
+        history['avg_kappa'].append(avg_epoch_kappa) # تغییر: ذخیره کاپا
+          
+        if is_main:
+            print(f"\nEpoch {epoch+1}:")
+            print(f" Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            print(f" Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
+            print(f" Avg Agreement (Kappa): {avg_epoch_kappa:.4f}") # تغییر: پرینت کاپا
+          
+        if is_main and val_acc > best_val_acc:
+            best_val_acc = val_acc
+            tmp_path = os.path.join(save_dir, 'best_tmp.pt')
+            final_path = os.path.join(save_dir, 'best_hesitant_fuzzy.pt')
+              
+            try:
+                torch.save({
+                    'epoch': epoch + 1,
+                    'hesitant_state_dict': hesitant_net.state_dict(),
+                    'val_acc': val_acc,
+                    'history': history
+                }, tmp_path)
+                  
+                if os.path.exists(tmp_path):
+                    shutil.move(tmp_path, final_path)
+                    print(f" Best model saved → {val_acc:.2f}%")
+            except Exception as e:
+                print(f" [ERROR] Failed to save model: {e}")
+          
+        if is_main:
+            print("-" * 70)
+  
+    if is_main:
+        print(f"\nTraining completed! Best Val Acc: {best_val_acc:.2f}%")
+    return best_val_acc, history
 
 def setup_distributed():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -901,10 +875,10 @@ def setup_distributed():
         torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
         if rank == 0:
-            print(f"✅ Initialized DDP: rank {rank}, world_size {world_size}")
+            print(f"Initialized process group: rank {rank}, world_size {world_size}, local_rank {local_rank}")
         return device, local_rank, rank, world_size
     else:
-        print("⚠️ Not running in distributed mode")
+        print("Not running in distributed mode")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         return device, 0, 0, 1
 
@@ -912,31 +886,31 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-
-# این بخش را جایگزین تابع main() فعلی خود کنید
-
 def main():
     SEED = 42
     set_seed(SEED)
-  
-    # راه‌اندازی محیط توزیع‌شده
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
   
-    parser = argparse.ArgumentParser(description="Train Kappa-Aware Fuzzy Hesitant Ensemble")
+    parser = argparse.ArgumentParser(description="Train Fuzzy Hesitant Ensemble with Kappa")
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--num_memberships', type=int, default=3)
-    parser.add_argument('--diversity_weight', type=float, default=0.3)
-    parser.add_argument('--min_diversity_threshold', type=float, default=0.2)
-    parser.add_argument('--num_grad_cam_samples', type=int, default=5)
-    parser.add_argument('--dataset', type=str, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'], required=True)
-    parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--model_paths', type=str, nargs='+', required=True)
-    parser.add_argument('--model_names', type=str, nargs='+', required=True)
+    parser.add_argument('--num_memberships', type=int, default=3, help='Number of membership values per model')
+    parser.add_argument('--num_grad_cam_samples', type=int, default=5, help='Number of samples for GradCAM visualization')
+    parser.add_argument('--num_lime_samples', type=int, default=5, help='Number of samples for LIME visualization')
+    parser.add_argument('--dataset', type=str, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'], required=True,
+                       help='Dataset type')
+    
+    # تغییر آرگومان‌ها: حذف cum و hesitancy_threshold
+    parser.add_argument('--min_agreement_kappa', type=float, default=0.0, 
+                   help='Minimum Kappa score for a model to agree with ensemble (default: 0.0, keeps all). Use higher values to force consensus.')
+    
+    parser.add_argument('--data_dir', type=str, required=True, help='Base directory of dataset')
+    parser.add_argument('--model_paths', type=str, nargs='+', required=True, help='Paths to pruned model checkpoints')
+    parser.add_argument('--model_names', type=str, nargs='+', required=True, help='Names for each model')
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/')
-    parser.add_argument('--seed', type=int, default=SEED)
+    parser.add_argument('--seed', type=int, default=SEED, help='Random seed for reproducibility')
   
     args = parser.parse_args()
   
@@ -954,37 +928,39 @@ def main():
   
     if is_main:
         print("="*70)
-        print(f"Distributed Training on {world_size} GPUs | SEED: {args.seed}")
+        print(f"Distributed Data Parallel Training on {world_size} GPUs | SEED: {args.seed}")
         print("="*70)
         print(f"Device: {device}")
         print(f"Batch size: {args.batch_size}")
         print(f"Dataset: {args.dataset}")
+        print(f"Min Agreement Kappa: {args.min_agreement_kappa}")
         print(f"Data directory: {args.data_dir}")
-        print(f"Diversity weight: {args.diversity_weight}")
-        print(f"Min diversity threshold: {args.min_diversity_threshold}")
+        print(f"\nUsing normalization parameters:")
+        print(f" MEANS: {MEANS}")
+        print(f" STDS: {STDS}")
+        print(f"\nModels to load:")
+        for i, (path, name) in enumerate(zip(args.model_paths, args.model_names)):
+            print(f" {i+1}. {name}: {path}")
         print("="*70 + "\n")
   
     base_models = load_pruned_models(args.model_paths, device)
     if len(base_models) != len(args.model_paths):
         if is_main:
-            print(f"[WARNING] Only {len(base_models)}/{len(args.model_paths)} models loaded.")
+            print(f"[WARNING] Only {len(base_models)}/{len(args.model_paths)} models loaded. Adjusting parameters.")
         MEANS = MEANS[:len(base_models)]
         STDS = STDS[:len(base_models)]
         MODEL_NAMES = args.model_names[:len(base_models)]
     else:
         MODEL_NAMES = args.model_names
   
-    # ✅ استفاده از نام صحیح کلاس و پارامترهای درست
-    ensemble = KappaAwareFuzzyEnsemble(
-        base_models, 
-        MEANS, 
-        STDS,
+    ensemble = FuzzyHesitantEnsemble(
+        base_models, MEANS, STDS,
         num_memberships=args.num_memberships,
         freeze_models=True,
-        diversity_weight=args.diversity_weight,
-        min_diversity_threshold=args.min_diversity_threshold
+        min_agreement_kappa=args.min_agreement_kappa # تغییر آرگومان ورودی
     ).to(device)
     
+
     ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
     
     hesitant_net = ensemble.module.hesitant_fuzzy
@@ -997,107 +973,110 @@ def main():
         args.data_dir, args.batch_size, dataset_type=args.dataset, is_distributed=True
     )
     
-    # ارزیابی مدل‌های فردی
     if is_main:
         print("\n" + "="*70)
-        print("EVALUATING INDIVIDUAL MODELS (Before Training)")
+        print("EVALUATING INDIVIDUAL MODELS ON TEST SET (Before Training)")
         print("="*70)
-    
     individual_accs = []
     for i, model in enumerate(base_models):
-        acc = evaluate_single_model(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", 
-                                    MEANS[i], STDS[i], is_main, is_distributed=True)
+        acc = evaluate_single_model_ddp(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i],is_main)
         individual_accs.append(acc)
-    
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
     if is_main:
-        print(f"\nBest Single Model: {MODEL_NAMES[best_idx]} → {best_single:.2f}%")
+        print(f"\nBest Single Model: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
   
-    # ✅ استفاده از تابع صحیح آموزش
-    best_val_acc, history = train_kappa_aware_ensemble(
+    best_val_acc, history = train_hesitant_fuzzy(
         ensemble, train_loader, val_loader,
         args.epochs, args.lr, device, args.save_dir, local_rank
     )
     
-    dist.barrier()
-    ckpt_path = os.path.join(args.save_dir, 'best_kappa_aware_ensemble.pt')
+    ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         ensemble.module.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
         if is_main:
-            print("Best model loaded.\n")
+            print("Best hesitant fuzzy network loaded.\n")
 
-    # ارزیابی نهایی
     if is_main:
         print("\n" + "="*70)
-        print("FINAL EVALUATION")
+        print("EVALUATING FUZZY HESITANT ENSEMBLE")
         print("="*70)
-    
-    ensemble_test_acc, ensemble_weights, avg_diversity, avg_kappa, activation_percentages = \
-        evaluate_ensemble_final_kappa(ensemble.module, test_loader, device, "Test", MODEL_NAMES, is_main)
+    # تغییر متغیرهای بازگشتی: variance -> kappa
+    ensemble_test_acc, ensemble_weights, kappa_values, activation_percentages = evaluate_ensemble_final_ddp(
+        ensemble.module, test_loader, device, "Test", MODEL_NAMES, is_main
+    )
     
     if is_main:
         print("\n" + "="*70)
         print("FINAL COMPARISON")
         print("="*70)
         print(f"Best Single Model Acc : {best_single:.2f}%")
-        print(f"Kappa-Aware Ensemble  : {ensemble_test_acc:.2f}%")
+        print(f"Hesitant Ensemble Acc : {ensemble_test_acc:.2f}%")
         improvement = ensemble_test_acc - best_single
-        print(f"Improvement           : {improvement:+.2f}%")
+        print(f"Improvement : {improvement:+.2f}%")
         
-        # ذخیره نتایج
-        # نمونه اصلاح شده برای بخش ذخیره نتایج
+        # Save final results
         final_results = {
-            "test_accuracy": float(ensemble_test_acc),  # تبدیل به float پایتون
-            "avg_diversity": float(avg_diversity),
-            "avg_kappa": float(avg_kappa),
-            "model_weights": [float(w) for w in ensemble_weights]
+            'best_single_model': {
+                'name': MODEL_NAMES[best_idx],
+                'accuracy': best_single
+            },
+            'ensemble': {
+                'test_accuracy': ensemble_test_acc,
+                'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)},
+                'agreement_kappa_scores': {name: float(k) for name, k in zip(MODEL_NAMES, kappa_values)},
+                'activation_percentages': {name: float(p) for name, p in zip(MODEL_NAMES, activation_percentages)}
+            },
+            'improvement': float(improvement),
+            'training_history': history
         }
-
-# فقط Rank 0 عملیات ذخیره فایل را انجام دهد تا تداخل پیش نیاید
-        if dist.get_rank() == 0:
-            with open("final_results.json", "w") as f:
-                json.dump(final_results, f, indent=4)
-            print("Results saved successfully!")
         
-        # ذخیره مدل نهایی
-        final_model_path = os.path.join(args.save_dir, 'final_kappa_ensemble.pt')
+        results_path = os.path.join(args.save_dir, 'final_results.json')
+        with open(results_path, 'w') as f:
+            json.dump(final_results, f, indent=4)
+        print(f"\nResults saved to: {results_path}")
+        
+        final_model_path = os.path.join(args.save_dir, 'final_ensemble_model.pt')
         torch.save({
             'ensemble_state_dict': ensemble.module.state_dict(),
             'hesitant_fuzzy_state_dict': ensemble.module.hesitant_fuzzy.state_dict(),
             'test_accuracy': ensemble_test_acc,
             'model_names': MODEL_NAMES,
             'means': MEANS,
-            'stds': STDS,
-            'diversity_weight': args.diversity_weight
+            'stds': STDS
         }, final_model_path)
         print(f"Final model saved: {final_model_path}")
 
-        # GradCAM Visualization
+        # GradCAM and LIME Visualization
         print("="*70)
-        print("GENERATING GRADCAM VISUALIZATIONS")
+        print("GENERATING GRADCAM AND LIME VISUALIZATIONS FOR ENSEMBLE OUTPUT")
         print("="*70)
 
         ensemble.module.eval()
-        vis_dir = os.path.join(args.save_dir, 'gradcam_kappa_vis')
-        os.makedirs(vis_dir, exist_ok=True)
+        vis_dir = os.path.join(args.save_dir, 'visualizations')
+        gradcam_dir = os.path.join(vis_dir, 'gradcam')
+        lime_dir = os.path.join(vis_dir, 'lime')
+        combined_dir = os.path.join(vis_dir, 'combined')
+        os.makedirs(gradcam_dir, exist_ok=True)
+        os.makedirs(lime_dir, exist_ok=True)
+        os.makedirs(combined_dir, exist_ok=True)
 
         if args.dataset == 'wild':
             full_test_dataset = test_loader.dataset
             total_samples = len(full_test_dataset)
             vis_indices = list(range(total_samples))
             random.shuffle(vis_indices)
-            vis_indices = vis_indices[:args.num_grad_cam_samples]
+            vis_indices = vis_indices[:max(args.num_grad_cam_samples, args.num_lime_samples)]
             vis_dataset = Subset(full_test_dataset, vis_indices)
         else:
             test_indices = test_loader.dataset.indices
             vis_indices = test_indices.copy()
             random.shuffle(vis_indices)
-            vis_indices = vis_indices[:args.num_grad_cam_samples]
+            vis_indices = vis_indices[:max(args.num_grad_cam_samples, args.num_lime_samples)]
             vis_dataset = Subset(test_loader.dataset.dataset, vis_indices)
 
-        vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0)
+        vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=False)
 
         for idx, (image, label_from_loader) in enumerate(vis_loader):
             image = image.to(device)
@@ -1108,105 +1087,111 @@ def main():
             else:
                 img_path, true_label = test_loader.dataset.dataset.samples[original_full_dataset_index]
 
-            print(f"\n[GradCAM {idx+1}/{len(vis_loader)}]")
-            print(f"  Path: {img_path}")
-            print(f"  True: {'real' if true_label == 1 else 'fake'}")
+            print(f"\n[Visualization {idx+1}/{len(vis_loader)}]")
+            print(f"  Original image path: {img_path}")
+            print(f"  True label: {'real' if true_label == 1 else 'fake'} (label={true_label})")
 
             with torch.no_grad():
-                output, weights, _, _, _ = ensemble.module(image, return_details=True)
+                output, weights, _, _ = ensemble.module(image, return_details=True)
             pred = 1 if output.squeeze().item() > 0 else 0
-            print(f"  Pred: {'real' if pred == 1 else 'fake'}")
+            print(f"  Predicted: {'real' if pred == 1 else 'fake'}")
 
-            active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
-            combined_cam = None
-            
-            for i in active_models:
-                model = ensemble.module.models[i]
-                for p in model.parameters():
-                    p.requires_grad_(True)
-                target_layer = model.layer4[2].conv3
-                gradcam = GradCAM(model, target_layer)
-                
-                with torch.enable_grad():
-                    x_n = ensemble.module.normalizations(image, i)
-                    model_out = model(x_n)
-                    if isinstance(model_out, (tuple, list)):
-                        model_out = model_out[0]
-                    score = model_out.squeeze() if pred == 1 else -model_out.squeeze()
-                    cam = gradcam.generate(score)
-                
-                weight = weights[0, i].item()
-                if combined_cam is None:
-                    combined_cam = weight * cam
-                else:
-                    combined_cam += weight * cam
-                
-                for p in model.parameters():
-                    p.requires_grad_(False)
+            if idx < args.num_grad_cam_samples:
+                active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
+                combined_cam = None
+                for i in active_models:
+                    model = ensemble.module.models[i]
+                    for p in model.parameters():
+                        p.requires_grad_(True)
+                    target_layer = model.layer4[2].conv3
+                    gradcam = GradCAM(model, target_layer)
+                    with torch.enable_grad():
+                        x_n = ensemble.module.normalizations(image, i)
+                        model_out = model(x_n)
+                        if isinstance(model_out, (tuple, list)):
+                            model_out = model_out[0]
+                        model_out = model_out.squeeze()
+                        score = model_out if pred == 1 else -model_out
+                        cam = gradcam.generate(score)
+                    weight = weights[0, i].item()
+                    if combined_cam is None:
+                        combined_cam = weight * cam
+                    else:
+                        combined_cam += weight * cam
+                    for p in model.parameters():
+                        p.requires_grad_(False)
 
-            if combined_cam is not None:
-                combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
-                img_np = image[0].cpu().permute(1, 2, 0).numpy()
-                img_h, img_w = img_np.shape[:2]
-                combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h))
+                if combined_cam is not None:
+                    combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
+                    img_np = image[0].cpu().permute(1, 2, 0).numpy()
+                    img_h, img_w = img_np.shape[:2]
+                    combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h))
 
-                heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
-                heatmap = np.float32(heatmap) / 255
-                overlay = heatmap + img_np
-                overlay = overlay / overlay.max()
+                    heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
+                    heatmap = np.float32(heatmap) / 255
+                    overlay = heatmap + img_np
+                    overlay = overlay / overlay.max()
 
-                save_path = os.path.join(vis_dir, f"sample_{idx}_true{true_label}_pred{pred}.png")
-                
-                plt.figure(figsize=(10, 10))
-                plt.imshow(overlay)
-                plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
-                plt.axis('off')
-                plt.savefig(save_path, bbox_inches='tight', dpi=200)
-                plt.close()
-                
-                print(f"  Saved: {save_path}")
+                    gradcam_save_path = os.path.join(gradcam_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+                    
+                    plt.figure(figsize=(10, 10))
+                    plt.imshow(overlay)
+                    plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+                    plt.axis('off')
+                    plt.savefig(gradcam_save_path, bbox_inches='tight', dpi=200)
+                    plt.close()
+                    
+                    print(f"  GradCAM saved: {gradcam_save_path}")
+
+            if idx < args.num_lime_samples:
+                try:
+                    lime_img = generate_lime_explanation(ensemble.module, image, device)
+                    
+                    lime_save_path = os.path.join(lime_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+                    
+                    plt.figure(figsize=(10, 10))
+                    plt.imshow(lime_img)
+                    plt.title(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+                    plt.axis('off')
+                    plt.savefig(lime_save_path, bbox_inches='tight', dpi=200)
+                    plt.close()
+                    
+                    print(f"  LIME saved: {lime_save_path}")
+                    
+                    if idx < args.num_grad_cam_samples and 'combined_cam' in locals():
+                        combined_save_path = os.path.join(combined_dir, f"sample_{idx}_true{'real' if true_label==1 else 'fake'}_pred{'real' if pred==1 else 'fake'}.png")
+                        
+                        fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+                        
+                        axes[0].imshow(img_np)
+                        axes[0].set_title("Original Image")
+                        axes[0].axis('off')
+                        
+                        axes[1].imshow(overlay)
+                        axes[1].set_title("GradCAM")
+                        axes[1].axis('off')
+                        
+                        axes[2].imshow(lime_img)
+                        axes[2].set_title("LIME")
+                        axes[2].axis('off')
+                        
+                        plt.suptitle(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}\n{os.path.basename(img_path)}")
+                        plt.tight_layout()
+                        plt.savefig(combined_save_path, bbox_inches='tight', dpi=200)
+                        plt.close()
+                        
+                        print(f"  Combined visualization saved: {combined_save_path}")
+                except Exception as e:
+                    print(f"  Error generating LIME: {e}")
 
         print("="*70)
-        print("GradCAM completed!")
+        print("Visualizations completed!")
+        print(f"GradCAM visualizations saved to: {gradcam_dir}")
+        print(f"LIME visualizations saved to: {lime_dir}")
+        print(f"Combined visualizations saved to: {combined_dir}")
         print("="*70)
     
     cleanup_distributed()
-
-
-# تابع کمکی برای ارزیابی مدل‌های فردی
-@torch.no_grad()
-def evaluate_single_model(model, loader, device, name, mean, std, is_main, is_distributed=False):
-    model.eval()
-    correct = total = 0
-    mean_t = torch.tensor(mean).view(1, 3, 1, 1).to(device)
-    std_t = torch.tensor(std).view(1, 3, 1, 1).to(device)
-    
-    for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
-        images_norm = (images - mean_t) / std_t
-        
-        outputs = model(images_norm)
-        if isinstance(outputs, (tuple, list)):
-            outputs = outputs[0]
-        
-        pred = (outputs.squeeze(1) > 0).long()
-        total += labels.size(0)
-        correct += pred.eq(labels.long()).sum().item()
-    
-    if is_distributed:
-        correct_t = torch.tensor(correct, dtype=torch.long, device=device)
-        total_t = torch.tensor(total, dtype=torch.long, device=device)
-        dist.all_reduce(correct_t, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_t, op=dist.ReduceOp.SUM)
-        correct = correct_t.item()
-        total = total_t.item()
-    
-    acc = 100. * correct / total
-    if is_main:
-        print(f"{name}: {acc:.2f}%")
-    return acc
-
 
 if __name__ == "__main__":
     main()
