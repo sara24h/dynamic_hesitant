@@ -95,20 +95,16 @@ class GradCAM:
 
 # تابع جدید برای تولید توضیحات LIME
 def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256)):
-    # Convert tensor to numpy and ensure it's in the right format
     img_np = image_tensor[0].cpu().permute(1, 2, 0).numpy()
     img_np = (img_np * 255).astype(np.uint8)
     
-    # Create LIME explainer
     explainer = lime_image.LimeImageExplainer()
     
-    # Define prediction function for LIME
     def predict_fn(images):
         batch = torch.from_numpy(images.transpose(0, 3, 1, 2)).float() / 255.0
         batch = batch.to(device)
         
         with torch.no_grad():
-            # مدیریت خروجی مدل که می‌تواند tuple (logits, weights) باشد
             model_out = model(batch)
             if isinstance(model_out, tuple):
                 outputs, _ = model_out
@@ -117,10 +113,8 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
             
             probs = torch.sigmoid(outputs).cpu().numpy()
             
-        # Return probabilities for both classes
         return np.hstack([1 - probs, probs])
     
-    # Generate explanation
     explanation = explainer.explain_instance(
         img_np, 
         predict_fn, 
@@ -129,7 +123,6 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         num_samples=1000
     )
     
-    # Get the explanation for the predicted class
     temp, mask = explanation.get_image_and_mask(
         explanation.top_labels[0], 
         positive_only=True, 
@@ -137,15 +130,12 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         hide_rest=True
     )
     
-    # Create the explanation image
     lime_img = mark_boundaries(temp / 255.0, mask)
-    
-    # Resize to match original image
     lime_img = cv2.resize(lime_img, target_size)
     
     return lime_img
 
-# توابع کمکی بدون تغییر باقی می‌مانند
+# توابع کمکی
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -232,7 +222,7 @@ def prepare_uadfV_dataset(base_dir, seed=42):
     train_indices, val_indices, test_indices = create_reproducible_split(full_dataset, seed=seed)
     return full_dataset, train_indices, val_indices, test_indices
 
-# کلاس‌های مدل بدون تغییر باقی می‌مانند
+# کلاس‌های مدل
 class HesitantFuzzyMembership(nn.Module):
     def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, dropout: float = 0.3):
         super().__init__()
@@ -319,7 +309,6 @@ class FuzzyHesitantEnsemble(nn.Module):
       
         for b in range(x.size(0)):
             if high_hesitancy_mask[b]:
-                # در صورت تردید بالا، آستانه نادیده گرفته می‌شود
                 pass 
             else:
                 # --- اینجا آستانه بررسی می‌شود ---
@@ -331,7 +320,7 @@ class FuzzyHesitantEnsemble(nn.Module):
                 sample_mask[top_indices] = 1.0
                 mask[b] = sample_mask
                 
-                # --- ذخیره تعداد مدل‌های فعال برای این نمونه ---
+                # --- ذخیره تعداد مدل‌های فعال ---
                 batch_active_models_count.append(active_count.item())
       
         final_weights = final_weights * mask
@@ -354,7 +343,7 @@ class FuzzyHesitantEnsemble(nn.Module):
         final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
       
         if return_details:
-            # --- تغییر جدید: برگرداندن لیست تعداد مدل‌های فعال ---
+            # --- تغییر جدید: برگرداندن لیست ---
             return final_output, final_weights, all_memberships, outputs, batch_active_models_count
         return final_output, final_weights
     
@@ -362,8 +351,8 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
     try:
         from model.pruned_model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     except ImportError:
-        # Placeholder for demonstration if import fails
-        print("Warning: Using dummy model class for demonstration.")
+        # Dummy model for safety
+        print("Warning: Could not import ResNet_pruned. Using a dummy model for structure.")
         class ResNet_50_pruned_hardfakevsreal(nn.Module):
             def __init__(self, masks=None):
                 super().__init__()
@@ -374,7 +363,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
                 self.fc = nn.Linear(128, 1)
             def forward(self, x):
                 return self.fc(x.mean(dim=[2,3]))
-    
+
     models = []
     if dist.get_rank() == 0:
         print(f"Loading {len(model_paths)} pruned models...")
@@ -440,9 +429,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         transforms.ToTensor(),
     ])
   
-    # ... (بخش‌های مختلف دیتاست مشابه قبل هستند، برای خلاصه سازی نرمال‌سازی مسیرها نشان داده می‌شود) ...
-    
-    # Generic loader creation logic (simplified for brevity, assuming datasets prepared)
+    # --- حالت wild ---
     if dataset_type == 'wild':
         splits = ['train', 'valid', 'test']
         datasets_dict = {}
@@ -456,31 +443,90 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2, dat
         val_sampler = DistributedSampler(datasets_dict['valid'], shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(datasets_dict['test'], shuffle=False) if is_distributed else None
         
-        train_loader = DataLoader(datasets_dict['train'], batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True)
-        val_loader = DataLoader(datasets_dict['valid'], batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True)
-        test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True)
+        train_loader = DataLoader(datasets_dict['train'], batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True, worker_init_fn=worker_init_fn)
+        val_loader = DataLoader(datasets_dict['valid'], batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
         
+    # --- حالت real_fake ---
     elif dataset_type == 'real_fake':
-        full_dataset, train_indices, val_indices, test_indices = prepare_real_fake_dataset(base_dir)
+        print(f"Processing real-fake dataset from: {base_dir}")
+        full_dataset, train_indices, val_indices, test_indices = prepare_real_fake_dataset(base_dir, seed=42)
         train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
+        
         train_sampler = DistributedSampler(train_dataset) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True)
         
-    # (سایر حالت‌های دیتاست مشابه الگوی بالا پیاده‌سازی می‌شوند)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True, worker_init_fn=worker_init_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+                                
+    # --- حالت hard_fake_real ---
+    elif dataset_type == 'hard_fake_real':
+        print(f"Processing hardfakevsrealfaces dataset from: {base_dir}")
+        full_dataset, train_indices, val_indices, test_indices = prepare_hard_fake_real_dataset(base_dir, seed=42)
+        train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
+        val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
+        test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
+        
+        train_sampler = DistributedSampler(train_dataset) if is_distributed else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
+        test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True, worker_init_fn=worker_init_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+                                
+    # --- حالت deepflux ---
+    elif dataset_type == 'deepflux':
+        print(f"Processing DeepFLUX dataset from: {base_dir}")
+        full_dataset, train_indices, val_indices, test_indices = prepare_deepflux_dataset(base_dir, seed=42)
+        train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
+        val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
+        test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
+        
+        train_sampler = DistributedSampler(train_dataset) if is_distributed else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
+        test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True, worker_init_fn=worker_init_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+                                
+    # --- حالت uadfV ---
+    elif dataset_type == 'uadfV':
+        print(f"Processing UADFV dataset from: {base_dir}")
+        full_dataset, train_indices, val_indices, test_indices = prepare_uadfV_dataset(base_dir, seed=42)
+        
+        # برای UADFV چون کلاس سفارشی است، سابست‌ها را مستقیم می‌سازیم
+        train_dataset = Subset(full_dataset, train_indices)
+        val_dataset = Subset(full_dataset, val_indices)
+        test_dataset = Subset(full_dataset, test_indices)
+        
+        # اعمال ترنسفرم
+        train_dataset.dataset.transform = train_transform
+        val_dataset.dataset.transform = val_test_transform
+        test_dataset.dataset.transform = val_test_transform
+        
+        train_sampler = DistributedSampler(train_dataset) if is_distributed else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
+        test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=num_workers, pin_memory=True, drop_last=True, worker_init_fn=worker_init_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, sampler=test_sampler, num_workers=num_workers, pin_memory=True, drop_last=False, worker_init_fn=worker_init_fn)
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
-
+  
     if dist.get_rank() == 0:
         print(f"DataLoaders ready! Batch size: {batch_size}")
+        print(f" Batches → Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
+        print("="*70 + "\n")
     return train_loader, val_loader, test_loader
 
-# === توابع ارزیابی اصلاح شده ===
+# === توابع ارزیابی ===
 
 @torch.no_grad()
 def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device, name: str, mean: Tuple[float], std: Tuple[float], is_main: bool) -> float:
@@ -531,20 +577,18 @@ def evaluate_accuracy_ddp(model, loader, device):
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
     
-    # لیست‌های محلی برای ذخیره اطلاعات
     local_preds = []
     local_labels = []
     local_weights = []
     local_memberships = []
     
-    # --- تغییر جدید: جمع‌آوری تعداد مدل‌های فعال در بچ‌های محلی ---
+    # --- تغییر جدید: جمع‌آوری تعداد مدل‌های فعال ---
     local_active_counts = []
 
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", leave=True, disable=not is_main):
         images = images.to(device)
         labels = labels.to(device)
         
-        # دریافت خروجی با جزئیات (شامل active_counts)
         outputs, weights, memberships, _, active_counts_batch = model(images, return_details=True)
         
         pred = (outputs.squeeze(1) > 0).long()
@@ -554,11 +598,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         local_weights.append(weights)
         local_memberships.append(memberships)
         
-        # اضافه کردن تعداد مدل‌های فعال این بچ به لیست محلی
         if active_counts_batch:
             local_active_counts.extend(active_counts_batch)
 
-    # --- Gather کردن اطلاعات از تمام GPUها ---
     local_preds_tensor = torch.cat(local_preds)
     local_labels_tensor = torch.cat(local_labels)
     local_weights_tensor = torch.cat(local_weights)
@@ -581,16 +623,8 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     dist.gather(local_weights_tensor, gathered_weights, dst=0)
     dist.gather(local_memberships_tensor, gathered_memberships, dst=0)
 
-    # --- پردازش و چاپ آمار ---
     if is_main:
-        # ترکیب لیست‌های پایتونی (active_counts) نیاز به مدیریت دستی دارد زیرا dist.gather برای تانسور است
-        # اما threshold_check_count در خود مدل جمع شده است چون روی همه GPUها یکسان اجرا شده است
-        # (اگر DDP بود، متغیرها سینک می‌شوند اما شمارنده ساده روی هر GPU جدا زیاد می‌شود. باید همه را جمع کنیم)
-        
-        # جمع کردن شمارنده از تمام GPUها (نیاز به همگام‌سازی دستی دارد اگر روی GPU اجرا نشده باشد، اما اینجا ساده handle می‌کنیم)
-        # نکته: threshold_check_count روی هر GPU برای هر بچ آن GPU زیاد شده. مجموع آن‌ها مهم است.
-        # چون متغیر در Module است و DDP آن را replciate نمی‌کند مگر اینکه buffer باشد. اینجا صفت معمولی است.
-        # پس باید آن را جمع کنیم.
+        # --- محاسبه و چاپ آمار آستانه ---
         total_threshold_checks_list = [torch.tensor(0, device=device) for _ in range(world_size)]
         dist.all_gather(total_threshold_checks_list, torch.tensor(model.threshold_check_count, device=device))
         total_threshold_checks = sum([x.item() for x in total_threshold_checks_list])
@@ -600,20 +634,13 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         all_weights = torch.cat(gathered_weights).cpu().numpy()
         all_memberships = torch.cat(gathered_memberships).cpu().numpy()
         
-        # محاسبه میانگین مدل‌های فعال
-        # برای سادگی فرض می‌کنیم local_active_counts روی همه تقریبا یکسان است یا از یک GPU نمونه می‌گیریم
-        # اما برای دقت، باید لیست‌های پایتونی را هم از همه GPUها بگیریم (که پیچیده است).
-        # راه ساده: استفاده از تعداد نمونه‌ها تقسیم بر شمارنده (اگر هر نمونه حتما یکبار چک شده باشد).
-        
-        # چاپ آمار آستانه
         print(f"\n{'='*70}")
         print(f"THRESHOLD & AGGREGATION STATISTICS ({name.upper()})")
         print(f"{'='*70}")
         print(f"Total times Cumulative Threshold was evaluated: {total_threshold_checks}")
         if local_active_counts:
-             # تخمین ساده: میانگین روی داده‌های این پردازنده
              avg_active = np.mean(local_active_counts)
-             print(f"Average active models (local GPU estimate): {avg_active:.2f}")
+             print(f"Average active models (local estimate): {avg_active:.2f}")
         print(f"{'='*70}")
         
         acc = 100. * np.mean(all_preds == all_labels)
