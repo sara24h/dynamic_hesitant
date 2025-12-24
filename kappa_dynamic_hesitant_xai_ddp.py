@@ -341,10 +341,10 @@ class MultiModelNormalization(nn.Module):
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
     
-# --- کلاس اصلاح شده FuzzyHesitantEnsemble با منطق Kappa ---
 class FuzzyHesitantEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
-                 stds: List[Tuple[float]], num_memberships: int = 3, freeze_models: bool = True):
+                 stds: List[Tuple[float]], num_memberships: int = 3, freeze_models: bool = True,
+                 kappa_threshold: float = 1.0):
         super().__init__()
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
@@ -354,7 +354,7 @@ class FuzzyHesitantEnsemble(nn.Module):
             num_models=self.num_models,
             num_memberships=num_memberships
         )
-        # حذف cum_weight_threshold و hesitancy_threshold
+        self.kappa_threshold = kappa_threshold
       
         if freeze_models:
             for model in self.models:
@@ -363,14 +363,14 @@ class FuzzyHesitantEnsemble(nn.Module):
                     p.requires_grad = False
   
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        # محاسبه وزن‌های اولیه توسط شبکه فازی
-        final_weights, all_memberships = self.hesitant_fuzzy(x)
+        # 1. دریافت وزن‌های اولیه از شبکه فازی (این تانسور گرادین دارد)
+        fuzzy_weights, all_memberships = self.hesitant_fuzzy(x)
       
-        # محاسبه hesitancy (فقط برای نمایش در لاگ‌ها، تاثیری در انتخاب ندارد)
+        # محاسبه hesitancy فقط برای نمایش
         hesitancy = all_memberships.var(dim=2)
         avg_hesitancy = hesitancy.mean(dim=1)
       
-        # --- محاسبه خروجی تمام مدل‌ها برای محاسبه تنوع ---
+        # 2. محاسبه خروجی تمام مدل‌ها برای محاسبه تنوع (Kappa)
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
         probs = torch.zeros(x.size(0), self.num_models, device=x.device)
         
@@ -383,57 +383,54 @@ class FuzzyHesitantEnsemble(nn.Module):
             outputs[:, i] = out
             probs[:, i] = torch.sigmoid(out).squeeze(1)
 
-        # --- محاسبه Cohen's Kappa برای تنوع ---
-        # تبدیل احتمالات به پیش‌بینی باینری
+        # 3. محاسبه Cohen's Kappa (گرادین ندارد چون مدل‌ها فریز شده‌اند)
         preds = (probs > 0.5).float()
-        batch_size = x.size(0)
         
-        # ماتریس توافق مشاهده شده (O)
-        eq_matrix = (preds.unsqueeze(2) == preds.unsqueeze(1)).float() # (B, N, N)
-        O_matrix = eq_matrix.mean(dim=0) # (N, N)
+        eq_matrix = (preds.unsqueeze(2) == preds.unsqueeze(1)).float() 
+        O_matrix = eq_matrix.mean(dim=0) 
 
-        # ماتریس توافق مورد انتظار (E)
-        p1 = preds.mean(dim=0) # (N,)
+        p1 = preds.mean(dim=0) 
         p0 = 1 - p1
-        # E[i, j] = p1[i]*p1[j] + p0[i]*p0[j]
         E_matrix = torch.ger(p1, p1) + torch.ger(p0, p0)
 
-        # محاسبه Kappa
         denominator = 1 - E_matrix
         kappa_matrix = torch.zeros_like(O_matrix)
         valid_mask = denominator > 1e-6
         kappa_matrix[valid_mask] = (O_matrix[valid_mask] - E_matrix[valid_mask]) / denominator[valid_mask]
         
-        # --- انتخاب مدل بر اساس وزن فازی و تنوع (1 - Kappa) ---
-        selected_indices = []
-        remaining_indices = list(range(self.num_models))
+        # 4. ساخت ماسک انتخاب به روش حریصانه
+        # مهم: ماسک نیازی به گرادین ندارد، پس خالی می‌سازیم
+        selection_mask = torch.zeros_like(fuzzy_weights) 
         
-        # استراتژی: انتخاب حریصانه برای بیشینه کردن (وزن * تنوع)
-        # تنوع = 1 - کاپا (کاپای کمتر یعنی تنوع بیشتر)
-        
-        # تعداد مدل‌هایی که می‌خواهیم انتخاب کنیم (مثلاً 3 تا)
-        # اگر بخواهیم پویا باشد می‌توانیم بر اساس مجموع وزن‌ها تصمیم بگیریم
         num_to_select = min(3, self.num_models)
-        
-        current_weights_batch = final_weights # (B, N)
+        batch_size = x.size(0)
 
-        for b in range(x.size(0)):
-            mask = torch.zeros(self.num_models, device=x.device)
+        # حلقه روی بچ‌ها برای ساخت ماسک
+        for b in range(batch_size):
+            sample_weights = fuzzy_weights[b] # وزن‌های مربوط به این نمونه (گرادین دارد)
+            
             selected_indices_b = []
             remaining_indices_b = list(range(self.num_models))
-            current_weights = current_weights_batch[b] # (N,)
             
+            # انتخاب مدل‌ها
             for _ in range(num_to_select):
                 best_score = -1.0
                 best_idx = -1
                 
                 for i in remaining_indices_b:
-                    score = current_weights[i].item()
+                    # استفاده از .item() برای شکستن گراف در تصمیم‌گیری گسسته
+                    score = sample_weights[i].item()
                     
                     if selected_indices_b:
-                        # تناسب با انتخاب شده‌های قبلی
                         kappas_with_selected = kappa_matrix[i, selected_indices_b]
-                        # میانگین (1 - kappa) به عنوان ضریب تنوع
+                        
+                        # اعمال آستانه سخت کاپا
+                        if self.kappa_threshold < 1.0:
+                            max_kappa = kappas_with_selected.max().item()
+                            if max_kappa > self.kappa_threshold:
+                                continue 
+                        
+                        # محاسبه امتیاز نهایی (وزن * تنوع)
                         diversity = (1 - kappas_with_selected).mean().item()
                         score = score * diversity
                     
@@ -445,13 +442,17 @@ class FuzzyHesitantEnsemble(nn.Module):
                     selected_indices_b.append(best_idx)
                     remaining_indices_b.remove(best_idx)
             
-            mask[selected_indices_b] = 1.0
-            current_weights_batch[b] = current_weights * mask
+            # اعمال ماسک برای این نمونه (اینجا inplace شدن مشکلی ندارد چون selection_mask گرادین ندارد)
+            selection_mask[b, selected_indices_b] = 1.0
 
-        # نرمال‌سازی نهایی وزن‌ها
-        final_weights = current_weights_batch / (current_weights_batch.sum(dim=1, keepdim=True) + 1e-8)
+        # 5. اعمال ماسک روی وزن‌ها و نرمال‌سازی نهایی
+        # ضرب وزن‌ها در ماسک: باعث می‌شود گرادینت برای مدل‌های انتخاب شده حفظ شود
+        masked_weights = fuzzy_weights * selection_mask
         
-        # محاسبه خروجی نهایی
+        # نرمال‌سازی وزن‌های نهایی
+        final_weights = masked_weights / (masked_weights.sum(dim=1, keepdim=True) + 1e-8)
+        
+        # محاسبه خروجی نهایی انسامبل
         final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
       
         if return_details:
