@@ -542,9 +542,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"\nAverage Model Weights:")
         for i, (w, mname) in enumerate(zip(avg_weights, model_names)):
             print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
-        print(f"\nActivation Frequency:")
-        for i, (perc, mname) in enumerate(zip(activation_percentages, model_names)):
-            print(f" {i+1:2d}. {mname:<25}: {perc:6.2f}% active")
         
         print(f"\nDiversity Analysis (Cohen's Kappa):")
         print(f" → Average Pairwise Kappa: {avg_kappa:.4f} (Lower is more diverse)")
