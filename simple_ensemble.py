@@ -774,6 +774,8 @@ def main():
             'improvement': float(ensemble_test_acc - best_single)
         }
 
+
+        os.makedirs(args.save_dir, exist_ok=True)
         results_path = os.path.join(args.save_dir, 'final_results_simple_ensemble.json')
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=4)
