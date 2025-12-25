@@ -196,7 +196,6 @@ class MultiModelNormalization(nn.Module):
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
-
 # ================== SIMPLE ENSEMBLE CLASS ==================
 class SimpleEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
@@ -223,22 +222,22 @@ class SimpleEnsemble(nn.Module):
                     out = out[0]
             outputs.append(out)
 
-        # Stack: (Batch, NumModels, 1)
+        # Stack: (Batch, NumModels)
         stacked_outputs = torch.cat(outputs, dim=1)
 
         # Simple Average (Standard Ensemble)
-        final_output = stacked_outputs.mean(dim=1)
+        # FIX: Added keepdim=True to ensure shape is (Batch, 1)
+        final_output = stacked_outputs.mean(dim=1, keepdim=True)
 
         if return_details:
             batch_size = x.size(0)
-            # Uniform weights for compatibility with visualization/eval functions
+            # Uniform weights
             weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
-            # Dummy memberships (3 members per model) to match original signature
+            # Dummy memberships to match original signature
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             return final_output, weights, dummy_memberships, stacked_outputs
 
         return final_output, weights
-
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
