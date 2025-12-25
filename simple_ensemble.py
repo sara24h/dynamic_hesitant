@@ -711,6 +711,10 @@ def main():
         freeze_models=True
     ).to(device)
 
+    # Note: We are NOT wrapping the model with DDP.
+    # DDP requires trainable parameters (requires_grad=True), but our simple ensemble 
+    # is frozen. We use DistributedSampler in the DataLoader for parallel processing instead.
+
     if world_size > 1:
         ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
