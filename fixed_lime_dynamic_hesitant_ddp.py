@@ -784,12 +784,10 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
     
     return lime_img
 
-
 # ================== VISUALIZATION FUNCTIONS ==================
-
 def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names, 
                            num_gradcam, num_lime, dataset_type, is_main):
-    """Generate GradCAM and LIME visualizations - OPTIMIZED"""
+    """Generate GradCAM and LIME visualizations"""
     if not is_main:
         return
     
@@ -848,12 +846,15 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
                 combined_cam = None
                 
                 for i in active_models:
-                    model = ensemble.models[i]
+                    # Use 'local_ensemble' to avoid shadowing the function argument
+                    local_ensemble = ensemble.module if hasattr(ensemble, 'module') else ensemble
+                    model = local_ensemble.models[i]
+                    
                     target_layer = model.layer4[2].conv3
                     gradcam = GradCAM(model, target_layer)
                     
                     with torch.enable_grad():
-                        x_n = ensemble.normalizations(image, i)
+                        x_n = local_ensemble.normalizations(image, i)
                         x_n.requires_grad_(True)
                         model_out = model(x_n)
                         if isinstance(model_out, (tuple, list)):
@@ -921,7 +922,6 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
     print("Visualizations completed!")
     print(f"Saved to: {vis_dir}")
     print("="*70)
-
 
 # ================== DISTRIBUTED SETUP ==================
 
