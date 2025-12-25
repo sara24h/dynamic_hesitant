@@ -489,7 +489,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_correct += pred.eq(labels.long()).sum().item()
         total_samples += labels.size(0)
         sum_weights += weights.sum(dim=0)
-        sum_activation += (weights > 1e-4).sum(dim=0).float()
+        sum_activation += weights.sum(dim=0)
         
         # Collect data for Kappa (only if is_main to save memory/complexity)
         if is_main:
