@@ -896,22 +896,39 @@ def main():
         print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
         print("="*70)
 
+        # ... (کد قبلی تا خط 870 بدون تغییر) ...
+
     best_val_acc, history = train_hesitant_fuzzy(
         ensemble, train_loader, val_loader,
         args.epochs, args.lr, device, args.save_dir, is_main)
 
     ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
+    
+    # --- اصلاح شده: همگام‌سازی و بررسی وجود فایل ---
+    if dist.is_initialized():
+        dist.barrier()  # صبر می‌کند تا همه GPUها به این خط برسند (اطمینان از تکمیل ذخیره)
+
     if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        hesitant_net = ensemble.module.hesitant_fuzzy if hasattr(ensemble, 'module') else ensemble.hesitant_fuzzy
-        hesitant_net.load_state_dict(ckpt['hesitant_state_dict'])
+        # چک کردن می‌کند که آیا فایل خالی است یا خیر
+        if os.path.getsize(ckpt_path) > 0:
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            hesitant_net = ensemble.module.hesitant_fuzzy if hasattr(ensemble, 'module') else ensemble.hesitant_fuzzy
+            hesitant_net.load_state_dict(ckpt['hesitant_state_dict'])
+            if is_main:
+                print("Best model loaded.\n")
+        else:
+            if is_main:
+                print("Warning: Checkpoint file is empty. Skipping load.\n")
+    else:
         if is_main:
-            print("Best model loaded.\n")
+            print(f"Warning: Checkpoint not found at {ckpt_path}. Skipping load.\n")
+    # ---------------------------------------------
 
     if is_main:
         print("\n" + "="*70)
         print("FINAL ENSEMBLE EVALUATION")
         print("="*70)
+
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     ensemble_test_acc, ensemble_weights, activation_percentages, avg_kappa = evaluate_ensemble_final_ddp(
