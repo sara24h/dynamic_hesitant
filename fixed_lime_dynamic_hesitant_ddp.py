@@ -578,16 +578,21 @@ def evaluate_accuracy_ddp(model, loader, device):
 
 
 @torch.no_grad()
+@torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
-    """Optimized ensemble evaluation with reduced memory usage"""
+    """Optimized ensemble evaluation with Hesitant Membership Statistics"""
     model.eval()
     
-    # Use tensors instead of lists for efficiency
     total_correct = 0
     total_samples = 0
     sum_weights = torch.zeros(len(model_names), device=device)
     sum_activation = torch.zeros(len(model_names), device=device)
     
+    # New tensors for membership statistics
+    sum_membership_vals = torch.zeros(len(model_names), 3, device=device) # Assuming num_memberships=3
+    sum_hesitancy = torch.zeros(len(model_names), device=device)
+
+    print(f"\nEvaluating {name} set...")
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", leave=True, disable=not is_main):
         images = images.to(device)
         labels = labels.to(device)
@@ -600,12 +605,19 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_samples += labels.size(0)
         sum_weights += weights.sum(dim=0)
         sum_activation += (weights > 1e-4).sum(dim=0).float()
+
+        sum_membership_vals += memberships.sum(dim=0)
+
+        batch_hesitancy = memberships.var(dim=2) # shape: [Batch, Num_Models]
+        sum_hesitancy += batch_hesitancy.sum(dim=0)
     
     # Aggregate across GPUs
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
     dist.all_reduce(sum_weights, op=dist.ReduceOp.SUM)
     dist.all_reduce(sum_activation, op=dist.ReduceOp.SUM)
+    dist.all_reduce(sum_membership_vals, op=dist.ReduceOp.SUM)
+    dist.all_reduce(sum_hesitancy, op=dist.ReduceOp.SUM)
     
     if is_main:
         total_correct = stats[0].item()
@@ -614,23 +626,43 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         avg_weights = (sum_weights / total_samples).cpu().numpy()
         activation_percentages = (sum_activation / total_samples * 100).cpu().numpy()
         
+        # Calculate Average Membership Values and Hesitancy
+        avg_membership = (sum_membership_vals / total_samples).cpu().numpy()
+        avg_hesitancy = (sum_hesitancy / total_samples).cpu().numpy()
+
         print(f"\n{'='*70}")
         print(f"{name.upper()} SET RESULTS")
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Samples: {total_samples:,}")
+        
         print(f"\nAverage Model Weights:")
         for i, (w, mname) in enumerate(zip(avg_weights, model_names)):
             print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
+        
         print(f"\nActivation Frequency:")
         for i, (perc, mname) in enumerate(zip(activation_percentages, model_names)):
             print(f" {i+1:2d}. {mname:<25}: {perc:6.2f}% active")
+
+        # --- NEW PRINT SECTION ---
+        print(f"\nHesitant Membership Values:")
+        for i, mname in enumerate(model_names):
+            # Format mu values: [0.868, 0.867, 0.868]
+            mu_vals = avg_membership[i]
+            mu_str = ", ".join([f"{v:.3f}" for v in mu_vals])
+            mu_str = f"[{mu_str}]"
+            
+            # Format hesitancy: 0.0664
+            hes_val = avg_hesitancy[i]
+            
+            print(f" {i+1:2d}. {mname:<25}: μ = {mu_str:<20} | Hesitancy = {hes_val:.4f}")
+        # ------------------------
+        
         print(f"{'='*70}")
         
         return acc, avg_weights.tolist(), activation_percentages.tolist()
     
     return 0.0, [0.0]*len(model_names), [0.0]*len(model_names)
-
 
 # ================== TRAINING FUNCTION ==================
 
@@ -1067,7 +1099,6 @@ def main():
             json.dump(final_results, f, indent=4)
         print(f"\nResults saved: {results_path}")
         
-        # Save final model
         final_model_path = os.path.join(args.save_dir, 'final_ensemble_model.pt')
         torch.save({
             'ensemble_state_dict': ensemble_module.state_dict(),
@@ -1078,8 +1109,7 @@ def main():
             'stds': STDS
         }, final_model_path)
         print(f"Model saved: {final_model_path}")
-        
-        # Generate visualizations
+
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         generate_visualizations(
             ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
@@ -1088,7 +1118,6 @@ def main():
         )
     
     cleanup_distributed()
-
 
 if __name__ == "__main__":
     main()
