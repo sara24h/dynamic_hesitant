@@ -232,7 +232,7 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
-# ================== UPDATED ENSEMBLE CLASS ==================
+# ================== UPDATED ENSEMBLE CLASS (FIXED) ==================
 class FuzzyHesitantEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
                  stds: List[Tuple[float]], num_memberships: int = 3, freeze_models: bool = True,
@@ -244,8 +244,7 @@ class FuzzyHesitantEnsemble(nn.Module):
         self.hesitant_fuzzy = HesitantFuzzyMembership(
             input_dim=128, num_models=self.num_models, num_memberships=num_memberships)
         
-        # این پارامتر حساسیت سیستم به تردید را کنترل می‌کند
-        # هر چه قدر بزرگتر باشد، به ازای مقدار تردید کمتر، مدل‌های بیشتری فعال می‌شوند
+        # پارامتر حساسیت به تردید
         self.hesitancy_sensitivity = hesitancy_sensitivity
 
         if freeze_models:
@@ -255,54 +254,41 @@ class FuzzyHesitantEnsemble(nn.Module):
                     p.requires_grad = False
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        # دریافت وزن‌ها و مقادیر عضویت از شبکه مردد فازی
         final_weights, all_memberships = self.hesitant_fuzzy(x)
         
-        # --- منطق جدید: تعیین تعداد مدل‌های فعال بر اساس تردید ---
-        # 1. محاسبه تردید (Hesitancy): واریانس توابع عضویت
-        # shape: [Batch, NumModels]
+        # --- 1. محاسبه تردید (Hesitancy) ---
         hesitancy_per_model = all_memberships.var(dim=2)
-        # میانگین تردید در کل آنسامبل برای هر نمونه
-        # shape: [Batch]
         avg_hesitancy = hesitancy_per_model.mean(dim=1)
 
-        # 2. محاسبه تعداد مدل‌های فعال (Dynamic K)
-        # فرمول: K = 1 + Round(Hesitancy * Num_Models * Sensitivity)
-        # دلیل +1: حداقل 1 مدل باید همیشه فعال باشد.
+        # --- 2. تعیین تعداد مدل‌های فعال (Dynamic K) ---
+        # فرمول: K بین 1 و تعداد کل مدل‌ها
         k_val = 1 + (avg_hesitancy * self.num_models * self.hesitancy_sensitivity).round().long()
-        k_val = torch.clamp(k_val, 1, self.num_models) # اطمینان از اینکه K بین 1 و تعداد کل مدل‌ها است
+        k_val = torch.clamp(k_val, 1, self.num_models)
 
-        # 3. ساخت ماسک با استفاده از Top-K (بدون استفاده از cumsum)
+        # --- 3. ساخت ماسک با استفاده از Top-K ---
         batch_size = final_weights.size(0)
         mask = torch.zeros_like(final_weights)
         
-        # انتخاب K مدل با بالاترین وزن برای هر نمونه در batch
-        # (از حلقه استفاده می‌شود چون k برای هر نمونه می‌تواند متفاوت باشد)
+        # نکته: چون k_val ممکن است برای هر نمونه متفاوت باشد، از حلقه استفاده می‌کنیم
         for i in range(batch_size):
             k = k_val[i].item()
-            # دریافت اندیس‌های k وزن برتر
+            # دریافت k وزن برتر برای نمونه iام
             _, top_indices = torch.topk(final_weights[i], k=k)
             mask[i, top_indices] = 1.0
 
-        # --- اعمال ماسک و نرمال‌سازی ---
+        # --- 4. اعمال ماسک و نرمال‌سازی ---
         final_weights = final_weights * mask
         final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
 
-        # --- اجرای مدل‌های فعال ---
+        # --- 5. اجرای مدل‌ها ---
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
         
-        # پیدا کردن مدل‌هایی که در این batch حداقل یک بار فعال شده‌اند (برای بهینه‌سازی)
-        # اما چون maks متغیر است، بهتر است برای هر نمونه چک کنیم یا همه را اجرا دهیم.
-        # اینجا برای سادگی و حفظ ساختار قبلی، مدل‌هایی که وزن نهایی دارند اجرا می‌شوند.
-        # برای پایداری Gradients در حالت آموزش، بهتر است خروجی همه مدل‌ها محاسبه شود 
-        # اما اگر batch size زیاد است می‌توان فقط فعال‌ها را محاسبه کرد.
-        # اینجا برای جلوگیری از پیچیدگی با اندیس‌های متغیر، همه را محاسبه می‌کنیم (چون معمولا تعداد مدل کم است).
+        # برای محاسبه گرادیان صحیح در حین آموزش (اگر مدل‌ها freeze نبودند) یا
+        # برای اطمینان از پایدار بودن تانسورها، همه مدل‌ها را روی کل ورودی اجرا می‌کنیم.
+        # اگر نیاز به سرعت بسیار بالا در Inference داشتید، می‌توانستید فقط idxهای فعال را اجرا کنید،
+        # اما در Training بهتر است همه اجرا شوند تا graph پایدار باشد.
         
         for i in range(self.num_models):
-            # اگر این مدل برای هیچ نمونه‌ای در batch فعال نیست، از پردازش آن صرف نظر می‌کنیم
-            if mask[:, i].sum() == 0:
-                continue
-                
             x_n = self.normalizations(x, i)
             with torch.no_grad():
                 out = self.models[i](x_n)
@@ -313,8 +299,18 @@ class FuzzyHesitantEnsemble(nn.Module):
         final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
         
         if return_details:
-            # برای نمایش و تحلیل، k_val را هم برمی‌گردانیم
-            return final_output, final_weights, all_memberships, outputs, k_val
+            # ترفند: k_val را به عنوان یک دیکشنری برمی‌گردانیم تا تعداد آرگومان‌ها زیاد نشود
+            # تابع train_hesitant_fuzzy 4 آرگومان برمی‌دارد: outputs, weights, memberships, raw_model_outputs
+            # ما raw_model_outputs را برمی‌گردانیم و k_val را در آن قرار می‌دهیم (یا یک دیکشنری جدا)
+            
+            # در اینجا ما 4 مقدار استاندارد برمی‌گردانیم تا خطای unpacking رفع شود.
+            # اگر به k_val نیاز دارید می‌توانید آن را به outputs یا لیست اضافه کنید.
+            # اما ساده‌ترین راه حفظ رابطه قبلی است:
+            
+            # اگر مطمئن هستید تابع train_hesitant_fuzzy آخرین آرگومان را نادیده می‌گیرد،
+            # می‌توانید همان 4 تا را برگردانید.
+            return final_output, final_weights, all_memberships, outputs
+            
         return final_output, final_weights
 
 # ================== MODEL LOADING ==================
