@@ -544,6 +544,12 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
+    """
+    تابع اصلاح‌شده training با نمایش جزئیات کامل
+    
+    Args:
+        model_names: لیست نام مدل‌ها برای نمایش در خروجی
+    """
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -551,7 +557,15 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     criterion = nn.BCEWithLogitsLoss()
 
     best_val_acc = 0.0
-    history = {'train_loss': [], 'train_acc': [], 'val_acc': [], 'membership_variance': []}
+    history = {
+        'train_loss': [], 
+        'train_acc': [], 
+        'val_acc': [], 
+        'membership_variance': [],
+        'per_model_hesitancy': [],  # اضافه شده
+        'cumsum_usage': [],  # اضافه شده
+        'model_activation': []  # اضافه شده
+    }
 
     if is_main:
         print("="*70)
@@ -559,17 +573,19 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         print("="*70)
         print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
         print(f"Epochs: {num_epochs} | Initial LR: {lr}")
-        print(f"Hesitant memberships per model: {hesitant_net.num_memberships}\n")
+        print(f"Hesitant memberships per model: {hesitant_net.num_memberships}")
+        print(f"Number of models: {len(model_names)}\n")
 
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
+        
         ensemble_model.train()
         train_loss = 0.0
         train_correct = 0
         train_total = 0
         
-        # برای جمع‌آوری آمار
+        # آرایه‌های جمع‌آوری آمار
         sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
         sum_cumsum_used = 0
         sum_active_models = torch.zeros(len(model_names), device=device)
@@ -578,48 +594,59 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main):
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
+            
+            # Forward pass با جزئیات
             outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
             optimizer.step()
 
+            # آمار پایه
             batch_size = images.size(0)
             train_loss += loss.item() * batch_size
             pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
             
-            # محاسبه واریانس هر مدل
-            per_model_hesitancy = memberships.var(dim=2)  # (batch_size, num_models)
+            # ✅ 1. محاسبه واریانس (Hesitancy) هر مدل
+            per_model_hesitancy = memberships.var(dim=2)  # shape: (batch_size, num_models)
             sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
             
-            # بررسی استفاده از cumsum (mask)
-            # اگر تعداد مدل‌های فعال کمتر از کل مدل‌ها باشد، یعنی cumsum استفاده شده
-            active_mask = (weights > 1e-4).float()  # (batch_size, num_models)
-            num_active_per_sample = active_mask.sum(dim=1)
-            cumsum_used = (num_active_per_sample < len(model_names)).sum().item()
-            sum_cumsum_used += cumsum_used
+            # ✅ 2. بررسی استفاده از Cumsum
+            # اگر تعداد مدل‌های فعال < کل مدل‌ها باشد، یعنی cumsum استفاده شده
+            active_mask = (weights > 1e-4).float()  # shape: (batch_size, num_models)
+            num_active_per_sample = active_mask.sum(dim=1)  # shape: (batch_size,)
+            cumsum_used_samples = (num_active_per_sample < len(model_names)).sum().item()
+            sum_cumsum_used += cumsum_used_samples
             
-            # کدام مدل‌ها فعال شدند
+            # ✅ 3. کدام مدل‌ها فعال شدند
             sum_active_models += active_mask.sum(dim=0)
             num_batches += 1
 
+        # محاسبه متریک‌های epoch
         train_acc = 100. * train_correct / train_total
         train_loss = train_loss / train_total
         
-        # محاسبه میانگین‌ها
+        # میانگین‌ها
         avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
         avg_cumsum_usage = (sum_cumsum_used / train_total) * 100
         avg_model_activation = (sum_active_models / train_total) * 100
+        overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
         
+        # Validation
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         scheduler.step()
 
+        # ذخیره history
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
-        history['membership_variance'].append(avg_per_model_hesitancy.mean().item())
+        history['membership_variance'].append(overall_mean_hesitancy)
+        history['per_model_hesitancy'].append(avg_per_model_hesitancy.cpu().tolist())
+        history['cumsum_usage'].append(avg_cumsum_usage)
+        history['model_activation'].append(avg_model_activation.cpu().tolist())
 
+        # ========== نمایش اطلاعات کامل ==========
         if is_main:
             print(f"\n{'='*70}")
             print(f"Epoch {epoch+1}/{num_epochs}")
@@ -627,29 +654,46 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
             print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
             
-            print(f"\n{'Hesitancy (Variance) per Model:':>40}")
+            # ===== 1. Hesitancy (Variance) per Model =====
+            print(f"\n{'Hesitancy (Variance) per Model:':^70}")
             print(f"{'-'*70}")
-            overall_mean = avg_per_model_hesitancy.mean().item()
             for i, name in enumerate(model_names):
                 hesitancy_val = avg_per_model_hesitancy[i].item()
-                print(f"  {i+1:2d}. {name:<25}: {hesitancy_val:.6f}")
+                print(f"  {i+1:2d}. {name:<30}: {hesitancy_val:.6f}")
             print(f"{'-'*70}")
-            print(f"  {'Overall Mean Hesitancy:':<25}  {overall_mean:.6f}")
+            print(f"  {'Overall Mean Hesitancy:':<30}  {overall_mean_hesitancy:.6f}")
             
-            print(f"\n{'Cumulative Weight Threshold (Cumsum) Usage:':>40}")
+            # ===== 2. Cumsum Usage =====
+            print(f"\n{'Cumulative Weight Threshold (Cumsum) Analysis:':^70}")
             print(f"{'-'*70}")
-            print(f"  Used in {avg_cumsum_usage:.2f}% of samples")
-            print(f"  (i.e., not all models were needed)")
+            print(f"  {'Cumsum activated in:':<30}  {avg_cumsum_usage:.2f}% of samples")
+            if avg_cumsum_usage > 50:
+                print(f"  {'Status:':<30}  ✓ Efficient (most samples use fewer models)")
+            elif avg_cumsum_usage > 20:
+                print(f"  {'Status:':<30}  ≈ Moderate (balanced usage)")
+            else:
+                print(f"  {'Status:':<30}  ✗ Low efficiency (almost all models used)")
+            print(f"  {'All models used in:':<30}  {100-avg_cumsum_usage:.2f}% of samples")
             
-            print(f"\n{'Model Activation Frequency:':>40}")
+            # ===== 3. Model Activation Frequency =====
+            print(f"\n{'Model Activation Frequency:':^70}")
             print(f"{'-'*70}")
             for i, name in enumerate(model_names):
                 activation_pct = avg_model_activation[i].item()
                 bar_length = int(activation_pct / 2)  # Scale to 50 chars max
                 bar = '█' * bar_length
-                print(f"  {i+1:2d}. {name:<25}: {activation_pct:5.1f}% {bar}")
+                print(f"  {i+1:2d}. {name:<30}: {activation_pct:5.1f}% {bar}")
+            
+            # ===== تحلیل سریع =====
+            max_activation_idx = avg_model_activation.argmax().item()
+            min_activation_idx = avg_model_activation.argmin().item()
+            print(f"\n{'Quick Analysis:':^70}")
+            print(f"{'-'*70}")
+            print(f"  Most active:  {model_names[max_activation_idx]} ({avg_model_activation[max_activation_idx]:.1f}%)")
+            print(f"  Least active: {model_names[min_activation_idx]} ({avg_model_activation[min_activation_idx]:.1f}%)")
             print(f"{'='*70}")
 
+        # ذخیره بهترین مدل
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
             save_path = os.path.join(save_dir, 'best_hesitant_fuzzy.pt')
@@ -661,8 +705,15 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             }, save_path)
             print(f"\n✓ Best model saved → {val_acc:.2f}%")
 
+        if is_main:
+            print()
+
     if is_main:
-        print(f"\nTraining completed! Best Val Acc: {best_val_acc:.2f}%")
+        print(f"\n{'='*70}")
+        print(f"Training Completed!")
+        print(f"Best Validation Accuracy: {best_val_acc:.2f}%")
+        print(f"{'='*70}\n")
+    
     return best_val_acc, history
 
 # ================== LIME EXPLANATION ==================
@@ -927,7 +978,7 @@ def main():
 
     best_val_acc, history = train_hesitant_fuzzy(
         ensemble, train_loader, val_loader,
-        args.epochs, args.lr, device, args.save_dir, is_main)
+        args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
     ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
     if os.path.exists(ckpt_path):
