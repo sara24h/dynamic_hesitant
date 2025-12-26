@@ -541,12 +541,13 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         return acc, avg_weights.tolist(), activation_percentages.tolist()
     return 0.0, [0.0]*len(model_names), [0.0]*len(model_names)
 
-
 # ================== TRAINING FUNCTION ==================
+
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main):
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
+    
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
@@ -554,27 +555,51 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     best_val_acc = 0.0
     history = {'train_loss': [], 'train_acc': [], 'val_acc': [], 'membership_variance': []}
 
+    is_distributed = dist.is_initialized()
+
     if is_main:
         print("="*70)
         print("Training Fuzzy Hesitant Network")
         print("="*70)
         print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
         print(f"Epochs: {num_epochs} | Initial LR: {lr}")
-        print(f"Hesitant memberships per model: {hesitant_net.num_memberships}\n")
+        print(f"Hesitant memberships per model: {hesitant_net.num_memberships}")
+        print(f"Number of models: {hesitant_net.num_models}\n")
 
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
+        
         ensemble_model.train()
         train_loss = 0.0
         train_correct = 0
         train_total = 0
         membership_vars = []
 
+        epoch_var_sum = torch.zeros(hesitant_net.num_models, device=device)
+        epoch_safety_count = 0
+        epoch_total_samples = 0
+
         for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main):
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
+            
+            # دریافت خروجی با جزئیات
             outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
+
+            batch_var_per_model = memberships.var(dim=2)
+            # میانگین واریانس برای هر سمپل (برای تصمیم‌گیری): [Batch]
+            batch_avg_hesitancy = batch_var_per_model.mean(dim=1)
+
+            # تجمیع واریانس مدل‌ها در طول ایپوک
+            epoch_var_sum += batch_var_per_model.sum(dim=0)
+
+            ensemble_ref = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
+            
+            is_safety_mode = (batch_avg_hesitancy > ensemble_ref.hesitancy_threshold)
+            epoch_safety_count += is_safety_mode.sum().item()
+            epoch_total_samples += labels.size(0)
+         
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
             optimizer.step()
@@ -584,7 +609,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
-            membership_vars.append(memberships.var(dim=2).mean().item())
+            membership_vars.append(batch_avg_hesitancy.mean().item())
 
         train_acc = 100. * train_correct / train_total
         train_loss = train_loss / train_total
@@ -598,10 +623,32 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         history['membership_variance'].append(avg_membership_var)
 
         if is_main:
+           
+            if is_distributed:
+                dist.all_reduce(epoch_var_sum, op=dist.ReduceOp.SUM)
+                cnt_tensor = torch.tensor([epoch_total_samples, epoch_safety_count], device=device)
+                dist.all_reduce(cnt_tensor, op=dist.ReduceOp.SUM)
+                epoch_total_samples = cnt_tensor[0].item()
+                epoch_safety_count = cnt_tensor[1].item()
+
+            # محاسبه میانگین نهایی
+            final_avg_vars_model = (epoch_var_sum / epoch_total_samples).cpu().numpy()
+            safety_pct = 100.0 * epoch_safety_count / epoch_total_samples
+            cumsum_pct = 100.0 - safety_pct
+            global_avg_var = final_avg_vars_model.mean()
+
             print(f"\nEpoch {epoch+1}:")
             print(f" Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
             print(f" Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
-            print(f" Membership Variance: {avg_membership_var:.4f}")
+            print("-" * 40)
+            print(f" Variance Analysis:")
+            print(f"  Avg Variance per Model: {np.array2string(final_avg_vars_model, precision=4, suppress_small=True)}")
+            print(f"  Global Avg Variance:    {global_avg_var:.4f}")
+            print("-" * 40)
+            print(f" Decision Mode Analysis:")
+            print(f"  Safety Mode (All Models): {safety_pct:.2f}% ({epoch_safety_count}/{epoch_total_samples})")
+            print(f"  CumSum Mode (Pruned):     {cumsum_pct:.2f}%")
+            print("-" * 70)
 
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -614,14 +661,10 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             }, save_path)
             print(f" Best model saved → {val_acc:.2f}%")
 
-        if is_main:
-            print("-" * 70)
-
     if is_main:
         print(f"\nTraining completed! Best Val Acc: {best_val_acc:.2f}%")
     return best_val_acc, history
-
-
+                            
 # ================== LIME EXPLANATION ==================
 def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256)):
     img_np = image_tensor[0].cpu().permute(1, 2, 0).numpy()
@@ -643,7 +686,6 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
     lime_img = mark_boundaries(temp / 255.0, mask)
     lime_img = cv2.resize(lime_img, target_size)
     return lime_img
-
 
 # ================== VISUALIZATION FUNCTIONS ==================
 def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
