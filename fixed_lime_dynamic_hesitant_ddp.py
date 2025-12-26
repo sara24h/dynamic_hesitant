@@ -542,13 +542,10 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     return 0.0, [0.0]*len(model_names), [0.0]*len(model_names)
 
 
-# ================== TRAINING FUNCTION ==================
-# ================== TRAINING FUNCTION ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
-                        device, save_dir, is_main):
+                        device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
-    
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
@@ -562,112 +559,96 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         print("="*70)
         print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
         print(f"Epochs: {num_epochs} | Initial LR: {lr}")
-        print(f"Hesitant memberships per model: {hesitant_net.num_memberships}")
-        print(f"Number of models: {hesitant_net.num_models}")
-        print(f"Note: Skipping batches with size < 4 to avoid CUDA instability.\n")
+        print(f"Hesitant memberships per model: {hesitant_net.num_memberships}\n")
 
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
-        
         ensemble_model.train()
         train_loss = 0.0
         train_correct = 0
         train_total = 0
-        membership_vars = []
-
-        # متغیرهای محلی روی GPU برای محاسبه آمار
-        epoch_var_sum = torch.zeros(hesitant_net.num_models, device=device)
-        epoch_safety_count = 0
-        epoch_total_samples = 0
+        
+        # برای جمع‌آوری آمار
+        sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
+        sum_cumsum_used = 0
+        sum_active_models = torch.zeros(len(model_names), device=device)
+        num_batches = 0
 
         for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main):
-            # --- ایمن سازی برای بچ‌های کوچک ---
-            if images.size(0) < 4:
-                # اگر سایز بچ خیلی کم است (مثلاً آخرین بچ در دیتاست‌های کوچک)،
-            # احتمال خطای CUDA وجود دارد، پس اسکیپ می‌کنیم تا برنامه هنگ نکند.
-                continue
+            images, labels = images.to(device), labels.to(device).float()
+            optimizer.zero_grad()
+            outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
+            loss = criterion(outputs.squeeze(1), labels)
+            loss.backward()
+            optimizer.step()
 
-            try:
-                images, labels = images.to(device), labels.to(device).float()
-                optimizer.zero_grad()
-                
-                outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
-                
-                # --- محاسبات آماری ---
-                # memberships shape: [Batch, NumModels, NumMemberships]
-                batch_var_per_model = memberships.var(dim=2)
-                batch_avg_hesitancy = batch_var_per_model.mean(dim=1)
+            batch_size = images.size(0)
+            train_loss += loss.item() * batch_size
+            pred = (outputs.squeeze(1) > 0).long()
+            train_correct += pred.eq(labels.long()).sum().item()
+            train_total += batch_size
+            
+            # محاسبه واریانس هر مدل
+            per_model_hesitancy = memberships.var(dim=2)  # (batch_size, num_models)
+            sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
+            
+            # بررسی استفاده از cumsum (mask)
+            # اگر تعداد مدل‌های فعال کمتر از کل مدل‌ها باشد، یعنی cumsum استفاده شده
+            active_mask = (weights > 1e-4).float()  # (batch_size, num_models)
+            num_active_per_sample = active_mask.sum(dim=1)
+            cumsum_used = (num_active_per_sample < len(model_names)).sum().item()
+            sum_cumsum_used += cumsum_used
+            
+            # کدام مدل‌ها فعال شدند
+            sum_active_models += active_mask.sum(dim=0)
+            num_batches += 1
 
-                # جمع واریانس‌ها در طول ایپوک (فقط روی همین رank)
-                epoch_var_sum += batch_var_per_model.sum(dim=0)
-                
-                # شمارش حالت ایمنی
-                ensemble_ref = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
-                is_safety_mode = (batch_avg_hesitancy > ensemble_ref.hesitancy_threshold)
-                epoch_safety_count += is_safety_mode.sum().item()
-                epoch_total_samples += labels.size(0)
-                # -----------------------------
-
-                loss = criterion(outputs.squeeze(1), labels)
-                loss.backward()
-                optimizer.step()
-
-                batch_size = images.size(0)
-                train_loss += loss.item() * batch_size
-                pred = (outputs.squeeze(1) > 0).long()
-                train_correct += pred.eq(labels.long()).sum().item()
-                train_total += batch_size
-                membership_vars.append(batch_avg_hesitancy.mean().item())
-
-            except RuntimeError as e:
-                # اگر خطای دیگری رخ داد، لوگ بگیر و ادامه بده
-                print(f"\n[Warning] Skipping batch due to error: {e}")
-                continue
-
-        # محاسبه دقت اعتبارسنجی
+        train_acc = 100. * train_correct / train_total
+        train_loss = train_loss / train_total
+        
+        # محاسبه میانگین‌ها
+        avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
+        avg_cumsum_usage = (sum_cumsum_used / train_total) * 100
+        avg_model_activation = (sum_active_models / train_total) * 100
+        
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         scheduler.step()
-
-        # نرمال کردن آمارها بر اساس تعداد سمپل‌ها
-        if epoch_total_samples > 0:
-            train_acc = 100. * train_correct / train_total
-            train_loss = train_loss / train_total
-            avg_membership_var = np.mean(membership_vars)
-            
-            # محاسبه واریانس‌ها (محلی روی Rank 0)
-            final_avg_vars_model = (epoch_var_sum / epoch_total_samples).cpu().numpy()
-            safety_pct = 100.0 * epoch_safety_count / epoch_total_samples
-            cumsum_pct = 100.0 - safety_pct
-            global_avg_var = final_avg_vars_model.mean()
-        else:
-            # اگر همه بچ‌ها اسکیپ شدند
-            train_acc = 0
-            train_loss = 0
-            avg_membership_var = 0
-            final_avg_vars_model = np.zeros(hesitant_net.num_models)
-            safety_pct = 0
-            cumsum_pct = 0
-            global_avg_var = 0
 
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
-        history['membership_variance'].append(avg_membership_var)
+        history['membership_variance'].append(avg_per_model_hesitancy.mean().item())
 
         if is_main:
-            print(f"\nEpoch {epoch+1}:")
-            print(f" Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-            print(f" Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
-            print("-" * 40)
-            print(f" Variance Analysis (Rank 0 Approximation):")
-            print(f"  Avg Variance per Model: {np.array2string(final_avg_vars_model, precision=4, suppress_small=True)}")
-            print(f"  Global Avg Variance:    {global_avg_var:.4f}")
-            print("-" * 40)
-            print(f" Decision Mode Analysis (Rank 0 Approximation):")
-            print(f"  Safety Mode (All Models): {safety_pct:.2f}% ({epoch_safety_count}/{epoch_total_samples})")
-            print(f"  CumSum Mode (Pruned):     {cumsum_pct:.2f}%")
-            print("-" * 70)
+            print(f"\n{'='*70}")
+            print(f"Epoch {epoch+1}/{num_epochs}")
+            print(f"{'='*70}")
+            print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
+            
+            print(f"\n{'Hesitancy (Variance) per Model:':>40}")
+            print(f"{'-'*70}")
+            overall_mean = avg_per_model_hesitancy.mean().item()
+            for i, name in enumerate(model_names):
+                hesitancy_val = avg_per_model_hesitancy[i].item()
+                print(f"  {i+1:2d}. {name:<25}: {hesitancy_val:.6f}")
+            print(f"{'-'*70}")
+            print(f"  {'Overall Mean Hesitancy:':<25}  {overall_mean:.6f}")
+            
+            print(f"\n{'Cumulative Weight Threshold (Cumsum) Usage:':>40}")
+            print(f"{'-'*70}")
+            print(f"  Used in {avg_cumsum_usage:.2f}% of samples")
+            print(f"  (i.e., not all models were needed)")
+            
+            print(f"\n{'Model Activation Frequency:':>40}")
+            print(f"{'-'*70}")
+            for i, name in enumerate(model_names):
+                activation_pct = avg_model_activation[i].item()
+                bar_length = int(activation_pct / 2)  # Scale to 50 chars max
+                bar = '█' * bar_length
+                print(f"  {i+1:2d}. {name:<25}: {activation_pct:5.1f}% {bar}")
+            print(f"{'='*70}")
 
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -678,7 +659,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
                 'val_acc': val_acc,
                 'history': history
             }, save_path)
-            print(f" Best model saved -> {val_acc:.2f}%")
+            print(f"\n✓ Best model saved → {val_acc:.2f}%")
 
     if is_main:
         print(f"\nTraining completed! Best Val Acc: {best_val_acc:.2f}%")
