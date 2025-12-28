@@ -87,18 +87,64 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 
-def create_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
-    num_samples = len(dataset)
-    indices = list(range(num_samples))
-    labels = [dataset.samples[i][1] for i in indices]
+def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+   
+    all_video_ids = set()
+    
+    for img_path, label in dataset.samples:
+       
+        dir_name = os.path.basename(os.path.dirname(img_path))
+        
+        if '_fake' in dir_name:
+            video_id = dir_name.replace('_fake', '')
+        else:
+            video_id = dir_name
+            
+        all_video_ids.add(video_id)
 
-    train_val_indices, test_indices = train_test_split(
-        indices, test_size=test_ratio, random_state=seed, stratify=labels)
-    train_val_labels = [labels[i] for i in train_val_indices]
-    val_size = val_ratio / (train_ratio + val_ratio)
-    train_indices, val_indices = train_test_split(
-        train_val_indices, test_size=val_size, random_state=seed, stratify=train_val_labels)
+    all_video_ids = sorted(list(all_video_ids))
+    print(f"[Split] Found {len(all_video_ids)} unique video pairs (Real+Fake).")
+
+    train_val_ids, test_ids = train_test_split(
+        all_video_ids,
+        test_size=test_ratio,
+        random_state=seed
+    )
+    
+    # سپس Train را از Val جدا می‌کنیم
+    val_size_adjusted = val_ratio / (train_ratio + val_ratio)
+    train_ids, val_ids = train_test_split(
+        train_val_ids,
+        test_size=val_size_adjusted,
+        random_state=seed
+    )
+    
+    print(f"[Split] Videos -> Train: {len(train_ids)}, Val: {len(val_ids)}, Test: {len(test_ids)}")
+
+    # 3. نسبت دادن تصاویر (فریم‌ها) به لیست‌ها بر اساس نام پوشه والد
+    train_indices = []
+    val_indices = []
+    test_indices = []
+    
+    for idx, (img_path, label) in enumerate(dataset.samples):
+        dir_name = os.path.basename(os.path.dirname(img_path))
+        
+        if '_fake' in dir_name:
+            vid_id = dir_name.replace('_fake', '')
+        else:
+            vid_id = dir_name
+            
+        if vid_id in test_ids:
+            test_indices.append(idx)
+        elif vid_id in val_ids:
+            val_indices.append(idx)
+        elif vid_id in train_ids:
+            train_indices.append(idx)
+        else:
+            # این بخش نباید اجرا شود مگر خطایی در لاجیک داشته باشیم
+            print(f"[Warning] Video ID {vid_id} not found in splits!")
+            
+    print(f"[Split] Frames -> Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
     return train_indices, val_indices, test_indices
 
 
@@ -111,18 +157,64 @@ def get_sample_info(dataset, index):
         raise AttributeError("Cannot find samples in dataset")
 
 
+# ================== HELPER SPLIT FUNCTIONS ==================
+
+def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    """
+    تابع اسپلیت استاندارد برای دیتاست‌هایی که ساختار ویدئویی ندارند (کلاس/تصویر.jpg).
+    فقط روی شاخص‌ها کار می‌کند و کلاس‌ها را حفظ می‌کند (Stratified).
+    """
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
+    
+    num_samples = len(dataset)
+    indices = list(range(num_samples))
+    
+    # دریافت لیبل‌ها برای Stratify
+    labels = [dataset.samples[i][1] for i in indices]
+    
+    # 1. جدا کردن Train+Val از Test
+    train_val_indices, test_indices = train_test_split(
+        indices,
+        test_size=test_ratio,
+        random_state=seed,
+        stratify=labels
+    )
+    
+    # 2. جدا کردن Train از Val
+    train_val_labels = [labels[i] for i in train_val_indices]
+    val_size = val_ratio / (train_ratio + val_ratio)
+    
+    train_indices, val_indices = train_test_split(
+        train_val_indices,
+        test_size=val_size,
+        random_state=seed,
+        stratify=train_val_labels
+    )
+    
+    print(f"[Standard Split] Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
+    return train_indices, val_indices, test_indices
+
+
+# ================== MAIN PREPARE FUNCTION ==================
+
 def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
+  
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
         'deepflux': ['Fake', 'Real'],
     }
 
+    print(f"\n[Dataset Loading] Processing: {dataset_type}")
+    
+    # 1. لود کردن دیتاست (Dataset Loading)
     if dataset_type == 'uadfV':
         if not os.path.exists(base_dir):
             raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = UADFVDataset(base_dir, transform=temp_transform)
+        print("[Dataset Loading] UADFVDataset loaded.")
+        
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
         if all(os.path.exists(os.path.join(base_dir, f)) for f in folders):
@@ -136,13 +228,44 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
             dataset_dir = os.path.join(base_dir, alt_names[dataset_type])
             if not os.path.exists(dataset_dir):
                 raise FileNotFoundError(f"Could not find dataset folders in {base_dir}")
+        
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
+        print(f"[Dataset Loading] ImageFolder loaded from: {dataset_dir}")
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
 
-    train_indices, val_indices, test_indices = create_reproducible_split(
-        full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed)
+    # 2. تشخیص هوشمند ساختار (Structure Detection)
+    # ما مسیر یک نمونه تصادفی را بررسی می‌کنیم تا ببینیم پوشه والد نام کلاس است یا نام ویدئو.
+    sample_path = full_dataset.samples[0][0]
+    immediate_parent = os.path.basename(os.path.dirname(sample_path))
+    
+    # اگر پوشه والد یکی از نام کلاس‌ها نباشد، یعنی ساختار تودرتو (ویدئویی) است.
+    # مثال UADFV: .../real/frames/0000/img.jpg -> parent: 0000 (که کلاس نیست) -> Video Split
+    # مثال Flat: .../real/img.jpg -> parent: real (که کلاس است) -> Standard Split
+    is_video_structure = immediate_parent not in full_dataset.classes
+
+    print(f"[Structure Detection] Parent of image: '{immediate_parent}' | Classes: {full_dataset.classes}")
+    
+    if is_video_structure:
+        print("[Structure Decision] >> Detected VIDEO/NESTED structure. Using Video-Level Split.")
+        train_indices, val_indices, test_indices = create_video_level_uadfV_split(
+            full_dataset, 
+            train_ratio=0.7, 
+            val_ratio=0.15, 
+            test_ratio=0.15, 
+            seed=seed
+        )
+    else:
+        print("[Structure Decision] >> Detected FLAT IMAGE structure. Using Standard Stratified Split.")
+        train_indices, val_indices, test_indices = create_standard_reproducible_split(
+            full_dataset, 
+            train_ratio=0.7, 
+            val_ratio=0.15, 
+            test_ratio=0.15, 
+            seed=seed
+        )
+        
     return full_dataset, train_indices, val_indices, test_indices
 
 
