@@ -719,7 +719,7 @@ def main():
         print("="*70 + "\n")
 
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
-    STDS = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)] # Default to 0, usually specific normalization is inside models or loaded with ckpt
+    STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
 
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
@@ -733,14 +733,6 @@ def main():
         freeze_models=True
     ).to(device)
 
-    # Handle Distributed Wrapping
-    # Majority voting has no learnable params, so DDP is optional, but we use DP or simple no-wrap if not needed.
-    # Using DP for multi-GPU speed if available but DDP not strictly necessary.
-    # We will stick to the logic provided in the prompt: setup_distributed handles the device assignment.
-    # We won't wrap in DDP if there are no parameters to optimize (avoids the error), 
-    # but we can use DataParallel for inference speed if we want.
-    # For consistency with your code style, we skip wrapping if no grad required.
-    
     if is_main:
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
         total = sum(p.numel() for p in ensemble.parameters())
