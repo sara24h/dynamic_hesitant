@@ -87,7 +87,63 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 
-def create_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    all_video_ids = set()
+    
+    for img_path, label in dataset.samples:
+        dir_name = os.path.basename(os.path.dirname(img_path))
+        
+        if '_fake' in dir_name:
+            video_id = dir_name.replace('_fake', '')
+        else:
+            video_id = dir_name
+            
+        all_video_ids.add(video_id)
+
+    all_video_ids = sorted(list(all_video_ids))
+    print(f"[Split] Found {len(all_video_ids)} unique video pairs (Real+Fake).")
+
+    train_val_ids, test_ids = train_test_split(
+        all_video_ids,
+        test_size=test_ratio,
+        random_state=seed
+    )
+    
+    val_size_adjusted = val_ratio / (train_ratio + val_ratio)
+    train_ids, val_ids = train_test_split(
+        train_val_ids,
+        test_size=val_size_adjusted,
+        random_state=seed
+    )
+    
+    print(f"[Split] Videos -> Train: {len(train_ids)}, Val: {len(val_ids)}, Test: {len(test_ids)}")
+
+    train_indices = []
+    val_indices = []
+    test_indices = []
+    
+    for idx, (img_path, label) in enumerate(dataset.samples):
+        dir_name = os.path.basename(os.path.dirname(img_path))
+        
+        if '_fake' in dir_name:
+            vid_id = dir_name.replace('_fake', '')
+        else:
+            vid_id = dir_name
+            
+        if vid_id in test_ids:
+            test_indices.append(idx)
+        elif vid_id in val_ids:
+            val_indices.append(idx)
+        elif vid_id in train_ids:
+            train_indices.append(idx)
+        else:
+            print(f"[Warning] Video ID {vid_id} not found in splits!")
+            
+    print(f"[Split] Frames -> Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
+    return train_indices, val_indices, test_indices
+
+
+def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     num_samples = len(dataset)
     indices = list(range(num_samples))
@@ -118,11 +174,15 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         'deepflux': ['Fake', 'Real'],
     }
 
+    print(f"\n[Dataset Loading] Processing: {dataset_type}")
+    
     if dataset_type == 'uadfV':
         if not os.path.exists(base_dir):
             raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = UADFVDataset(base_dir, transform=temp_transform)
+        print("[Dataset Loading] UADFVDataset loaded.")
+        
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
         if all(os.path.exists(os.path.join(base_dir, f)) for f in folders):
@@ -136,13 +196,40 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
             dataset_dir = os.path.join(base_dir, alt_names[dataset_type])
             if not os.path.exists(dataset_dir):
                 raise FileNotFoundError(f"Could not find dataset folders in {base_dir}")
+        
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
+        print(f"[Dataset Loading] ImageFolder loaded from: {dataset_dir}")
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
 
-    train_indices, val_indices, test_indices = create_reproducible_split(
-        full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed)
+    # 2. Structure Detection Logic (Same as Fuzzy)
+    sample_path = full_dataset.samples[0][0]
+    immediate_parent = os.path.basename(os.path.dirname(sample_path))
+    
+    is_video_structure = immediate_parent not in full_dataset.classes
+
+    print(f"[Structure Detection] Parent of image: '{immediate_parent}' | Classes: {full_dataset.classes}")
+    
+    if is_video_structure:
+        print("[Structure Decision] >> Detected VIDEO/NESTED structure. Using Video-Level Split.")
+        train_indices, val_indices, test_indices = create_video_level_uadfV_split(
+            full_dataset, 
+            train_ratio=0.7, 
+            val_ratio=0.15, 
+            test_ratio=0.15, 
+            seed=seed
+        )
+    else:
+        print("[Structure Decision] >> Detected FLAT IMAGE structure. Using Standard Stratified Split.")
+        train_indices, val_indices, test_indices = create_standard_reproducible_split(
+            full_dataset, 
+            train_ratio=0.7, 
+            val_ratio=0.15, 
+            test_ratio=0.15, 
+            seed=seed
+        )
+        
     return full_dataset, train_indices, val_indices, test_indices
 
 
@@ -215,7 +302,14 @@ class MajorityVotingEnsemble(nn.Module):
         # Collect votes (logits) from all models
         votes_logits = []
         for i in range(self.num_models):
-            x_n = self.normalizations(x, i)
+            # Check if normalization is needed (if std is not 0)
+            current_std = self.normalizations.__getattr__(f'std_{i}')
+            
+            x_n = x
+            # Only normalize if std is not all zeros
+            if not torch.all(current_std == 0):
+                x_n = self.normalizations(x, i)
+            
             with torch.no_grad():
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
@@ -229,20 +323,17 @@ class MajorityVotingEnsemble(nn.Module):
         hard_votes = (stacked_logits > 0).long()
 
         # Majority Voting
-        # torch.mode returns the most frequent element (value) and counts
         final_vote, _ = torch.mode(hard_votes, dim=1)
         final_output = final_vote.float().unsqueeze(1) # Shape: (Batch, 1)
 
         if return_details:
             batch_size = x.size(0)
-            # Return dummy weights (uniform) to match signature of evaluation functions
-            # Or we could return agreement percentage as "weight"
+            # Return dummy weights (uniform) to match signature
             weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             
             # Dummy memberships to match original signature
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             
-            # Return hard_votes as 'outputs' for analysis if needed
             return final_output, weights, dummy_memberships, hard_votes.float()
 
         return final_output, hard_votes
@@ -250,10 +341,9 @@ class MajorityVotingEnsemble(nn.Module):
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     try:
-        from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
+        from model.pruned_model.ResNet_pruned_hardfakevsreal import ResNet_50_pruned_hardfakevsreal
     except ImportError:
-        # Try to fallback or raise clear error
-        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal. Ensure 'model' directory is in PYTHONPATH.")
+        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
 
     models = []
     if is_main:
@@ -381,7 +471,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                shuffle=False, sampler=val_sampler,
                                num_workers=num_workers, pin_memory=True, drop_last=False,
                                worker_init_fn=worker_init_fn)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size,
+        test_loader = DataLoader(test_loader, batch_size=batch_size,
                                 shuffle=False, sampler=test_sampler,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
@@ -733,6 +823,11 @@ def main():
         freeze_models=True
     ).to(device)
 
+    # Handle Distributed Wrapping
+    # We won't wrap in DDP if there are no parameters to optimize (avoids error)
+    # But we use DP for speed if needed, or just raw model.
+    # Here we stick to raw model + distributed samplers.
+    
     if is_main:
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
         total = sum(p.numel() for p in ensemble.parameters())
@@ -764,6 +859,7 @@ def main():
         print("\nSkipping training phase (Majority Voting is rule-based).")
         print("Proceeding directly to evaluation...\n")
 
+    # Directly evaluate without training
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
     if is_main:
