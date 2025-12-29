@@ -332,7 +332,7 @@ class MajorityVotingEnsemble(nn.Module):
             weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             
             # Dummy memberships to match original signature
-            dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
+            dummy_memberships = torch.zeros(batch_size, self.num_models,3, device=x.device)
             
             return final_output, weights, dummy_memberships, hard_votes.float()
 
@@ -341,7 +341,9 @@ class MajorityVotingEnsemble(nn.Module):
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     try:
-        from model.ResNet_pruned.ResNet_pruned.ResNet_pruned_hardfakevsreal import ResNet_50_pruned_hardfakevsreal
+        # اصلاح مسیر ایمپورت بر اساس فایلی که فرستادید
+        # اگر فایل در پوشه model/ResNet_pruned.py است:
+        from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     except ImportError:
         raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
 
@@ -471,7 +473,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                shuffle=False, sampler=val_sampler,
                                num_workers=num_workers, pin_memory=True, drop_last=False,
                                worker_init_fn=worker_init_fn)
-        test_loader = DataLoader(test_loader, batch_size=batch_size,
+        test_loader = DataLoader(test_dataset, batch_size=batch_size,
                                 shuffle=False, sampler=test_sampler,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
