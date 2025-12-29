@@ -10,14 +10,11 @@ import warnings
 import argparse
 import json
 import random
-import matplotlib.pyplot as plt
-import cv2
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 
 warnings.filterwarnings("ignore")
 
-# ایمپورت ابزارهای دیتاست از فایل مشترک
 from dataset_utils import (
     UADFVDataset, 
     create_dataloaders, 
@@ -25,8 +22,7 @@ from dataset_utils import (
     worker_init_fn
 )
 
-from lime import lime_image
-from skimage.segmentation import mark_boundaries
+from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -37,46 +33,6 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
-
-
-class GradCAM:
-    """Optimized GradCAM – FIXED gradient check & squeeze"""
-    def __init__(self, model, target_layer):
-        self.model = model
-        self.target_layer = target_layer
-        self.gradients = None
-        self.activations = None
-        self._register_hooks()
-
-    def _register_hooks(self):
-        def forward_hook(module, input, output):
-            self.activations = output.detach()
-
-        def backward_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0].detach()
-
-        self.target_layer.register_forward_hook(forward_hook)
-        self.target_layer.register_full_backward_hook(backward_hook)
-
-    def generate(self, score):
-        self.model.zero_grad()
-        score.backward()
-        if self.gradients is None:
-            raise RuntimeError("Gradients not captured – forgot requires_grad_(True)?")
-
-        gradients = self.gradients[0]
-        activations = self.activations[0]
-        weights = gradients.mean(dim=[1, 2], keepdim=True)
-        cam = (weights * activations).sum(dim=0)
-        cam = F.relu(cam)
-        cam = F.interpolate(
-            cam.unsqueeze(0).unsqueeze(0),
-            size=activations.shape[1:],
-            mode='bilinear',
-            align_corners=False
-        )
-        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-        return cam.squeeze().cpu().numpy()
 
 
 class MultiModelNormalization(nn.Module):
@@ -271,7 +227,6 @@ def evaluate_accuracy_ddp(model, loader, device):
 
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
-    """FIXED: removed double @torch.no_grad"""
     model.eval()
     total_correct = 0
     total_samples = 0
@@ -333,9 +288,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
                         device, save_dir, is_main, model_names):
     """
     تابع اصلاح‌شده training با نمایش جزئیات کامل
-    
-    Args:
-        model_names: لیست نام مدل‌ها برای نمایش در خروجی
     """
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
@@ -349,9 +301,9 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         'train_acc': [], 
         'val_acc': [], 
         'membership_variance': [],
-        'per_model_hesitancy': [],  # اضافه شده
-        'cumsum_usage': [],  # اضافه شده
-        'model_activation': []  # اضافه شده
+        'per_model_hesitancy': [], 
+        'cumsum_usage': [], 
+        'model_activation': [] 
     }
 
     if is_main:
@@ -372,7 +324,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         train_correct = 0
         train_total = 0
         
-        # آرایه‌های جمع‌آوری آمار
         sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
         sum_cumsum_used = 0
         sum_active_models = torch.zeros(len(model_names), device=device)
@@ -382,49 +333,39 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
             
-            # Forward pass با جزئیات
             outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
             optimizer.step()
 
-            # آمار پایه
             batch_size = images.size(0)
             train_loss += loss.item() * batch_size
             pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
             
-            # ✅ 1. محاسبه واریانس (Hesitancy) هر مدل
-            per_model_hesitancy = memberships.var(dim=2)  # shape: (batch_size, num_models)
+            per_model_hesitancy = memberships.var(dim=2)
             sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
             
-            # ✅ 2. بررسی استفاده از Cumsum
-            # اگر تعداد مدل‌های فعال < کل مدل‌ها باشد، یعنی cumsum استفاده شده
-            active_mask = (weights > 1e-4).float()  # shape: (batch_size, num_models)
-            num_active_per_sample = active_mask.sum(dim=1)  # shape: (batch_size,)
+            active_mask = (weights > 1e-4).float()
+            num_active_per_sample = active_mask.sum(dim=1)
             cumsum_used_samples = (num_active_per_sample < len(model_names)).sum().item()
             sum_cumsum_used += cumsum_used_samples
             
-            # ✅ 3. کدام مدل‌ها فعال شدند
             sum_active_models += active_mask.sum(dim=0)
             num_batches += 1
 
-        # محاسبه متریک‌های epoch
         train_acc = 100. * train_correct / train_total
         train_loss = train_loss / train_total
         
-        # میانگین‌ها
         avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
         avg_cumsum_usage = (sum_cumsum_used / train_total) * 100
         avg_model_activation = (sum_active_models / train_total) * 100
         overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
         
-        # Validation
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         scheduler.step()
 
-        # ذخیره history
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
@@ -433,7 +374,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         history['cumsum_usage'].append(avg_cumsum_usage)
         history['model_activation'].append(avg_model_activation.cpu().tolist())
 
-        # ========== نمایش اطلاعات کامل ==========
         if is_main:
             print(f"\n{'='*70}")
             print(f"Epoch {epoch+1}/{num_epochs}")
@@ -441,7 +381,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
             print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
             
-            # ===== 1. Hesitancy (Variance) per Model =====
             print(f"\n{'Hesitancy (Variance) per Model:':^70}")
             print(f"{'-'*70}")
             for i, name in enumerate(model_names):
@@ -450,37 +389,25 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             print(f"{'-'*70}")
             print(f"  {'Overall Mean Hesitancy:':<30}  {overall_mean_hesitancy:.6f}")
             
-            # ===== 2. Cumsum Usage =====
             print(f"\n{'Cumulative Weight Threshold (Cumsum) Analysis:':^70}")
             print(f"{'-'*70}")
             print(f"  {'Cumsum activated in:':<30}  {avg_cumsum_usage:.2f}% of samples")
             if avg_cumsum_usage > 50:
-                print(f"  {'Status:':<30}  ✓ Efficient (most samples use fewer models)")
+                print(f"  {'Status:':<30}  ✓ Efficient")
             elif avg_cumsum_usage > 20:
-                print(f"  {'Status:':<30}  ≈ Moderate (balanced usage)")
+                print(f"  {'Status:':<30}  ≈ Moderate")
             else:
-                print(f"  {'Status:':<30}  ✗ Low efficiency (almost all models used)")
+                print(f"  {'Status:':<30}  ✗ Low efficiency")
             print(f"  {'All models used in:':<30}  {100-avg_cumsum_usage:.2f}% of samples")
             
-            # ===== 3. Model Activation Frequency =====
             print(f"\n{'Model Activation Frequency:':^70}")
             print(f"{'-'*70}")
             for i, name in enumerate(model_names):
                 activation_pct = avg_model_activation[i].item()
-                bar_length = int(activation_pct / 2)  # Scale to 50 chars max
+                bar_length = int(activation_pct / 2)
                 bar = '█' * bar_length
                 print(f"  {i+1:2d}. {name:<30}: {activation_pct:5.1f}% {bar}")
-            
-            # ===== تحلیل سریع =====
-            max_activation_idx = avg_model_activation.argmax().item()
-            min_activation_idx = avg_model_activation.argmin().item()
-            print(f"\n{'Quick Analysis:':^70}")
-            print(f"{'-'*70}")
-            print(f"  Most active:  {model_names[max_activation_idx]} ({avg_model_activation[max_activation_idx]:.1f}%)")
-            print(f"  Least active: {model_names[min_activation_idx]} ({avg_model_activation[min_activation_idx]:.1f}%)")
-            print(f"{'='*70}")
 
-        # ذخیره بهترین مدل
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
             save_path = os.path.join(save_dir, 'best_hesitant_fuzzy.pt')
@@ -502,157 +429,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         print(f"{'='*70}\n")
     
     return best_val_acc, history
-
-# ================== LIME EXPLANATION ==================
-def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256)):
-    img_np = image_tensor[0].cpu().permute(1, 2, 0).numpy()
-    img_np = (img_np * 255).astype(np.uint8)
-    explainer = lime_image.LimeImageExplainer()
-
-    def predict_fn(images):
-        batch = torch.from_numpy(images.transpose(0, 3, 1, 2)).float() / 255.0
-        batch = batch.to(device)
-        with torch.no_grad():
-            outputs, _ = model(batch)
-            probs = torch.sigmoid(outputs).cpu().numpy()
-        return np.hstack([1 - probs, probs])
-
-    explanation = explainer.explain_instance(
-        img_np, predict_fn, top_labels=1, hide_color=0, num_samples=1000)
-    temp, mask = explanation.get_image_and_mask(
-        explanation.top_labels[0], positive_only=True, num_features=10, hide_rest=True)
-    lime_img = mark_boundaries(temp / 255.0, mask)
-    lime_img = cv2.resize(lime_img, target_size)
-    return lime_img
-
-# ================== VISUALIZATION FUNCTIONS ==================
-def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
-                           num_gradcam, num_lime, dataset_type, is_main):
-    if not is_main:
-        return
-    print("="*70)
-    print("GENERATING VISUALIZATIONS")
-    print("="*70)
-
-    dirs = {k: os.path.join(vis_dir, k) for k in ['gradcam', 'lime', 'combined']}
-    for d in dirs.values():
-        os.makedirs(d, exist_ok=True)
-
-    ensemble.eval()
-    local_ensemble = ensemble.module if hasattr(ensemble, 'module') else ensemble
-    for model in local_ensemble.models:
-        model.eval()
-
-    full_dataset = test_loader.dataset
-    if hasattr(full_dataset, 'dataset'):
-        full_dataset = full_dataset.dataset
-
-    total_samples = len(full_dataset)
-    vis_count = min(max(num_gradcam, num_lime), total_samples)
-    if vis_count == 0:
-        print("No samples for visualization.")
-        return
-
-    vis_indices = random.sample(range(total_samples), vis_count)
-    vis_dataset = Subset(full_dataset, vis_indices)
-    vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0)
-
-    for idx, (image, _) in enumerate(vis_loader):
-        image = image.to(device)
-        try:
-            img_path, true_label = get_sample_info(full_dataset, vis_indices[idx])
-        except Exception:
-            print(f"Warning: Could not get info for sample {idx}")
-            continue
-
-        print(f"\n[Visualization {idx+1}/{len(vis_loader)}]")
-        print(f"  Path: {os.path.basename(img_path)}")
-        print(f"  True: {'real' if true_label == 1 else 'fake'}")
-
-        with torch.no_grad():
-            output, weights, _, _ = ensemble(image, return_details=True)
-        pred = 1 if output.squeeze().item() > 0 else 0
-        print(f"  Pred: {'real' if pred == 1 else 'fake'}")
-
-        filename = f"sample_{idx}_true{'real' if true_label == 1 else 'fake'}_pred{'real' if pred == 1 else 'fake'}.png"
-
-        # ---------- GradCAM ----------
-        if idx < num_gradcam:
-            try:
-                active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
-                combined_cam = None
-                for i in active_models:
-                    model = local_ensemble.models[i]
-                    target_layer = model.layer4[2].conv3
-                    gradcam = GradCAM(model, target_layer)
-
-                    x_n = local_ensemble.normalizations(image, i)   # FIXED: normalize
-                    x_n.requires_grad_(True)                        # FIXED: grad
-                    model_out = model(x_n)
-                    if isinstance(model_out, (tuple, list)):
-                        model_out = model_out[0]
-                    score = model_out.squeeze(0) if pred == 1 else -model_out.squeeze(0)  # FIXED: squeeze
-                    cam = gradcam.generate(score)
-
-                    weight = weights[0, i].item()
-                    combined_cam = weight * cam if combined_cam is None else combined_cam + weight * cam
-
-                if combined_cam is not None:
-                    combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
-                    img_np = image[0].cpu().permute(1, 2, 0).numpy()
-                    img_h, img_w = img_np.shape[:2]
-                    combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h))
-                    heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
-                    heatmap = np.float32(heatmap) / 255
-                    overlay = heatmap + img_np
-                    overlay = overlay / overlay.max()
-
-                    plt.figure(figsize=(10, 10))
-                    plt.imshow(overlay)
-                    plt.title(f"GradCAM\nTrue: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
-                    plt.axis('off')
-                    plt.savefig(os.path.join(dirs['gradcam'], filename), bbox_inches='tight', dpi=200)
-                    plt.close()
-                    print(f"  GradCAM saved")
-            except Exception as e:
-                print(f"  GradCAM error: {e}")
-
-        # ---------- LIME ----------
-        if idx < num_lime:
-            try:
-                lime_img = generate_lime_explanation(ensemble, image, device)
-                plt.figure(figsize=(10, 10))
-                plt.imshow(lime_img)
-                plt.title(f"LIME\nTrue: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
-                plt.axis('off')
-                plt.savefig(os.path.join(dirs['lime'], filename), bbox_inches='tight', dpi=200)
-                plt.close()
-                print(f"  LIME saved")
-
-                # Combined
-                if idx < num_gradcam and 'overlay' in locals():
-                    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-                    axes[0].imshow(img_np)
-                    axes[0].set_title("Original")
-                    axes[0].axis('off')
-                    axes[1].imshow(overlay)
-                    axes[1].set_title("GradCAM")
-                    axes[1].axis('off')
-                    axes[2].imshow(lime_img)
-                    axes[2].set_title("LIME")
-                    axes[2].axis('off')
-                    plt.suptitle(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(dirs['combined'], filename), bbox_inches='tight', dpi=200)
-                    plt.close()
-                    print(f"  Combined saved")
-            except Exception as e:
-                print(f"  LIME error: {e}")
-
-    print("="*70)
-    print("Visualizations completed!")
-    print(f"Saved to: {vis_dir}")
-    print("="*70)
 
 
 # ================== DISTRIBUTED SETUP ==================
