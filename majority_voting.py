@@ -341,7 +341,7 @@ class MajorityVotingEnsemble(nn.Module):
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     try:
-        from model.ResNet_pruned.ResNet_pruned_hardfakevsreal import ResNet_50_pruned_hardfakevsreal
+        from model.ResNet_pruned.ResNet_pruned.ResNet_pruned_hardfakevsreal import ResNet_50_pruned_hardfakevsreal
     except ImportError:
         raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
 
