@@ -1,12 +1,3 @@
-
-
-این کد کامل و اصلاح‌شده است. در این نسخه:
-1. کلاس‌های مربوط به `HesitantFuzzyMembership` و `FuzzyHesitantEnsemble` حذف شده‌اند.
-2. کلاس جدید `MajorityVotingEnsemble` اضافه شده که از روش اکثریت آرا (Hard Voting) استفاده می‌کند.
-3. توابع آموزش و ارزیابی برای کار با لاجیک رأی‌گیری به‌روزرسانی شده‌اند.
-4. بخش Visualisation تنظیم شده تا نقشه‌های حرارتی (GradCAM) را بر اساس مدل‌هایی که به رأی نهایی رأی داده‌اند، تولید کند.
-
-```python
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -984,4 +975,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
