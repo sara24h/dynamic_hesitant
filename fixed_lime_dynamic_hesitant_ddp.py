@@ -12,6 +12,7 @@ import json
 import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
+from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
 
@@ -606,6 +607,16 @@ def main():
             args.dataset, is_main)
 
     cleanup_distributed()
+
+    if is_main:
+        plot_roc_and_f1(
+            ensemble_module,
+            test_loader, 
+            device, 
+            args.save_dir, 
+            MODEL_NAMES,
+            is_main
+        )
 
 if __name__ == "__main__":
     main()
