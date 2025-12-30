@@ -98,9 +98,10 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
 
     ensemble.eval()
     local_ensemble = ensemble.module if hasattr(ensemble, 'module') else ensemble
-    for model in local_ensemble.models:         # FIXED: ensure eval
+    for model in local_ensemble.models:
         model.eval()
 
+    # دریافت دیتاست اصلی
     full_dataset = test_loader.dataset
     if hasattr(full_dataset, 'dataset'):
         full_dataset = full_dataset.dataset
@@ -111,16 +112,37 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
         print("No samples for visualization.")
         return
 
+    # انتخاب ایندکس‌ها
     vis_indices = random.sample(range(total_samples), vis_count)
     vis_dataset = Subset(full_dataset, vis_indices)
+    
+    # نکته مهم: num_workers را صفر بگذاریم تا شافل نشوند
     vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0)
 
-    for idx, (image, _) in enumerate(vis_loader):
+    for idx, (image, label_int) in enumerate(vis_loader):
         image = image.to(device)
+        
+        # --- اصلاحیه: دریافت مسیر صحیح از دیتاست اصلی با ایندکس دقیق ---
         try:
-            img_path, true_label = get_sample_info(full_dataset, vis_indices[idx])
-        except Exception:
-            print(f"Warning: Could not get info for sample {idx}")
+            # تلاش برای گرفتن مسیر مستقیم
+            if hasattr(full_dataset, 'samples'):
+                path_obj = full_dataset.samples[vis_indices[idx]]
+                img_path = path_obj[0] # path is usually the first element
+                true_label_int = path_obj[1]
+            elif hasattr(full_dataset, 'imgs'): # برای CIFAR یا دیتاست‌های خاص
+                path_obj = full_dataset.imgs[vis_indices[idx]]
+                img_path = str(path_obj[0])
+                true_label_int = path_obj[1]
+            else:
+                # اگر ساختار ساده بود
+                img_path = f"index_{vis_indices[idx]}"
+                true_label_int = label_int.item() # استفاده از لیبل لود شده
+            
+            # اطمینان از اینکه لیبل با فایل مچ است
+            true_label = int(true_label_int)
+            
+        except Exception as e:
+            print(f"Warning: Could not get path for sample {vis_indices[idx]}: {e}")
             continue
 
         print(f"\n[Visualization {idx+1}/{len(vis_loader)}]")
@@ -129,27 +151,35 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
 
         with torch.no_grad():
             output, weights, _, _ = ensemble(image, return_details=True)
-        pred = 1 if output.squeeze().item() > 0 else 0
-        print(f"  Pred: {'real' if pred == 1 else 'fake'}")
+        
+        # پیش‌بینی نهایی
+        pred_val = 1 if output.squeeze().item() > 0 else 0
+        print(f"  Pred: {'real' if pred_val == 1 else 'fake'}")
 
-        filename = f"sample_{idx}_true{'real' if true_label == 1 else 'fake'}_pred{'real' if pred == 1 else 'fake'}.png"
+        # ساخت نام فایل بر اساس لیبل واقعی (که الان درست است)
+        filename = f"sample_{idx}_true{'real' if true_label == 1 else 'fake'}_pred{'real' if pred_val == 1 else 'fake'}.png"
 
         # ---------- GradCAM ----------
         if idx < num_gradcam:
             try:
                 active_models = torch.where(weights[0] > 1e-4)[0].cpu().tolist()
                 combined_cam = None
+                
+                # ذخیره تصویر اصلی برای استفاده بعدی
+                img_np = image[0].cpu().permute(1, 2, 0).numpy()
+                
                 for i in active_models:
                     model = local_ensemble.models[i]
                     target_layer = model.layer4[2].conv3
                     gradcam = GradCAM(model, target_layer)
 
-                    x_n = local_ensemble.normalizations(image, i)   # FIXED: normalize
-                    x_n.requires_grad_(True)                        # FIXED: grad
+                    x_n = local_ensemble.normalizations(image, i)   
+                    x_n.requires_grad_(True)                        
                     model_out = model(x_n)
                     if isinstance(model_out, (tuple, list)):
                         model_out = model_out[0]
-                    score = model_out.squeeze(0) if pred == 1 else -model_out.squeeze(0)  # FIXED: squeeze
+                    # محاسبه اسکور بر اساس پیش‌بینی انسامبل
+                    score = model_out.squeeze(0) if pred_val == 1 else -model_out.squeeze(0)  
                     cam = gradcam.generate(score)
 
                     weight = weights[0, i].item()
@@ -157,7 +187,6 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
 
                 if combined_cam is not None:
                     combined_cam = (combined_cam - combined_cam.min()) / (combined_cam.max() - combined_cam.min() + 1e-8)
-                    img_np = image[0].cpu().permute(1, 2, 0).numpy()
                     img_h, img_w = img_np.shape[:2]
                     combined_cam_resized = cv2.resize(combined_cam, (img_w, img_h))
                     heatmap = cv2.applyColorMap(np.uint8(255 * combined_cam_resized), cv2.COLORMAP_JET)
@@ -167,7 +196,7 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
 
                     plt.figure(figsize=(10, 10))
                     plt.imshow(overlay)
-                    plt.title(f"GradCAM\nTrue: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
+                    plt.title(f"GradCAM\nTrue: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred_val == 1 else 'fake'}")
                     plt.axis('off')
                     plt.savefig(os.path.join(dirs['gradcam'], filename), bbox_inches='tight', dpi=200)
                     plt.close()
@@ -181,7 +210,7 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
                 lime_img = generate_lime_explanation(ensemble, image, device)
                 plt.figure(figsize=(10, 10))
                 plt.imshow(lime_img)
-                plt.title(f"LIME\nTrue: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
+                plt.title(f"LIME\nTrue: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred_val == 1 else 'fake'}")
                 plt.axis('off')
                 plt.savefig(os.path.join(dirs['lime'], filename), bbox_inches='tight', dpi=200)
                 plt.close()
@@ -199,7 +228,7 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
                     axes[2].imshow(lime_img)
                     axes[2].set_title("LIME")
                     axes[2].axis('off')
-                    plt.suptitle(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
+                    plt.suptitle(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred_val == 1 else 'fake'}")
                     plt.tight_layout()
                     plt.savefig(os.path.join(dirs['combined'], filename), bbox_inches='tight', dpi=200)
                     plt.close()
