@@ -50,15 +50,13 @@ class MultiModelNormalization(nn.Module):
 class SimpleAveragingEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
                  stds: List[Tuple[float]]):
-        # تغییر مهم: حذف freeze_models یا تنظیم آن برابر False
-        # اگر True باشد DDP خطا می‌دهد زیرا هیچ پارامتری برای بهینه‌سازی باقی نمی‌ماند
+        # No freezing to allow DDP wrapping
         super().__init__()
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        # Get outputs from all models
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
         
         for i in range(self.num_models):
@@ -69,7 +67,6 @@ class SimpleAveragingEnsemble(nn.Module):
                     out = out[0]
             outputs[:, i] = out
 
-        # Simple Averaging
         final_output = outputs.mean(dim=1)
         
         if return_details:
@@ -102,8 +99,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
             model.load_state_dict(ckpt['model_state_dict'])
             model = model.to(device).eval()
             
-            # حذف دستور فریز کردن پارامترها (p.requires_grad = False)
-            # این کار باعث می‌شود DDP خطا ندهد، اگرچه ما در forward از no_grad استفاده می‌کنیم.
+            # Not freezing parameters to satisfy DDP requirements
             
             param_count = sum(p.numel() for p in model.parameters())
             if is_main:
@@ -229,7 +225,7 @@ def cleanup_distributed():
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Simple Averaging Ensemble")
-    parser.add_argument('--epochs', type=int, default=1, help="Unused in Simple Averaging, kept for compatibility")
+    parser.add_argument('--epochs', type=int, default=1, help="Unused in Simple Averaging")
     parser.add_argument('--lr', type=float, default=0.0001, help="Unused in Simple Averaging")
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_memberships', type=int, default=1, help="Unused in Simple Averaging")
@@ -270,8 +266,6 @@ def main():
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    # Initialize Simple Averaging Ensemble
-    # ما پارامتر freeze_models را حذف کردیم تا پارامترها trainable باشند و DDP خطا ندهد
     ensemble = SimpleAveragingEnsemble(
         base_models, MEANS, STDS
     ).to(device)
@@ -326,6 +320,9 @@ def main():
         print(f"Ensemble Accuracy: {ensemble_test_acc:.2f}%")
         print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
+
+        # Create the save directory if it doesn't exist
+        os.makedirs(args.save_dir, exist_ok=True)
 
         final_results = {
             'method': 'Simple Averaging',
