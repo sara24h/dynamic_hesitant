@@ -49,23 +49,18 @@ class MultiModelNormalization(nn.Module):
 
 class SimpleAveragingEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
-                 stds: List[Tuple[float]], freeze_models: bool = True):
+                 stds: List[Tuple[float]]):
+        # تغییر مهم: حذف freeze_models یا تنظیم آن برابر False
+        # اگر True باشد DDP خطا می‌دهد زیرا هیچ پارامتری برای بهینه‌سازی باقی نمی‌ماند
         super().__init__()
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
 
-        if freeze_models:
-            for model in self.models:
-                model.eval()
-                for p in model.parameters():
-                    p.requires_grad = False
-
     def forward(self, x: torch.Tensor, return_details: bool = False):
         # Get outputs from all models
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
         
-        # Compute output for every model (Vectorized gathering is hard due to different norms, so loop)
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
             with torch.no_grad():
@@ -78,7 +73,6 @@ class SimpleAveragingEnsemble(nn.Module):
         final_output = outputs.mean(dim=1)
         
         if return_details:
-            # Return dummy weights (equal) for compatibility with visualization utils if needed
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
             return final_output, weights, None, outputs
         return final_output, None
@@ -107,6 +101,10 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
             model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
             model.load_state_dict(ckpt['model_state_dict'])
             model = model.to(device).eval()
+            
+            # حذف دستور فریز کردن پارامترها (p.requires_grad = False)
+            # این کار باعث می‌شود DDP خطا ندهد، اگرچه ما در forward از no_grad استفاده می‌کنیم.
+            
             param_count = sum(p.numel() for p in model.parameters())
             if is_main:
                 print(f" → Parameters: {param_count:,}")
@@ -273,9 +271,9 @@ def main():
     MODEL_NAMES = args.model_names[:len(base_models)]
 
     # Initialize Simple Averaging Ensemble
+    # ما پارامتر freeze_models را حذف کردیم تا پارامترها trainable باشند و DDP خطا ندهد
     ensemble = SimpleAveragingEnsemble(
-        base_models, MEANS, STDS,
-        freeze_models=True
+        base_models, MEANS, STDS
     ).to(device)
 
     if world_size > 1:
@@ -284,7 +282,7 @@ def main():
     if is_main:
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
         total = sum(p.numel() for p in ensemble.parameters())
-        print(f"Total params: {total:,} | Trainable: {trainable:,} (No Training in Simple Avg)\n")
+        print(f"Total params: {total:,} | Trainable: {trainable:,} (Parameters kept trainable for DDP compatibility)\n")
 
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
