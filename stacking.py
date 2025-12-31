@@ -113,8 +113,11 @@ class StackingEnsemble(nn.Module):
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             
             return final_output, dummy_weights, dummy_memberships, stacked_logits
-
-        return final_output, dummy_weights # Simpler return for general loops
+        else:
+            # FIX: Define dummy_weights here to avoid UnboundLocalError during training
+            batch_size = x.size(0)
+            dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
+            return final_output, dummy_weights
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
@@ -237,11 +240,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         
         # Convert logits to probabilities for better display
         # Divide by number of batches/processors effectively to get mean
-        # Note: sum_logits is already accumulated, we need to divide by total_samples to get mean logit per sample approx 
-        # OR just divide by number of batches. Let's just divide by total_samples to be safe if we summed means.
-        # But here sum_logits added batch means. So we need total batches count.
-        # Simplified: Just normalize by total_samples for approximation or just display the raw accumulated logits normalized.
-        # Let's stick to a safe normalization.
         avg_logits = (sum_logits / len(loader.sampler if hasattr(loader, 'sampler') else loader)).cpu().numpy()
         avg_probs = 1 / (1 + np.exp(-avg_logits)) # Sigmoid
 
@@ -297,7 +295,7 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             optimizer.zero_grad()
             
             # Base models are run in no_grad implicitly by wrapper or we rely on freeze=True
-            # But we need gradients for the meta learner
+            # But we need gradients for meta learner
             outputs, _ = ensemble_model(images) # (Batch, 1)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
