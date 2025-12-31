@@ -26,34 +26,12 @@ from lime import lime_image
 from skimage.segmentation import mark_boundaries
 
 # ================== DATASET CLASSES ==================
-class UADFVDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.samples = []
-        self.class_to_idx = {'fake': 0, 'real': 1}
-        self.classes = list(self.class_to_idx.keys())
-
-        for class_name in ['fake', 'real']:
-            frames_dir = os.path.join(self.root_dir, class_name, 'frames')
-            if os.path.exists(frames_dir):
-                for subdir in os.listdir(frames_dir):
-                    subdir_path = os.path.join(frames_dir, subdir)
-                    if os.path.isdir(subdir_path):
-                        for img_file in os.listdir(subdir_path):
-                            if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                                img_path = os.path.join(subdir_path, img_file)
-                                self.samples.append((img_path, self.class_to_idx[class_name]))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        image = Image.open(img_path).convert('RGB')
-        if self.transform:
-            image = self.transform(image)
-        return image, label
+from dataset_utils import (
+    UADFVDataset, 
+    create_dataloaders, 
+    get_sample_info, 
+    worker_init_fn
+) image, label
 
 
 class TransformSubset(Subset):
