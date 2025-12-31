@@ -31,7 +31,7 @@ from dataset_utils import (
     create_dataloaders, 
     get_sample_info, 
     worker_init_fn
-) image, label
+)
 
 
 class TransformSubset(Subset):
