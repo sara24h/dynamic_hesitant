@@ -242,7 +242,7 @@ class SimpleEnsemble(nn.Module):
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     try:
-        from model.pruned_model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
+        from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     except ImportError:
         raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
 
