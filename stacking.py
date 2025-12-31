@@ -50,13 +50,13 @@ class MultiModelNormalization(nn.Module):
 # ================== STACKING META LEARNER ==================
 class StackingMetaLearner(nn.Module):
     """
-    مدل متا برای Stacking.
-    ورودی: Logits تمام مدل‌های پایه (Batch_Size x Num_Models)
-    خروجی: امتیاز نهایی (Batch_Size x 1)
+    Meta-Learner for Stacking.
+    Input: Logits from all base models (Batch_Size x Num_Models)
+    Output: Final Score (Batch_Size x 1)
     """
     def __init__(self, num_models: int, hidden_dim: int = 8):
         super().__init__()
-        # یک شبکه ساده (MLP) برای یادگیری وزن‌دهی غیرخطی
+        # Simple neural network (MLP) to learn non-linear weighting
         self.meta_net = nn.Sequential(
             nn.Linear(num_models, hidden_dim),
             nn.ReLU(inplace=True),
@@ -78,7 +78,7 @@ class StackingEnsemble(nn.Module):
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
         
-        # متا لرنر که روی خروجی مدل‌ها کار می‌کند
+        # Meta learner operating on model outputs
         self.meta_learner = StackingMetaLearner(self.num_models, hidden_dim=hidden_dim)
 
         if freeze_models:
@@ -88,34 +88,33 @@ class StackingEnsemble(nn.Module):
                     p.requires_grad = False
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        # 1. جمع‌آوری خروجی‌های خام (Logits) از تمام مدل‌ها
+        # 1. Collect raw outputs (Logits) from all models
         logits_list = []
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            with torch.no_grad(): # مدل‌های پایه فرض می‌شوند Frozen هستند
+            with torch.no_grad(): # Base models are assumed Frozen
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
             logits_list.append(out)
         
-        # Stack کردن خروجی‌ها: (Batch, Num_Models, 1) -> (Batch, Num_Models)
+        # Stack outputs: (Batch, Num_Models, 1) -> (Batch, Num_Models)
         stacked_logits = torch.cat(logits_list, dim=1)
         
-        # 2. پاس دادن خروجی‌ها به متا لرنر
+        # 2. Pass outputs to meta learner
         final_output = self.meta_learner(stacked_logits)
 
         if return_details:
-            # برای سازگاری با توابع ارزیابی قبلی
-            # وزن‌ها در Stacking به صورت صریح ساده نیستند، پس None می‌گذاریم یا وزن‌های آماری محاسبه می‌کنیم
+            # For compatibility with previous evaluation functions
             batch_size = x.size(0)
             
-            # ساخت یک دامی وزن یکنواخت برای سازگاری (در Stacking وزن‌ها دینامیک هستند)
+            # Dummy uniform weights for compatibility (weights are dynamic in Stacking)
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             
             return final_output, dummy_weights, dummy_memberships, stacked_logits
 
-        return final_output, dummy_weights # برای سادگی در loop های معمولی
+        return final_output, dummy_weights # Simpler return for general loops
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
@@ -211,21 +210,20 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     total_correct = 0
     total_samples = 0
     
-    # برای Stacking، وزن ثابت نداریم، پس میانگین لاجیت‌ها را گزارش می‌کنیم
+    # For Stacking, we don't have static weights, so we report average logits
     sum_logits = torch.zeros(len(model_names), device=device)
 
     if is_main:
         print(f"\nEvaluating {name} set (Stacking)...")
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
-        # outputs, weights, memberships, raw_logits = model(images, return_details=True)
         outputs, weights, _, raw_logits = model(images, return_details=True)
         
         pred = (outputs.squeeze(1) > 0).long()
         total_correct += pred.eq(labels.long()).sum().item()
         total_samples += labels.size(0)
         
-        # میانگین لاجیت خام هر مدل روی بچ
+        # Average raw logits per model over the batch
         sum_logits += raw_logits.mean(dim=0).squeeze()
 
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
@@ -237,7 +235,13 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_samples = stats[1].item()
         acc = 100. * total_correct / total_samples
         
-        # تبدیل لاجیت‌ها به احتمال برای نمایش بهتر
+        # Convert logits to probabilities for better display
+        # Divide by number of batches/processors effectively to get mean
+        # Note: sum_logits is already accumulated, we need to divide by total_samples to get mean logit per sample approx 
+        # OR just divide by number of batches. Let's just divide by total_samples to be safe if we summed means.
+        # But here sum_logits added batch means. So we need total batches count.
+        # Simplified: Just normalize by total_samples for approximation or just display the raw accumulated logits normalized.
+        # Let's stick to a safe normalization.
         avg_logits = (sum_logits / len(loader.sampler if hasattr(loader, 'sampler') else loader)).cpu().numpy()
         avg_probs = 1 / (1 + np.exp(-avg_logits)) # Sigmoid
 
@@ -249,8 +253,8 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         
         print(f"\nAverage Model Logits (Sigmoid -> Prob):")
         for i, mname in enumerate(model_names):
-            倾向 = "Real" if avg_probs[i] > 0.5 else "Fake"
-             print(f"  {i+1:2d}. {mname:<25}: Logit={avg_logits[i]:.4f} | Prob={avg_probs[i]:.4f} ({倾向})")
+            pred_label = "Real" if avg_probs[i] > 0.5 else "Fake"
+            print(f"  {i+1:2d}. {mname:<25}: Logit={avg_logits[i]:.4f} | Prob={avg_probs[i]:.4f} ({pred_label})")
         
         print(f"{'='*70}")
         return acc, avg_probs.tolist()
@@ -260,7 +264,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
     """
-    تابع آموزش برای Stacking
+    Training function for Stacking
     """
     os.makedirs(save_dir, exist_ok=True)
     meta_learner = ensemble_model.module.meta_learner if hasattr(ensemble_model, 'module') else ensemble_model.meta_learner
@@ -292,10 +296,8 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
             
-            # مدل‌های پایه در no_grad اجرا می‌شوند (چون Frozen هستند)، اما pytorch خودش مدیریت می‌کند
-            # برای صرفه‌جویی حافظه می‌توانیم no_grad را برای حلقه داخلی مدل‌ها فعال نگه داریم
-            # اما forward اصلی ensemble نیاز به gradient دارد برای متا لرنر
-            
+            # Base models are run in no_grad implicitly by wrapper or we rely on freeze=True
+            # But we need gradients for the meta learner
             outputs, _ = ensemble_model(images) # (Batch, 1)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
@@ -512,7 +514,7 @@ def main():
         print(f"Model saved: {final_model_path}")
 
         vis_dir = os.path.join(args.save_dir, 'visualizations')
-        # 注意：Stacking 的可视化逻辑和 Fuzzy 略有不同，这里复用通用函数
+        # Stacking visualization logic is slightly different from Fuzzy, reusing generic function
         generate_visualizations(
             ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
             args.num_grad_cam_samples, args.num_lime_samples,
