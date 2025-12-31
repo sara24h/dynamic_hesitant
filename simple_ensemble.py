@@ -26,6 +26,7 @@ from lime import lime_image
 from skimage.segmentation import mark_boundaries
 
 # ================== DATASET CLASSES ==================
+# Assuming UADFVDataset is available in dataset_utils
 from dataset_utils import (
     UADFVDataset, 
     create_dataloaders, 
@@ -99,6 +100,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
     if dataset_type == 'uadfV':
         if not os.path.exists(base_dir):
             raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
+        # Initialize with a dummy transform, real transform is applied in Subset
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = UADFVDataset(base_dir, transform=temp_transform)
     elif dataset_type in dataset_paths:
@@ -259,7 +261,8 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
 # ================== DATA LOADERS ==================
 def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                        dataset_type: str = 'wild', is_distributed: bool = False,
-                       seed: int = 42, is_main: bool = True):
+                       seed: int = 42, is_main: bool = True, skip_train: bool = False):
+    
     if is_main:
         print("="*70)
         print(f"Creating DataLoaders (Dataset: {dataset_type})")
@@ -281,14 +284,21 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
     ])
 
     if dataset_type == 'wild':
+        # 'wild' dataset logic (Folder structure)
         splits = ['train', 'valid', 'test']
         datasets_dict = {}
         for split in splits:
+            # If skip_train is True, only load test set for efficiency if desired, 
+            # but usually we load all unless specified. Here we assume 'wild' has separate folders.
+            if skip_train and split in ['train', 'valid']:
+                continue
+
             path = os.path.join(base_dir, split)
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Folder not found: {path}")
             if is_main:
                 print(f"{split.capitalize():5}: {path}")
+            
             transform = train_transform if split == 'train' else val_test_transform
             datasets_dict[split] = datasets.ImageFolder(path, transform=transform)
 
@@ -296,60 +306,95 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
             print(f"\nDataset Stats:")
             for split, ds in datasets_dict.items():
                 print(f" {split.capitalize():5}: {len(ds):,} images | Classes: {ds.classes}")
-            print(f" Class → Index: {datasets_dict['train'].class_to_idx}\n")
+            print(f" Class → Index: {datasets_dict.get('train', datasets_dict['test']).class_to_idx}\n")
 
-        train_sampler = DistributedSampler(datasets_dict['train'], shuffle=True) if is_distributed else None
-        val_sampler = DistributedSampler(datasets_dict['valid'], shuffle=False) if is_distributed else None
-        test_sampler = DistributedSampler(datasets_dict['test'], shuffle=False) if is_distributed else None
+        train_loader, val_loader, test_loader = None, None, None
+        
+        if 'train' in datasets_dict:
+            train_sampler = DistributedSampler(datasets_dict['train'], shuffle=True) if is_distributed else None
+            train_loader = DataLoader(datasets_dict['train'], batch_size=batch_size,
+                                     shuffle=(train_sampler is None), sampler=train_sampler,
+                                     num_workers=num_workers, pin_memory=True, drop_last=True,
+                                     worker_init_fn=worker_init_fn)
 
-        train_loader = DataLoader(datasets_dict['train'], batch_size=batch_size,
-                                 shuffle=(train_sampler is None), sampler=train_sampler,
-                                 num_workers=num_workers, pin_memory=True, drop_last=True,
-                                 worker_init_fn=worker_init_fn)
-        val_loader = DataLoader(datasets_dict['valid'], batch_size=batch_size,
-                               shuffle=False, sampler=val_sampler,
-                               num_workers=num_workers, pin_memory=True, drop_last=False,
-                               worker_init_fn=worker_init_fn)
-        test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size,
-                                shuffle=False, sampler=test_sampler,
-                                num_workers=num_workers, pin_memory=True, drop_last=False,
-                                worker_init_fn=worker_init_fn)
+        if 'valid' in datasets_dict:
+            val_sampler = DistributedSampler(datasets_dict['valid'], shuffle=False) if is_distributed else None
+            val_loader = DataLoader(datasets_dict['valid'], batch_size=batch_size,
+                                   shuffle=False, sampler=val_sampler,
+                                   num_workers=num_workers, pin_memory=True, drop_last=False,
+                                   worker_init_fn=worker_init_fn)
+
+        if 'test' in datasets_dict:
+            test_sampler = DistributedSampler(datasets_dict['test'], shuffle=False) if is_distributed else None
+            test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size,
+                                    shuffle=False, sampler=test_sampler,
+                                    num_workers=num_workers, pin_memory=True, drop_last=False,
+                                    worker_init_fn=worker_init_fn)
     else:
+        # Split-based datasets (UADFV, etc.)
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
+        
         full_dataset, train_indices, val_indices, test_indices = prepare_dataset(
             base_dir, dataset_type, seed=seed)
+        
         if is_main:
             print(f"\nDataset Stats:")
             print(f" Total: {len(full_dataset):,} images")
-            print(f" Train: {len(train_indices):,} ({len(train_indices)/len(full_dataset)*100:.1f}%)")
-            print(f" Valid: {len(val_indices):,} ({len(val_indices)/len(full_dataset)*100:.1f}%)")
+            if not skip_train:
+                print(f" Train: {len(train_indices):,} ({len(train_indices)/len(full_dataset)*100:.1f}%)")
+                print(f" Valid: {len(val_indices):,} ({len(val_indices)/len(full_dataset)*100:.1f}%)")
             print(f" Test: {len(test_indices):,} ({len(test_indices)/len(full_dataset)*100:.1f}%)\n")
 
-        if dataset_type == 'uadfV':
+        # We create the Subsets
+        train_dataset, val_dataset, test_dataset = None, None, None
+
+        if not skip_train:
             train_dataset = Subset(full_dataset, train_indices)
             val_dataset = Subset(full_dataset, val_indices)
-            test_dataset = Subset(full_dataset, test_indices)
-            train_dataset.dataset.transform = train_transform
-            val_dataset.dataset.transform = val_test_transform
-            test_dataset.dataset.transform = val_test_transform
-        else:
+        
+        test_dataset = Subset(full_dataset, test_indices)
+
+        # === FIX: Properly apply transforms for UADFV and others ===
+        # If it's UADFV, the underlying object is UADFVDataset.
+        # UADFVDataset applies transforms in __getitem__ if self.transform is set.
+        # However, Subset passes index to dataset. If we set dataset.transform, it affects all subsets.
+        # The robust way for UADFV is to ensure the full_dataset has the TEST transform by default, 
+        # and use TransformSubset for Train.
+        
+        # Check if it is UADFV (has transform attribute)
+        if hasattr(full_dataset, 'transform'):
+            # Set base transform to test transform for safety
+            full_dataset.transform = val_test_transform
+        
+        # For training, we need to override the transform to train_transform.
+        # We use TransformSubset for that.
+        if train_dataset is not None:
             train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
-            val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
-            test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
 
-        train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_distributed else None
-        val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
+        # For Val and Test, if we set full_dataset.transform to val_test_transform,
+        # simple Subset(full_dataset, indices) is sufficient.
+        # Note: If we used TransformSubset for Val, it would also be fine, 
+        # but setting full_dataset.transform is cleaner for UADFV.
+        
+        # Prepare loaders
+        train_loader, val_loader, test_loader = None, None, None
+
+        if train_dataset is not None:
+            train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_distributed else None
+            train_loader = DataLoader(train_dataset, batch_size=batch_size,
+                                     shuffle=(train_sampler is None), sampler=train_sampler,
+                                     num_workers=num_workers, pin_memory=True, drop_last=True,
+                                     worker_init_fn=worker_init_fn)
+
+        if val_dataset is not None:
+            val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
+            val_loader = DataLoader(val_dataset, batch_size=batch_size,
+                                   shuffle=False, sampler=val_sampler,
+                                   num_workers=num_workers, pin_memory=True, drop_last=False,
+                                   worker_init_fn=worker_init_fn)
+
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
-
-        train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                                 shuffle=(train_sampler is None), sampler=train_sampler,
-                                 num_workers=num_workers, pin_memory=True, drop_last=True,
-                                 worker_init_fn=worker_init_fn)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size,
-                               shuffle=False, sampler=val_sampler,
-                               num_workers=num_workers, pin_memory=True, drop_last=False,
-                               worker_init_fn=worker_init_fn)
         test_loader = DataLoader(test_dataset, batch_size=batch_size,
                                 shuffle=False, sampler=test_sampler,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
@@ -357,8 +402,13 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
 
     if is_main:
         print(f"DataLoaders ready! Batch size: {batch_size}")
-        print(f" Batches → Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
+        active_loaders = ['Test']
+        if train_loader: active_loaders.append('Train')
+        if val_loader: active_loaders.append('Val')
+        print(f" Active Loaders: {', '.join(active_loaders)}")
+        print(f" Test Batches: {len(test_loader)}")
         print("="*70 + "\n")
+        
     return train_loader, val_loader, test_loader
 
 
@@ -692,9 +742,10 @@ def main():
         total = sum(p.numel() for p in ensemble.parameters())
         print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
+    # Simple Ensemble doesn't need training data, so we skip_train=True to save time/memory if dataset is large
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
+        is_distributed=(world_size > 1), seed=args.seed, is_main=is_main, skip_train=True)
 
     if is_main:
         print("\n" + "="*70)
