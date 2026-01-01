@@ -47,39 +47,35 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
-# ================== STACKING META LEARNER ==================
+# ================== STACKING META LEARNER (Logistic Regression) ==================
 class StackingMetaLearner(nn.Module):
     """
-    Meta-Learner for Stacking.
+    Meta-Learner for Stacking using Logistic Regression.
     Input: Logits from all base models (Batch_Size x Num_Models)
     Output: Final Score (Batch_Size x 1)
     """
-    def __init__(self, num_models: int, hidden_dim: int = 8):
+    def __init__(self, num_models: int):
         super().__init__()
-        # Simple neural network (MLP) to learn non-linear weighting
-        self.meta_net = nn.Sequential(
-            nn.Linear(num_models, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_dim, 1)
-        )
+        # Logistic Regression is simply a single Linear layer (without bias usually handled inside or explicitly added)
+        # We keep bias=True for standard Logistic Regression
+        self.linear = nn.Linear(num_models, 1)
 
     def forward(self, x):
         # x shape: (Batch, Num_Models)
-        return self.meta_net(x)
+        return self.linear(x)
 
 
 # ================== STACKING ENSEMBLE CLASS ==================
 class StackingEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
-                 stds: List[Tuple[float]], freeze_models: bool = True, hidden_dim: int = 8):
+                 stds: List[Tuple[float]], freeze_models: bool = True):
         super().__init__()
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
         
-        # Meta learner operating on model outputs
-        self.meta_learner = StackingMetaLearner(self.num_models, hidden_dim=hidden_dim)
+        # Meta learner operating on model outputs (Logistic Regression)
+        self.meta_learner = StackingMetaLearner(self.num_models)
 
         if freeze_models:
             for model in self.models:
@@ -108,13 +104,12 @@ class StackingEnsemble(nn.Module):
             # For compatibility with previous evaluation functions
             batch_size = x.size(0)
             
-            # Dummy uniform weights for compatibility (weights are dynamic in Stacking)
+            # Dummy uniform weights for compatibility (weights are dynamic/learned in Stacking)
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             
             return final_output, dummy_weights, dummy_memberships, stacked_logits
         else:
-            # FIX: Define dummy_weights here to avoid UnboundLocalError during training
             batch_size = x.size(0)
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             return final_output, dummy_weights
@@ -217,7 +212,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     sum_logits = torch.zeros(len(model_names), device=device)
 
     if is_main:
-        print(f"\nEvaluating {name} set (Stacking)...")
+        print(f"\nEvaluating {name} set (Stacking - Logistic Regression)...")
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
         outputs, weights, _, raw_logits = model(images, return_details=True)
@@ -238,13 +233,11 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_samples = stats[1].item()
         acc = 100. * total_correct / total_samples
         
-        # Convert logits to probabilities for better display
-        # Divide by number of batches/processors effectively to get mean
         avg_logits = (sum_logits / len(loader.sampler if hasattr(loader, 'sampler') else loader)).cpu().numpy()
         avg_probs = 1 / (1 + np.exp(-avg_logits)) # Sigmoid
 
         print(f"\n{'='*70}")
-        print(f"{name.upper()} SET RESULTS (Stacking)")
+        print(f"{name.upper()} SET RESULTS (Stacking - Logistic Regression)")
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Samples: {total_samples:,}")
@@ -262,10 +255,12 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
     """
-    Training function for Stacking
+    Training function for Stacking using Logistic Regression
     """
     os.makedirs(save_dir, exist_ok=True)
     meta_learner = ensemble_model.module.meta_learner if hasattr(ensemble_model, 'module') else ensemble_model.meta_learner
+    
+    # Optimizer only for the linear layer weights
     optimizer = torch.optim.AdamW(meta_learner.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
@@ -275,7 +270,7 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
 
     if is_main:
         print("="*70)
-        print("Training Stacking Meta-Learner")
+        print("Training Stacking Meta-Learner (Logistic Regression)")
         print("="*70)
         print(f"Trainable params: {sum(p.numel() for p in meta_learner.parameters()):,}")
         print(f"Epochs: {num_epochs} | Initial LR: {lr}")
@@ -294,8 +289,6 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
             
-            # Base models are run in no_grad implicitly by wrapper or we rely on freeze=True
-            # But we need gradients for meta learner
             outputs, _ = ensemble_model(images) # (Batch, 1)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
@@ -326,7 +319,7 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
 
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
-            save_path = os.path.join(save_dir, 'best_stacking.pt')
+            save_path = os.path.join(save_dir, 'best_stacking_lr.pt')
             torch.save({
                 'epoch': epoch + 1,
                 'meta_state_dict': meta_learner.state_dict(),
@@ -371,11 +364,11 @@ def cleanup_distributed():
 
 # ================== MAIN FUNCTION ==================
 def main():
-    parser = argparse.ArgumentParser(description="Stacking Ensemble Training")
+    parser = argparse.ArgumentParser(description="Stacking Ensemble Training with Logistic Regression")
     parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--lr', type=float, default=0.0001)
+    parser.add_argument('--lr', type=float, default=0.003)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--hidden_dim', type=int, default=8, help="Hidden layer size for meta learner")
+    # Removed hidden_dim argument
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
     parser.add_argument('--dataset', type=str, required=True,
@@ -396,7 +389,7 @@ def main():
 
     if is_main:
         print("="*70)
-        print(f"STACKING ENSEMBLE TRAINING")
+        print(f"STACKING ENSEMBLE TRAINING (Logistic Regression)")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
         print(f"Dataset: {args.dataset}")
@@ -415,8 +408,7 @@ def main():
 
     ensemble = StackingEnsemble(
         base_models, MEANS, STDS,
-        freeze_models=True,
-        hidden_dim=args.hidden_dim
+        freeze_models=True # Removed hidden_dim argument
     ).to(device)
 
     if world_size > 1:
@@ -455,7 +447,8 @@ def main():
         ensemble, train_loader, val_loader,
         args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
-    ckpt_path = os.path.join(args.save_dir, 'best_stacking.pt')
+    # Adjusted checkpoint name
+    ckpt_path = os.path.join(args.save_dir, 'best_stacking_lr.pt')
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         meta_learner = ensemble.module.meta_learner if hasattr(ensemble, 'module') else ensemble.meta_learner
@@ -477,12 +470,12 @@ def main():
         print("FINAL COMPARISON")
         print("="*70)
         print(f"Best Single Model: {best_single:.2f}%")
-        print(f"Stacking Accuracy: {ensemble_test_acc:.2f}%")
+        print(f"Stacking Accuracy (LR): {ensemble_test_acc:.2f}%")
         print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
 
         final_results = {
-            'method': 'Stacking',
+            'method': 'Stacking_LR',
             'best_single_model': {
                 'name': MODEL_NAMES[best_idx],
                 'accuracy': float(best_single)
@@ -495,12 +488,12 @@ def main():
             'training_history': history
         }
 
-        results_path = os.path.join(args.save_dir, 'final_results_stacking.json')
+        results_path = os.path.join(args.save_dir, 'final_results_stacking_lr.json')
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=4)
         print(f"\nResults saved: {results_path}")
 
-        final_model_path = os.path.join(args.save_dir, 'final_stacking_model.pt')
+        final_model_path = os.path.join(args.save_dir, 'final_stacking_lr_model.pt')
         torch.save({
             'ensemble_state_dict': ensemble_module.state_dict(),
             'meta_learner_state_dict': ensemble_module.meta_learner.state_dict(),
@@ -512,7 +505,6 @@ def main():
         print(f"Model saved: {final_model_path}")
 
         vis_dir = os.path.join(args.save_dir, 'visualizations')
-        # Stacking visualization logic is slightly different from Fuzzy, reusing generic function
         generate_visualizations(
             ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
             args.num_grad_cam_samples, args.num_lime_samples,
