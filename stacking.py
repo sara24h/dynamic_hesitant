@@ -56,8 +56,7 @@ class StackingMetaLearner(nn.Module):
     """
     def __init__(self, num_models: int):
         super().__init__()
-        # Logistic Regression is simply a single Linear layer (without bias usually handled inside or explicitly added)
-        # We keep bias=True for standard Logistic Regression
+        # Logistic Regression is simply a single Linear layer
         self.linear = nn.Linear(num_models, 1)
 
     def forward(self, x):
@@ -104,7 +103,7 @@ class StackingEnsemble(nn.Module):
             # For compatibility with previous evaluation functions
             batch_size = x.size(0)
             
-            # Dummy uniform weights for compatibility (weights are dynamic/learned in Stacking)
+            # Dummy uniform weights for compatibility
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             
@@ -207,34 +206,32 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     model.eval()
     total_correct = 0
     total_samples = 0
-    
-    # For Stacking, we don't have static weights, so we report average logits
-    sum_logits = torch.zeros(len(model_names), device=device)
 
     if is_main:
         print(f"\nEvaluating {name} set (Stacking - Logistic Regression)...")
+    
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
-        outputs, weights, _, raw_logits = model(images, return_details=True)
+        # Only need final output for accuracy
+        outputs, _ = model(images, return_details=False)
         
         pred = (outputs.squeeze(1) > 0).long()
         total_correct += pred.eq(labels.long()).sum().item()
         total_samples += labels.size(0)
-        
-        # Average raw logits per model over the batch
-        sum_logits += raw_logits.mean(dim=0).squeeze()
 
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-    dist.all_reduce(sum_logits, op=dist.ReduceOp.SUM)
 
     if is_main:
         total_correct = stats[0].item()
         total_samples = stats[1].item()
         acc = 100. * total_correct / total_samples
         
-        avg_logits = (sum_logits / len(loader.sampler if hasattr(loader, 'sampler') else loader)).cpu().numpy()
-        avg_probs = 1 / (1 + np.exp(-avg_logits)) # Sigmoid
+        # Extract Learned Weights from the Meta Learner
+        # Note: We extract weights ONCE, they are constant across samples
+        meta_learner = model.meta_learner
+        weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
+        bias = meta_learner.linear.bias.data.cpu().item()
 
         print(f"\n{'='*70}")
         print(f"{name.upper()} SET RESULTS (Stacking - Logistic Regression)")
@@ -242,14 +239,15 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Samples: {total_samples:,}")
         
-        print(f"\nAverage Model Logits (Sigmoid -> Prob):")
-        for i, mname in enumerate(model_names):
-            pred_label = "Real" if avg_probs[i] > 0.5 else "Fake"
-            print(f"  {i+1:2d}. {mname:<25}: Logit={avg_logits[i]:.4f} | Prob={avg_probs[i]:.4f} ({pred_label})")
+        print(f"\nMeta-Learner (Logistic Regression) Analysis:")
+        print(f"  Bias (Intercept): {bias:+.4f}")
+        print(f"  Learned Weights (Importance of each base model):")
+        for i, (w, mname) in enumerate(zip(weights, model_names)):
+            print(f"    {i+1:2d}. {mname:<25}: {w:+.4f}")
         
         print(f"{'='*70}")
-        return acc, avg_probs.tolist()
-    return 0.0, [0.0]*len(model_names)
+        return acc, weights.tolist(), bias
+    return 0.0, [0.0]*len(model_names), 0.0
 
 
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
@@ -365,10 +363,9 @@ def cleanup_distributed():
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Stacking Ensemble Training with Logistic Regression")
-    parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--lr', type=float, default=0.003)
+    parser.add_argument('--epochs', type=int, default=10) # Reduced from 30 to 10
+    parser.add_argument('--lr', type=float, default=0.01) # Increased LR slightly for faster convergence
     parser.add_argument('--batch_size', type=int, default=32)
-    # Removed hidden_dim argument
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
     parser.add_argument('--dataset', type=str, required=True,
@@ -408,7 +405,7 @@ def main():
 
     ensemble = StackingEnsemble(
         base_models, MEANS, STDS,
-        freeze_models=True # Removed hidden_dim argument
+        freeze_models=True
     ).to(device)
 
     if world_size > 1:
@@ -462,7 +459,8 @@ def main():
         print("="*70)
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
-    ensemble_test_acc, ensemble_probs = evaluate_ensemble_final_ddp(
+    # Use the FIXED evaluate function that returns weights
+    ensemble_test_acc, learned_weights, learned_bias = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
     if is_main:
@@ -482,7 +480,8 @@ def main():
             },
             'ensemble': {
                 'test_accuracy': float(ensemble_test_acc),
-                'average_probabilities': {name: float(p) for name, p in zip(MODEL_NAMES, ensemble_probs)}
+                'learned_weights': {name: float(w) for name, w in zip(MODEL_NAMES, learned_weights)},
+                'learned_bias': float(learned_bias)
             },
             'improvement': float(ensemble_test_acc - best_single),
             'training_history': history
