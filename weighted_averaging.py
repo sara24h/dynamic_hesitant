@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, Dataset
-from torch.utils.data.distributed import DistributedSampler  
+from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms, datasets
 import os
 from tqdm import tqdm
@@ -21,8 +21,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 warnings.filterwarnings("ignore")
 
+# LIME library imports
 from lime import lime_image
 from skimage.segmentation import mark_boundaries
+
 # ================== DATASET CLASSES ==================
 class UADFVDataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -213,14 +215,14 @@ class WeightedEnsemble(nn.Module):
                 for p in model.parameters():
                     p.requires_grad = False
         
-        
+        # مهم: مطمئن میشویم که خود وزن‌ها قابل آموزش هستند
         self.raw_weights.requires_grad = True
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         outputs = []
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            with torch.no_grad(): 
+            with torch.no_grad(): # مدل‌ها گرادیان نمی‌گیرند
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
@@ -233,7 +235,6 @@ class WeightedEnsemble(nn.Module):
         weights = F.softmax(self.raw_weights, dim=0)
 
         # Weighted Average
-        # (Batch, NumModels) * (NumModels) -> Sum over dim 1 -> (Batch, 1)
         final_output = (stacked_outputs * weights.unsqueeze(0)).sum(dim=1, keepdim=True)
 
         if return_details:
@@ -523,8 +524,14 @@ def train_ensemble_weights(model, train_loader, val_loader, device, epochs, lr, 
         print("="*70)
         print(f"Epochs: {epochs} | Learning Rate: {lr}")
     
+    # اصلاح مهم: اگر مدل DDP است، باید از module استفاده کنیم
+    if isinstance(model, DDP):
+        raw_weights_param = model.module.raw_weights
+    else:
+        raw_weights_param = model.raw_weights
+
     # فقط پارامترهای raw_weights را بهOptimizer می‌دهیم
-    optimizer = torch.optim.Adam([model.raw_weights], lr=lr)
+    optimizer = torch.optim.Adam([raw_weights_param], lr=lr)
     criterion = nn.BCEWithLogitsLoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=is_main)
 
@@ -532,15 +539,20 @@ def train_ensemble_weights(model, train_loader, val_loader, device, epochs, lr, 
 
     for epoch in range(epochs):
         model.train()
-        # Important: Set requires_grad for weights explicitly (though already done in __init__)
-        model.raw_weights.requires_grad = True
+        
+        # مطمئن میشویم فقط وزن‌ها گرادیان می‌گیرند
+        raw_weights_param.requires_grad = True
         for p in model.parameters():
-            if p is not model.raw_weights:
+            if p is not raw_weights_param:
                 p.requires_grad = False
 
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
+
+        # Set sampler epoch for distributed training consistency
+        if hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
 
         # Training Loop
         if is_main:
@@ -583,17 +595,15 @@ def train_ensemble_weights(model, train_loader, val_loader, device, epochs, lr, 
             avg_train_acc = 100. * total_correct / total_samples
             print(f"Epoch {epoch+1}/{epochs} -> Train Loss: {avg_train_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
             
-            # Save best weights logic could go here
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                # torch.save(model.raw_weights.data, 'best_weights.pth')
 
     if is_main:
         print("="*70)
         print("Weight Training Completed.")
         print(f"Best Validation Accuracy during training: {best_val_acc:.2f}%")
         # نمایش وزن‌های نهایی آموخته شده
-        final_weights = F.softmax(model.raw_weights, dim=0).detach().cpu().numpy()
+        final_weights = F.softmax(raw_weights_param, dim=0).detach().cpu().numpy()
         print(f"Final Learned Weights: {final_weights}")
         print("="*70)
 
@@ -785,7 +795,8 @@ def setup_distributed():
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
-        
+
+
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Weighted Average Ensemble Evaluation with Training")
