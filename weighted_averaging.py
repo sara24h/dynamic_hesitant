@@ -206,7 +206,6 @@ class WeightedEnsemble(nn.Module):
         self.normalizations = MultiModelNormalization(means, stds)
 
         # Initialize learnable weights
-        # با صفر شروع میکنیم تا در ابتدا uniform باشند
         self.raw_weights = nn.Parameter(torch.zeros(self.num_models))
 
         if freeze_models:
@@ -222,19 +221,14 @@ class WeightedEnsemble(nn.Module):
         outputs = []
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            with torch.no_grad(): # مدل‌ها گرادیان نمی‌گیرند
+            with torch.no_grad(): 
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
             outputs.append(out)
 
-        # Stack: (Batch, NumModels)
         stacked_outputs = torch.cat(outputs, dim=1)
-
-        # محاسبه وزن‌ها با Softmax
         weights = F.softmax(self.raw_weights, dim=0)
-
-        # Weighted Average
         final_output = (stacked_outputs * weights.unsqueeze(0)).sum(dim=1, keepdim=True)
 
         if return_details:
@@ -248,15 +242,21 @@ class WeightedEnsemble(nn.Module):
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     try:
+        # تلاش برای ایمپورت مدل اصلی شما
         from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
+        use_placeholder = False
     except ImportError:
+        if is_main:
+            print("[WARNING] model.ResNet_pruned not found. Using torchvision ResNet50 as placeholder.")
+        use_placeholder = True
+    
+    if use_placeholder:
         try:
             from torchvision import models
-            print("[WARNING] model.ResNet_pruned not found, using torchvision ResNet50 as placeholder.")
             class MockPrunedResNet(nn.Module):
                 def __init__(self):
                     super().__init__()
-                    self.resnet = models.resnet50(pretrained=True)
+                    self.resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
                     self.layer4 = self.resnet.layer4 
                 
                 def forward(self, x):
@@ -269,7 +269,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
                 models_list.append(m)
             return models_list
         except Exception as e:
-            raise ImportError(f"Cannot import ResNet_50_pruned_hardfakevsreal or torchvision: {e}")
+            raise ImportError(f"Cannot import torchvision: {e}")
 
     models = []
     if is_main:
@@ -533,7 +533,9 @@ def train_ensemble_weights(model, train_loader, val_loader, device, epochs, lr, 
     # فقط پارامترهای raw_weights را بهOptimizer می‌دهیم
     optimizer = torch.optim.Adam([raw_weights_param], lr=lr)
     criterion = nn.BCEWithLogitsLoss()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=is_main)
+    
+    # اصلاح ارور: حذف پارامتر verbose برای سازگاری با PyTorch جدید
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
 
     best_val_acc = 0.0
 
@@ -621,7 +623,6 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         batch = batch.to(device)
         with torch.no_grad():
             out = model(batch)
-            # Robust check for Tuple output (Hesitant Fuzzy) vs Tensor output (Weighted Ensemble)
             if isinstance(out, (tuple, list)):
                 logits = out[0]
             else:
@@ -693,16 +694,13 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
         # ---------- GradCAM ----------
         if idx < num_gradcam:
             try:
-                # For weighted ensemble, all models contribute, but weighted
                 active_models = list(range(len(local_ensemble.models))) 
                 combined_cam = None
                 for i in active_models:
                     model = local_ensemble.models[i]
-                    # Accessing last conv layer (assuming ResNet-like structure)
                     try:
                         target_layer = model.layer4[2].conv3
                     except AttributeError:
-                        # Fallback for torchvision models if using placeholder
                         target_layer = model.resnet.layer4[2].conv3
 
                     gradcam = GradCAM(model, target_layer)
