@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, Dataset
+from torch.utils.data.distributed import DistributedSampler  
 from torchvision import transforms, datasets
 import os
 from tqdm import tqdm
@@ -20,10 +21,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 warnings.filterwarnings("ignore")
 
-# LIME library imports
 from lime import lime_image
 from skimage.segmentation import mark_boundaries
-
 # ================== DATASET CLASSES ==================
 class UADFVDataset(Dataset):
     def __init__(self, root_dir, transform=None):
