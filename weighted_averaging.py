@@ -236,8 +236,9 @@ class WeightedEnsemble(nn.Module):
             weights_matrix = weights.unsqueeze(0).expand(batch_size, -1)
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             return final_output, weights_matrix, dummy_memberships, stacked_outputs
-
-        return final_output, weights_matrix
+        
+        # اصلاح ارور UnboundLocalError: فقط در این حالت نرمال خروجی می‌دهیم
+        return final_output, weights.unsqueeze(0).expand(x.size(0), -1)
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
@@ -524,7 +525,7 @@ def train_ensemble_weights(model, train_loader, val_loader, device, epochs, lr, 
         print("="*70)
         print(f"Epochs: {epochs} | Learning Rate: {lr}")
     
-    # اصلاح مهم: اگر مدل DDP است، باید از module استفاده کنیم
+    # اگر مدل DDP است، باید از module استفاده کنیم
     if isinstance(model, DDP):
         raw_weights_param = model.module.raw_weights
     else:
