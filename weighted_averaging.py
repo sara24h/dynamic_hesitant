@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, Dataset
-from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms, datasets
 import os
 from tqdm import tqdm
@@ -10,7 +9,6 @@ import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
 import warnings
 import argparse
-import shutil
 import json
 import random
 from sklearn.model_selection import train_test_split
@@ -22,6 +20,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 warnings.filterwarnings("ignore")
 
+# LIME library imports
 from lime import lime_image
 from skimage.segmentation import mark_boundaries
 
@@ -205,8 +204,8 @@ class WeightedEnsemble(nn.Module):
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
 
-        # Initialize learnable weights. 
-        # We initialize them to zeros so softmax results in uniform weights (1/num_models) initially.
+        # Initialize learnable weights
+        # با صفر شروع میکنیم تا در ابتدا uniform باشند
         self.raw_weights = nn.Parameter(torch.zeros(self.num_models))
 
         if freeze_models:
@@ -214,13 +213,15 @@ class WeightedEnsemble(nn.Module):
                 model.eval()
                 for p in model.parameters():
                     p.requires_grad = False
+        
+        
+        self.raw_weights.requires_grad = True
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        # Collect outputs from all models
         outputs = []
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            with torch.no_grad():
+            with torch.no_grad(): 
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
@@ -229,19 +230,16 @@ class WeightedEnsemble(nn.Module):
         # Stack: (Batch, NumModels)
         stacked_outputs = torch.cat(outputs, dim=1)
 
-        # Calculate weights using Softmax to ensure they sum to 1
-        # Shape: (NumModels)
+        # محاسبه وزن‌ها با Softmax
         weights = F.softmax(self.raw_weights, dim=0)
 
-        # Weighted Average Calculation
+        # Weighted Average
         # (Batch, NumModels) * (NumModels) -> Sum over dim 1 -> (Batch, 1)
         final_output = (stacked_outputs * weights.unsqueeze(0)).sum(dim=1, keepdim=True)
 
         if return_details:
             batch_size = x.size(0)
-            # Broadcast weights to (Batch, NumModels) for return consistency
             weights_matrix = weights.unsqueeze(0).expand(batch_size, -1)
-            # Dummy memberships to match original signature
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             return final_output, weights_matrix, dummy_memberships, stacked_outputs
 
@@ -252,7 +250,26 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
     try:
         from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     except ImportError:
-        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
+        try:
+            from torchvision import models
+            print("[WARNING] model.ResNet_pruned not found, using torchvision ResNet50 as placeholder.")
+            class MockPrunedResNet(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.resnet = models.resnet50(pretrained=True)
+                    self.layer4 = self.resnet.layer4 
+                
+                def forward(self, x):
+                    return self.resnet(x)
+            
+            models_list = []
+            for _ in model_paths:
+                m = MockPrunedResNet().to(device).eval()
+                for p in m.parameters(): p.requires_grad = False
+                models_list.append(m)
+            return models_list
+        except Exception as e:
+            raise ImportError(f"Cannot import ResNet_50_pruned_hardfakevsreal or torchvision: {e}")
 
     models = []
     if is_main:
@@ -496,6 +513,94 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     return 0.0, [0.0]*len(model_names), [0.0]*len(model_names)
 
 
+# ================== TRAINING FUNCTION ==================
+def train_ensemble_weights(model, train_loader, val_loader, device, epochs, lr, is_main=True):
+    """
+    فقط وزن‌های ensemble را آموزش می‌دهد (مدل‌های پایه فریز هستند).
+    """
+    if is_main:
+        print("="*70)
+        print("TRAINING ENSEMBLE WEIGHTS (Meta-Learning)")
+        print("="*70)
+        print(f"Epochs: {epochs} | Learning Rate: {lr}")
+    
+    # فقط پارامترهای raw_weights را بهOptimizer می‌دهیم
+    optimizer = torch.optim.Adam([model.raw_weights], lr=lr)
+    criterion = nn.BCEWithLogitsLoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=is_main)
+
+    best_val_acc = 0.0
+
+    for epoch in range(epochs):
+        model.train()
+        # Important: Set requires_grad for weights explicitly (though already done in __init__)
+        model.raw_weights.requires_grad = True
+        for p in model.parameters():
+            if p is not model.raw_weights:
+                p.requires_grad = False
+
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+
+        # Training Loop
+        if is_main:
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
+        else:
+            pbar = train_loader
+
+        for images, labels in pbar:
+            images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
+            
+            optimizer.zero_grad()
+            
+            # Forward pass
+            outputs, _ = model(images)
+            
+            # Calculate Loss
+            loss = criterion(outputs, labels)
+            
+            # Backward pass & Optimize (فقط روی وزن‌ها اعمال می‌شود)
+            loss.backward()
+            optimizer.step()
+
+            # Statistics
+            total_loss += loss.item() * images.size(0)
+            preds = (torch.sigmoid(outputs) > 0.5).long()
+            total_correct += (preds == labels.long()).sum().item()
+            total_samples += images.size(0)
+
+            if is_main:
+                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*total_correct/total_samples:.2f}%'})
+
+        # Validation
+        val_acc = evaluate_accuracy_ddp(model, val_loader, device)
+        
+        # Update Scheduler
+        scheduler.step(val_acc)
+
+        if is_main:
+            avg_train_loss = total_loss / len(train_loader.dataset)
+            avg_train_acc = 100. * total_correct / total_samples
+            print(f"Epoch {epoch+1}/{epochs} -> Train Loss: {avg_train_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
+            
+            # Save best weights logic could go here
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                # torch.save(model.raw_weights.data, 'best_weights.pth')
+
+    if is_main:
+        print("="*70)
+        print("Weight Training Completed.")
+        print(f"Best Validation Accuracy during training: {best_val_acc:.2f}%")
+        # نمایش وزن‌های نهایی آموخته شده
+        final_weights = F.softmax(model.raw_weights, dim=0).detach().cpu().numpy()
+        print(f"Final Learned Weights: {final_weights}")
+        print("="*70)
+
+    return model
+
+
 # ================== LIME EXPLANATION ==================
 def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256)):
     img_np = image_tensor[0].cpu().permute(1, 2, 0).numpy()
@@ -506,8 +611,14 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         batch = torch.from_numpy(images.transpose(0, 3, 1, 2)).float() / 255.0
         batch = batch.to(device)
         with torch.no_grad():
-            outputs, _ = model(batch)
-            probs = torch.sigmoid(outputs).cpu().numpy()
+            out = model(batch)
+            # Robust check for Tuple output (Hesitant Fuzzy) vs Tensor output (Weighted Ensemble)
+            if isinstance(out, (tuple, list)):
+                logits = out[0]
+            else:
+                logits = out
+            
+            probs = torch.sigmoid(logits).cpu().numpy()
         return np.hstack([1 - probs, probs])
 
     explanation = explainer.explain_instance(
@@ -578,7 +689,13 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
                 combined_cam = None
                 for i in active_models:
                     model = local_ensemble.models[i]
-                    target_layer = model.layer4[2].conv3
+                    # Accessing last conv layer (assuming ResNet-like structure)
+                    try:
+                        target_layer = model.layer4[2].conv3
+                    except AttributeError:
+                        # Fallback for torchvision models if using placeholder
+                        target_layer = model.resnet.layer4[2].conv3
+
                     gradcam = GradCAM(model, target_layer)
 
                     x_n = local_ensemble.normalizations(image, i)
@@ -669,11 +786,10 @@ def setup_distributed():
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
-
-
+        
 # ================== MAIN FUNCTION ==================
 def main():
-    parser = argparse.ArgumentParser(description="Weighted Average Ensemble Evaluation")
+    parser = argparse.ArgumentParser(description="Weighted Average Ensemble Evaluation with Training")
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
@@ -682,8 +798,13 @@ def main():
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
-    parser.add_argument('--save_dir', type=str, default='./output')
+    parser.add_argument('--save_dir', type=str, default='./output_weighted')
     parser.add_argument('--seed', type=int, default=42)
+    
+    # Weight Training Arguments
+    parser.add_argument('--train_weights_epochs', type=int, default=10, help="Epochs to train ensemble weights")
+    parser.add_argument('--train_weights_lr', type=float, default=0.01, help="Learning rate for weight optimization")
+    
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
@@ -726,9 +847,29 @@ def main():
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
 
+    # ============================================================
+    #   WEIGHT TRAINING SECTION
+    # ============================================================
+    
+    # تبدیل به DDP اگر توزیع شده است
+    if world_size > 1:
+        ensemble = DDP(ensemble, device_ids=[local_rank], find_unused_parameters=True)
+    
+    # شروع آموزش وزن‌ها
+    ensemble = train_ensemble_weights(
+        ensemble, train_loader, val_loader, device, 
+        epochs=args.train_weights_epochs, 
+        lr=args.train_weights_lr, 
+        is_main=is_main
+    )
+    
+    # ============================================================
+    #   END WEIGHT TRAINING
+    # ============================================================
+
     if is_main:
         print("\n" + "="*70)
-        print("INDIVIDUAL MODEL PERFORMANCE")
+        print("INDIVIDUAL MODEL PERFORMANCE (For Reference)")
         print("="*70)
 
     individual_accs = []
@@ -745,10 +886,9 @@ def main():
     if is_main:
         print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
         print("="*70)
-        print("\nSkipping training phase (Weights initialized uniformly, set to trainable if needed).")
-        print("Proceeding directly to evaluation...\n")
+        print("\nProceeding to final evaluation with learned weights...\n")
 
-    # Directly evaluate without training
+    # Evaluate
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
     if is_main:
@@ -769,7 +909,7 @@ def main():
         print("="*70)
 
         final_results = {
-            'method': 'Weighted Average Ensemble',
+            'method': 'Weighted Average Ensemble (Learned Weights)',
             'best_single_model': {
                 'name': MODEL_NAMES[best_idx],
                 'accuracy': float(best_single)
@@ -782,7 +922,6 @@ def main():
             'improvement': float(ensemble_test_acc - best_single)
         }
 
-
         os.makedirs(args.save_dir, exist_ok=True)
         results_path = os.path.join(args.save_dir, 'final_results_weighted_ensemble.json')
         with open(results_path, 'w') as f:
@@ -790,7 +929,6 @@ def main():
         print(f"\nResults saved: {results_path}")
 
         final_model_path = os.path.join(args.save_dir, 'weighted_ensemble_model_info.json')
-        # Extract raw weights if needed, here we save normalized weights from eval
         with open(final_model_path, 'w') as f:
             json.dump({
                 'model_names': MODEL_NAMES,
