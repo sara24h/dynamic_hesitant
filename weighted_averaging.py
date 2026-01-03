@@ -186,6 +186,8 @@ class GradCAM:
         return cam.squeeze().cpu().numpy()
 
 
+# ================== UPDATED MULTI MODEL NORMALIZATION ==================
+# This logic is copied from the Fuzzy code to ensure consistency
 class MultiModelNormalization(nn.Module):
     def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
         super().__init__()
@@ -410,30 +412,50 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
     return train_loader, val_loader, test_loader
 
 
-# ================== EVALUATION FUNCTIONS ==================
+# ================== UPDATED EVALUATION FUNCTION ==================
+# این تابع دقیقاً با منطق کد دوم جایگزین شده است
 @torch.no_grad()
 def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device,
                               name: str, mean: Tuple[float, float, float],
                               std: Tuple[float, float, float], is_main: bool) -> float:
+    """
+    ارزیابی دقت یک مدل تکی با نرمال‌سازی اختصاصی آن مدل.
+    منطق مطابق با کد Fuzzy Hesitant Ensemble.
+    """
     model.eval()
+    # ایجاد نرمالایزر مخصوص این مدل با توجه به mean و std آن
     normalizer = MultiModelNormalization([mean], [std]).to(device)
+    
     correct = 0
     total = 0
+    
+    # پیمایش روی دیتا لودر
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
+        
+        # اعمال نرمال‌سازی دقیقاً مثل کد دوم
         images = normalizer(images, 0)
+        
+        # پیش‌بینی مدل
         out = model(images)
         if isinstance(out, (tuple, list)):
             out = out[0]
+            
+        # محاسبه دقت (تطابق با 0.5 Threshold)
         pred = (out.squeeze(1) > 0).long()
         total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
+    # همگام‌سازی در محیط DDP (Distributed)
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        
     acc = 100. * correct_tensor.item() / total_tensor.item()
+    
     if is_main:
         print(f" {name}: {acc:.2f}%")
     return acc
