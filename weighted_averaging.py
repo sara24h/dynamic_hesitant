@@ -321,10 +321,10 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
             save_path = os.path.join(save_dir, 'best_weighted_ensemble.pt')
-            # Save the weights specifically if needed, or the whole state dict
+            # Save the weights directly (not state_dict, because it's a Parameter)
             torch.save({
                 'epoch': epoch + 1,
-                'weights_state_dict': weights_param.state_dict(),
+                'weights': weights_param.data.cpu(),
                 'val_acc': val_acc,
                 'history': history
             }, save_path)
@@ -379,7 +379,6 @@ def main():
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
     parser.add_argument('--seed', type=int, default=42)
-    # Removed fuzzy specific arguments: num_memberships, cum_weight_threshold, hesitancy_threshold
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
@@ -404,10 +403,6 @@ def main():
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     # Adjust means/stds to number of models
     if len(args.model_paths) > len(MEANS):
-        # If more models than provided means/stds, cycle or use defaults. 
-        # Here assuming we extend the list logic if needed, but usually fixed.
-        # For safety, we'll just repeat the last one or handle error.
-        # For this snippet, we assume user provides matching counts or default list covers it.
         MEANS = MEANS * (len(args.model_paths) // len(MEANS) + 1)
         STDS = STDS * (len(args.model_paths) // len(STDS) + 1)
         
@@ -462,11 +457,11 @@ def main():
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         
-        # Load weights
+        # Load weights directly using data.copy_
         if hasattr(ensemble, 'module'):
-            ensemble.module.weights.load_state_dict(ckpt['weights_state_dict'])
+            ensemble.module.weights.data.copy_(ckpt['weights'])
         else:
-            ensemble.weights.load_state_dict(ckpt['weights_state_dict'])
+            ensemble.weights.data.copy_(ckpt['weights'])
             
         if is_main:
             print("Best model weights loaded.\n")
