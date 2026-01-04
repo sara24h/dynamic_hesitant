@@ -7,20 +7,13 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 import torch.nn.functional as F
-
-# کتابخانه‌های مورد نیاز برای Grad-CAM
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.model_targets import BinaryClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
-
-# --- فقط کلاس مدل اصلی خود را وارد کنید ---
-# مطمئن شوید این مسیر صحیح است
 from model.pruned_model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
 
 def visualize_grad_cam(model, image_tensor, target_layers, class_index, mean, std):
-    """
-    نمایش Grad-CAM برای یک مدل و یک تصویر خاص.
-    """
+   
     model.eval()
     input_tensor = image_tensor.unsqueeze(0)
     
@@ -32,13 +25,9 @@ def visualize_grad_cam(model, image_tensor, target_layers, class_index, mean, st
     # اجرای Grad-CAM
     grayscale_cam = cam(input_tensor=input_tensor, targets=targets, eigen_smooth=True)
     grayscale_cam = grayscale_cam[0, :]
-    
-    # --- بخش اصلاح شده برای نمایش بهتر تصویر ---
-    # 1. تبدیل تنسور نرمال‌شده به numpy
+
     normalized_img = image_tensor.cpu().numpy()
     
-    # 2. دِنورمالایز کردن تصویر برای نمایش
-    # فرمول: (img * std) + mean
     denormalized_img = np.transpose(normalized_img, (1, 2, 0)) # به [H, W, C] تبدیل کن
     denormalized_img = denormalized_img * std + mean
     denormalized_img = np.clip(denormalized_img, 0, 1) # مقادیر را بین 0 و 1 محدود کن
@@ -60,7 +49,6 @@ def visualize_grad_cam(model, image_tensor, target_layers, class_index, mean, st
     plt.title(f'Grad-CAM for Class {"Real" if class_index == 1 else "Fake"}')
     plt.axis('off')
     
-    # *** اضافه کردن این خط برای ذخیره تصویر ***
     plt.savefig('grad_cam_result.png')
     
     plt.show()
@@ -96,8 +84,8 @@ def main():
     target_layers = [model.layer4[-1]]
     print(f"Target layer for Grad-CAM: {target_layers[0]}")
 
-    MODEL_MEAN = (0.4868, 0.3972, 0.3624)
-    MODEL_STD = (0.2296, 0.2066, 0.2009)
+    MODEL_MEAN = (0.4460, 0.3622, 0.3416)
+    MODEL_STD = (0.2057, 0.1849, 0.1761)
 
     transform = transforms.Compose([
         transforms.Resize(256),
