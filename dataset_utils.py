@@ -41,11 +41,7 @@ class UADFVDataset(Dataset):
 
 
 class DFDDataset(Dataset):
-    """
-    برای دیتاست جدید (DFD) با ساختار:
-    root/train/fake_train_00000/img.jpg
-    root/train/real_train_00000/img.jpg
-    """
+   
     def __init__(self, root_dir, split='train', transform=None):
         self.root_dir = root_dir
         self.split = split
@@ -169,17 +165,12 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
 
 
 def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    """
-    منطق تقسیم‌بندی برای DFD (پوشه های fake_train_00000)
-    """
+   
     all_video_ids = set()
     
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
-        
-        # منطق DFD: حذف پیشوند (fake_ یا real_) تا ID استخراج شود
-        # مثال: fake_train_00000 -> ID: train_00000
-        # مثال: real_train_00000 -> ID: train_00000
+ 
         
         vid_id = dir_name
         if vid_id.startswith('fake_'):
@@ -420,9 +411,11 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
             train_dataset = Subset(full_dataset, train_indices)
             val_dataset = Subset(full_dataset, val_indices)
             test_dataset = Subset(full_dataset, test_indices)
-            train_dataset.dataset.transform = train_transform
-            val_dataset.dataset.transform = val_test_transform
-            test_dataset.dataset.transform = val_test_transform
+            # این جایگزین بخش اعمال Transform ها در کد شما شود
+        # برای همه دیتاست‌های لیستی (UADFV, DFD, etc.)
+            train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
+            val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
+            test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
         else:
             # برای DFD و سایر دیتاست‌ها از TransformSubset استفاده می‌کنیم
             # چون ImageFolder و DFDDataset در Subset معمولی ترنسفرم را به درستی هندل نمی‌کنند
