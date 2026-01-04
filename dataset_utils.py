@@ -40,6 +40,54 @@ class UADFVDataset(Dataset):
         return image, label
 
 
+class DFDDataset(Dataset):
+    """
+    برای دیتاست جدید (DFD) با ساختار:
+    root/train/fake_train_00000/img.jpg
+    root/train/real_train_00000/img.jpg
+    """
+    def __init__(self, root_dir, split='train', transform=None):
+        self.root_dir = root_dir
+        self.split = split
+        self.transform = transform
+        self.samples = []
+        self.classes = ['fake', 'real']
+        self.class_to_idx = {'fake': 0, 'real': 1}
+
+        split_dir = os.path.join(root_dir, split)
+        if not os.path.exists(split_dir):
+            raise FileNotFoundError(f"Directory not found: {split_dir}")
+
+        for video_folder in os.listdir(split_dir):
+            video_path = os.path.join(split_dir, video_folder)
+            
+            if not os.path.isdir(video_path):
+                continue
+            
+            # تشخیص لیبل از نام پوشه
+            if 'fake' in video_folder.lower():
+                label = 0
+            elif 'real' in video_folder.lower():
+                label = 1
+            else:
+                continue
+
+            for img_file in os.listdir(video_path):
+                if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    img_path = os.path.join(video_path, img_file)
+                    self.samples.append((img_path, label))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
 class TransformSubset(Subset):
     """Subset with custom transform"""
     def __init__(self, dataset, indices, transform):
@@ -69,6 +117,7 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
         
+        # منطق UADFV: حذف _fake از انتهای نام
         if '_fake' in dir_name:
             video_id = dir_name.replace('_fake', '')
         else:
@@ -119,6 +168,79 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
     return train_indices, val_indices, test_indices
 
 
+def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    """
+    منطق تقسیم‌بندی برای DFD (پوشه های fake_train_00000)
+    """
+    all_video_ids = set()
+    
+    for img_path, label in dataset.samples:
+        dir_name = os.path.basename(os.path.dirname(img_path))
+        
+        # منطق DFD: حذف پیشوند (fake_ یا real_) تا ID استخراج شود
+        # مثال: fake_train_00000 -> ID: train_00000
+        # مثال: real_train_00000 -> ID: train_00000
+        
+        vid_id = dir_name
+        if vid_id.startswith('fake_'):
+            vid_id = vid_id.replace('fake_', '', 1)
+        elif vid_id.startswith('real_'):
+            vid_id = vid_id.replace('real_', '', 1)
+        elif '_fake' in vid_id: # پشتیبانی از حالت‌ دیگر
+            vid_id = vid_id.replace('_fake', '_')
+        elif '_real' in vid_id:
+            vid_id = vid_id.replace('_real', '_')
+            
+        all_video_ids.add(vid_id)
+
+    all_video_ids = sorted(list(all_video_ids))
+    print(f"[Split] Found {len(all_video_ids)} unique video IDs.")
+
+    train_val_ids, test_ids = train_test_split(
+        all_video_ids,
+        test_size=test_ratio,
+        random_state=seed
+    )
+    
+    val_size_adjusted = val_ratio / (train_ratio + val_ratio)
+    train_ids, val_ids = train_test_split(
+        train_val_ids,
+        test_size=val_size_adjusted,
+        random_state=seed
+    )
+    
+    print(f"[Split] Videos -> Train: {len(train_ids)}, Val: {len(val_ids)}, Test: {len(test_ids)}")
+
+    train_indices = []
+    val_indices = []
+    test_indices = []
+    
+    for idx, (img_path, label) in enumerate(dataset.samples):
+        dir_name = os.path.basename(os.path.dirname(img_path))
+        
+        vid_id = dir_name
+        if vid_id.startswith('fake_'):
+            vid_id = vid_id.replace('fake_', '', 1)
+        elif vid_id.startswith('real_'):
+            vid_id = vid_id.replace('real_', '', 1)
+        elif '_fake' in vid_id:
+            vid_id = vid_id.replace('_fake', '_')
+        elif '_real' in vid_id:
+            vid_id = vid_id.replace('_real', '_')
+            
+        if vid_id in test_ids:
+            test_indices.append(idx)
+        elif vid_id in val_ids:
+            val_indices.append(idx)
+        elif vid_id in train_ids:
+            train_indices.append(idx)
+        else:
+            print(f"[Warning] Video ID {vid_id} not found in splits!")
+            
+    print(f"[Split] Frames -> Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
+    return train_indices, val_indices, test_indices
+
+
 def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     num_samples = len(dataset)
@@ -149,6 +271,14 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = UADFVDataset(base_dir, transform=temp_transform)
         print("[Dataset Loading] UADFVDataset loaded.")
+
+    elif dataset_type == 'dfd':
+        if not os.path.exists(base_dir):
+            raise FileNotFoundError(f"DFD dataset directory not found: {base_dir}")
+        # فرض بر این است که پوشه train حاوی داده‌های اصلی است یا ترکیبی از همه
+        temp_transform = transforms.Compose([transforms.ToTensor()])
+        full_dataset = DFDDataset(base_dir, split='train', transform=temp_transform)
+        print("[Dataset Loading] DFDDataset loaded.")
         
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
@@ -170,31 +300,40 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
 
-    # 2. Structure Detection Logic (Same as Fuzzy)
-    sample_path = full_dataset.samples[0][0]
-    immediate_parent = os.path.basename(os.path.dirname(sample_path))
-    
-    is_video_structure = immediate_parent not in full_dataset.classes
+    # 2. Structure Detection Logic
+    # اگر دیتاست UADFV یا DFD است، ساختار ویدئویی فرض می‌شود
+    is_video_structure = False
+    if dataset_type in ['uadfV', 'dfd']:
+        is_video_structure = True
+    else:
+        # برای دیتاست‌های دیگر تشخیص خودکار
+        sample_path = full_dataset.samples[0][0]
+        immediate_parent = os.path.basename(os.path.dirname(sample_path))
+        is_video_structure = immediate_parent not in full_dataset.classes
 
-    print(f"[Structure Detection] Parent of image: '{immediate_parent}' | Classes: {full_dataset.classes}")
+    print(f"[Structure Detection] Video Level: {is_video_structure}")
     
     if is_video_structure:
         print("[Structure Decision] >> Detected VIDEO/NESTED structure. Using Video-Level Split.")
-        train_indices, val_indices, test_indices = create_video_level_uadfV_split(
-            full_dataset, 
-            train_ratio=0.7, 
-            val_ratio=0.15, 
-            test_ratio=0.15, 
-            seed=seed
-        )
+        if dataset_type == 'uadfV':
+            train_indices, val_indices, test_indices = create_video_level_uadfV_split(
+                full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
+            )
+        elif dataset_type == 'dfd':
+            train_indices, val_indices, test_indices = create_video_level_dfd_split(
+                full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
+            )
+        else:
+            # Fallback for other video structures (like wild dataset if needed)
+            # در اینجا می‌توان از متد استاندارد استفاده کرد یا یک متد عمومی ویدئویی نوشت
+            # فعلاً برای اطمینان از استاندارد استفاده می‌کنیم
+            train_indices, val_indices, test_indices = create_standard_reproducible_split(
+                full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
+            )
     else:
         print("[Structure Decision] >> Detected FLAT IMAGE structure. Using Standard Stratified Split.")
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
-            full_dataset, 
-            train_ratio=0.7, 
-            val_ratio=0.15, 
-            test_ratio=0.15, 
-            seed=seed
+            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
         )
         
     return full_dataset, train_indices, val_indices, test_indices
@@ -275,7 +414,9 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
             print(f" Valid: {len(val_indices):,} ({len(val_indices)/len(full_dataset)*100:.1f}%)")
             print(f" Test: {len(test_indices):,} ({len(test_indices)/len(full_dataset)*100:.1f}%)\n")
 
+        # اعمال Transform ها
         if dataset_type == 'uadfV':
+            # UADFV خودش کلاس Dataset سفارشی دارد و مستقیماً ترنسفرم را قبول می‌کند
             train_dataset = Subset(full_dataset, train_indices)
             val_dataset = Subset(full_dataset, val_indices)
             test_dataset = Subset(full_dataset, test_indices)
@@ -283,6 +424,8 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
             val_dataset.dataset.transform = val_test_transform
             test_dataset.dataset.transform = val_test_transform
         else:
+            # برای DFD و سایر دیتاست‌ها از TransformSubset استفاده می‌کنیم
+            # چون ImageFolder و DFDDataset در Subset معمولی ترنسفرم را به درستی هندل نمی‌کنند
             train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
             val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
             test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
