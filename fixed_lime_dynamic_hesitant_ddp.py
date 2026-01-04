@@ -463,8 +463,9 @@ def main():
     parser.add_argument('--num_memberships', type=int, default=3)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
+    # تغییر ۱: اضافه کردن 'dfd' به choices
     parser.add_argument('--dataset', type=str, required=True,
-                       choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV'])
+                       choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV', 'dfd'])
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
     parser.add_argument('--data_dir', type=str, required=True)
@@ -492,8 +493,18 @@ def main():
         print(f"Models: {len(args.model_paths)}")
         print("="*70 + "\n")
 
-    MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
-    STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+    MEANS = [
+        (0.5207, 0.4258, 0.3806),  # Model 1
+        (0.4460, 0.3622, 0.3416),  # Model 2
+        (0.4668, 0.3816, 0.3414),  # Model 3
+    ]
+    
+    STDS = [
+        (0.2490, 0.2239, 0.2212),  # Model 1
+        (0.2057, 0.1849, 0.1761),  # Model 2
+        (0.2410, 0.2161, 0.2081),  # Model 3
+    ]
+    
     MEANS = MEANS[:len(args.model_paths)]
     STDS = STDS[:len(args.model_paths)]
 
@@ -516,6 +527,7 @@ def main():
         total = sum(p.numel() for p in ensemble.parameters())
         print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
+    # اگر دیتاست DFD انتخاب شود، create_dataloaders از dataset_utils آن را هندل می‌کند
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
