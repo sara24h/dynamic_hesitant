@@ -460,7 +460,6 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Optimized Fuzzy Hesitant Ensemble Training")
@@ -500,17 +499,8 @@ def main():
         print(f"Models: {len(args.model_paths)}")
         print("="*70 + "\n")
 
-    MEANS = [
-        (0.5207, 0.4258, 0.3806),  # Model 1
-        (0.4460, 0.3622, 0.3416),  # Model 2
-        (0.4668, 0.3816, 0.3414),  # Model 3
-    ]
-    
-    STDS = [
-        (0.2490, 0.2239, 0.2212),  # Model 1
-        (0.2057, 0.1849, 0.1761),  # Model 2
-        (0.2410, 0.2161, 0.2081),  # Model 3
-    ]
+    MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
+    STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
     MEANS = MEANS[:len(args.model_paths)]
     STDS = STDS[:len(args.model_paths)]
