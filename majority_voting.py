@@ -17,13 +17,20 @@ from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 
 warnings.filterwarnings("ignore")
 
-# ایمپورت تمام ابزارهای مربوط به دیتاست از فایل جداگانه
 from dataset_utils import (
     UADFVDataset, 
     create_dataloaders, 
     get_sample_info, 
     worker_init_fn
 )
+
+from dataset_utils import (
+    DFDDataset, 
+    create_dataloaders, 
+    get_sample_info, 
+    worker_init_fn
+)
+
 
 from lime import lime_image
 from skimage.segmentation import mark_boundaries
