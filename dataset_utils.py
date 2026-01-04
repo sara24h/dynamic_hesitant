@@ -45,7 +45,7 @@ class DFDDataset(Dataset):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
-        self.class_to_idx = {'fake': 0, 'real': 1}
+        self.class_to_idx = {'fake': 1, 'real': 0}
 
         # اگر split مشخص شده باشد (مثل 'train') فقط آن را لود می‌کند
         # اگر split=None باشد، کل پوشه‌ها (train, val, test) را لود می‌کند
@@ -63,9 +63,9 @@ class DFDDataset(Dataset):
                 
                 # تشخیص لیبل
                 if 'fake' in video_folder.lower():
-                    label = 0
-                elif 'real' in video_folder.lower():
                     label = 1
+                elif 'real' in video_folder.lower():
+                    label = 0
                 else:
                     continue
 
