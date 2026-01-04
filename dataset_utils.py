@@ -41,37 +41,37 @@ class UADFVDataset(Dataset):
 
 
 class DFDDataset(Dataset):
-   
-    def __init__(self, root_dir, split='train', transform=None):
+    def __init__(self, root_dir, split=None, transform=None):
         self.root_dir = root_dir
-        self.split = split
         self.transform = transform
         self.samples = []
-        self.classes = ['fake', 'real']
         self.class_to_idx = {'fake': 0, 'real': 1}
 
-        split_dir = os.path.join(root_dir, split)
-        if not os.path.exists(split_dir):
-            raise FileNotFoundError(f"Directory not found: {split_dir}")
-
-        for video_folder in os.listdir(split_dir):
-            video_path = os.path.join(split_dir, video_folder)
-            
-            if not os.path.isdir(video_path):
+        # اگر split مشخص شده باشد (مثل 'train') فقط آن را لود می‌کند
+        # اگر split=None باشد، کل پوشه‌ها (train, val, test) را لود می‌کند
+        search_dirs = [split] if split else ['train', 'val', 'test']
+        
+        for s in search_dirs:
+            split_path = os.path.join(root_dir, s)
+            if not os.path.exists(split_path):
                 continue
-            
-            # تشخیص لیبل از نام پوشه
-            if 'fake' in video_folder.lower():
-                label = 0
-            elif 'real' in video_folder.lower():
-                label = 1
-            else:
-                continue
+                
+            for video_folder in os.listdir(split_path):
+                video_path = os.path.join(split_path, video_folder)
+                if not os.path.isdir(video_path):
+                    continue
+                
+                # تشخیص لیبل
+                if 'fake' in video_folder.lower():
+                    label = 0
+                elif 'real' in video_folder.lower():
+                    label = 1
+                else:
+                    continue
 
-            for img_file in os.listdir(video_path):
-                if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    img_path = os.path.join(video_path, img_file)
-                    self.samples.append((img_path, label))
+                for img_file in os.listdir(video_path):
+                    if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        self.samples.append((os.path.join(video_path, img_file), label))
 
     def __len__(self):
         return len(self.samples)
@@ -82,7 +82,6 @@ class DFDDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image, label
-
 
 class TransformSubset(Subset):
     """Subset with custom transform"""
@@ -266,10 +265,11 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
     elif dataset_type == 'dfd':
         if not os.path.exists(base_dir):
             raise FileNotFoundError(f"DFD dataset directory not found: {base_dir}")
-        # فرض بر این است که پوشه train حاوی داده‌های اصلی است یا ترکیبی از همه
+        
         temp_transform = transforms.Compose([transforms.ToTensor()])
-        full_dataset = DFDDataset(base_dir, split='train', transform=temp_transform)
-        print("[Dataset Loading] DFDDataset loaded.")
+        # قرار دادن split=None باعث می‌شود کل ۸۵ هزار فریم لود شود
+        full_dataset = DFDDataset(base_dir, split=None, transform=temp_transform)
+        print(f"[Dataset Loading] DFDDataset loaded with {len(full_dataset)} images.")
         
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
