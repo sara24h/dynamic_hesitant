@@ -23,6 +23,13 @@ from dataset_utils import (
     worker_init_fn
 )
 
+from dataset_utils import (
+    DFDDataset, 
+    create_dataloaders, 
+    get_sample_info, 
+    worker_init_fn
+)
+
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
 
 # ================== UTILITY FUNCTIONS ==================
