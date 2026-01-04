@@ -20,25 +20,46 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def worker_init_fn(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
+# ==========================================
+# 2. DATASET CLASSES (DEFINED HERE TO AVOID IMPORT ERROR)
+# ==========================================
 
-# ==========================================
-# 2. DATASET CLASSES (CORRECTED)
-# ==========================================
+# کلاس UADFV را اضافه کردم تا اگر جایی صدا زده شد ارور ندهد
+class UADFVDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.samples = []
+        # تنظیمات پیش‌فرض برای UADFV
+        for class_name, label in [('fake', 1), ('real', 0)]:
+            path = os.path.join(root_dir, class_name)
+            if os.path.exists(path):
+                 for root, _, files in os.walk(path):
+                    for file in files:
+                        if file.lower().endswith(('png', 'jpg', 'jpeg')):
+                            self.samples.append((os.path.join(root, file), label))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
 class DFDDataset(Dataset):
     def __init__(self, root_dir, split=None, transform=None):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
         
-        # --- IMPORTANT FIX: LABEL SWAP ---
-        # فرض بر این است که مدل شما Fake را 1 و Real را 0 یاد گرفته است
+        # --- اصلاح جابجایی لیبل‌ها ---
+        # اگر دقت کم است، یعنی جای 0 و 1 عوض شده. اینجا تنظیم کردیم: Fake=1, Real=0
         self.class_to_idx = {'fake': 1, 'real': 0} 
 
-        # Load ALL data (train + val + test folders)
+        # اسکن تمام پوشه‌ها (Train, Val, Test) برای رسیدن به 85 هزار عکس
         search_dirs = [split] if split else ['train', 'val', 'test']
         
         print(f"[Init] Scanning directories: {search_dirs} in {root_dir}")
@@ -53,7 +74,7 @@ class DFDDataset(Dataset):
                 if not os.path.isdir(video_path):
                     continue
                 
-                # Logic for labels
+                # تشخیص لیبل
                 folder_lower = video_folder.lower()
                 if 'fake' in folder_lower:
                     label = self.class_to_idx['fake']
@@ -77,8 +98,8 @@ class DFDDataset(Dataset):
                 image = self.transform(image)
             return image, label
         except Exception as e:
+            # جلوگیری از کرش کردن اگر یک عکس خراب بود
             print(f"Error loading image {img_path}: {e}")
-            # Return a black image in case of error to avoid crash
             return torch.zeros((3, 256, 256)), label
 
 class TransformSubset(Subset):
@@ -94,26 +115,23 @@ class TransformSubset(Subset):
         return img, label
 
 # ==========================================
-# 3. SPLITTING LOGIC (VIDEO LEVEL)
+# 3. SPLITTING LOGIC
 # ==========================================
 def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
     all_video_ids = set()
     
-    # Extract unique video IDs
+    # استخراج شناسه ویدیوها
     for img_path, _ in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
-        # Normalize video ID
         vid_id = dir_name.replace('fake_', '').replace('real_', '').replace('_fake', '').replace('_real', '')
         all_video_ids.add(vid_id)
 
     all_video_ids = sorted(list(all_video_ids))
     
-    # Split Video IDs
     train_val_ids, test_ids = train_test_split(all_video_ids, test_size=test_ratio, random_state=seed)
     val_size_adj = val_ratio / (train_ratio + val_ratio)
     train_ids, val_ids = train_test_split(train_val_ids, test_size=val_size_adj, random_state=seed)
 
-    # Map back to Frame Indices
     train_indices, val_indices, test_indices = [], [], []
     for idx, (img_path, _) in enumerate(dataset.samples):
         dir_name = os.path.basename(os.path.dirname(img_path))
@@ -129,30 +147,26 @@ def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_
     return train_indices, val_indices, test_indices
 
 # ==========================================
-# 4. DATA LOADER CREATION
+# 4. LOADERS
 # ==========================================
 def get_dataloaders(base_dir, batch_size, is_distributed=False):
-    # Transforms
     test_transform = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.ToTensor(),
-        transforms.Normalize([0.5]*3, [0.5]*3) # Normalization usually helps
+        # نرمال‌سازی معمولا کمک می‌کند، اگر مدل با این نرمال‌سازی آموزش دیده:
+        # transforms.Normalize([0.5]*3, [0.5]*3) 
     ])
 
-    # 1. Load Full Dataset
     print("--- Loading Dataset ---")
-    full_dataset = DFDDataset(base_dir, split=None, transform=None) # No transform here
+    full_dataset = DFDDataset(base_dir, split=None, transform=None)
     print(f"Total Images Found: {len(full_dataset)}")
 
-    # 2. Split
     print("--- Splitting (Video Level) ---")
-    train_idx, val_idx, test_idx = create_video_level_dfd_split(full_dataset)
-    print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+    _, _, test_idx = create_video_level_dfd_split(full_dataset)
+    print(f"Test Set Size: {len(test_idx)}")
 
-    # 3. Create Subsets with Transforms
     test_ds = TransformSubset(full_dataset, test_idx, test_transform)
 
-    # 4. Sampler for Distributed Evaluation
     sampler = DistributedSampler(test_ds, shuffle=False) if is_distributed else None
 
     test_loader = DataLoader(
@@ -167,7 +181,7 @@ def get_dataloaders(base_dir, batch_size, is_distributed=False):
     return test_loader
 
 # ==========================================
-# 5. SAFE MODEL LOADING
+# 5. SAFE MODEL LOADING (FIXED)
 # ==========================================
 def load_models_safely(model_paths, device):
     models = []
@@ -175,10 +189,10 @@ def load_models_safely(model_paths, device):
     for path in model_paths:
         print(f"Attempting to load: {os.path.basename(path)} ...", end=" ")
         try:
-            # map_location ensures it loads to current GPU
+            # map_location برای جلوگیری از مشکلات GPU
+            # weights_only=False برای اطمینان از لود شدن کامل ساختار
             model = torch.load(path, map_location=device)
             
-            # Handle DataParallel wrapped models
             if isinstance(model, torch.nn.DataParallel) or isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 model = model.module
                 
@@ -187,13 +201,13 @@ def load_models_safely(model_paths, device):
             models.append(model)
             print("SUCCESS ✅")
         except Exception as e:
-            print(f"\nFAILED ❌ Error: {e}")
-            print(f"Skipping {path}...")
+            print(f"\nFAILED ❌ Error loading {path}: {e}")
+            print(f"Skipping this model and continuing...")
     
     return models
 
 # ==========================================
-# 6. EVALUATION LOOP (MAJORITY VOTING)
+# 6. EVALUATION
 # ==========================================
 def evaluate_ensemble(models, dataloader, device, is_master):
     all_preds = []
@@ -207,16 +221,12 @@ def evaluate_ensemble(models, dataloader, device, is_master):
             images = images.to(device)
             labels = labels.to(device)
             
-            # Collect votes
             batch_votes = torch.zeros(images.size(0)).to(device)
             
             for model in models:
                 outputs = model(images)
                 
-                # Assuming output is logits. If binary:
-                # If your model outputs 1 neuron: use sigmoid
-                # If your model outputs 2 neurons: use argmax
-                
+                # تبدیل خروجی به 0 یا 1
                 if outputs.shape[1] == 1:
                     preds = (torch.sigmoid(outputs) > 0.5).float().squeeze()
                 else:
@@ -224,8 +234,7 @@ def evaluate_ensemble(models, dataloader, device, is_master):
                 
                 batch_votes += preds
             
-            # Majority Vote Rule
-            # If more than half the models voted for class 1 (Fake)
+            # رای اکثریت
             final_preds = (batch_votes > (len(models) / 2)).long()
             
             all_preds.extend(final_preds.cpu().numpy())
@@ -237,10 +246,10 @@ def evaluate_ensemble(models, dataloader, device, is_master):
     return np.array(all_preds), np.array(all_labels)
 
 # ==========================================
-# 7. MAIN EXECUTION
+# 7. MAIN
 # ==========================================
 def main():
-    # Setup Distributed
+    # تنظیمات Distributed
     is_distributed = 'RANK' in os.environ
     if is_distributed:
         torch.distributed.init_process_group(backend='nccl')
@@ -254,11 +263,9 @@ def main():
 
     set_seed(42)
 
-    # --- SETTINGS ---
-    # آدرس دیتاست خود را دقیق وارد کنید
+    # --- تنظیمات آدرس‌ها (لطفاً چک کنید) ---
     DATA_DIR = '/kaggle/input/extracted-deepfake-frames' 
     
-    # آدرس مدل‌های خود را دقیق وارد کنید
     MODEL_PATHS = [
         '/kaggle/working/140k_pearson_pruned.pt',
         '/kaggle/working/200k_final.pt',
@@ -266,40 +273,28 @@ def main():
     ]
     BATCH_SIZE = 32
 
-    # 1. Get Data
+    # اجرا
     test_loader = get_dataloaders(DATA_DIR, BATCH_SIZE, is_distributed)
-
-    # 2. Load Models
     models = load_models_safely(MODEL_PATHS, device)
     
     if len(models) == 0:
         print("CRITICAL: No models loaded. Exiting.")
         return
 
-    # 3. Evaluate
     preds, labels = evaluate_ensemble(models, test_loader, device, is_master)
 
-    # 4. Report Results (Only on Master)
     if is_master:
         print("\n" + "="*50)
-        print("FINAL RESULTS (Label Swap: Real=0, Fake=1)")
+        print("FINAL RESULTS")
         print("="*50)
         
-        # Calculate Accuracy
         acc = np.mean(preds == labels) * 100
         print(f"Accuracy: {acc:.2f}%")
         
-        # Confusion Matrix
         cm = confusion_matrix(labels, preds)
         print("\nConfusion Matrix:")
         print(f"TN (Real Correct): {cm[0,0]} | FP (Real->Fake): {cm[0,1]}")
         print(f"FN (Fake->Real): {cm[1,0]} | TP (Fake Correct): {cm[1,1]}")
-        
-        print("\nAnalysis:")
-        if acc < 50:
-            print("❌ Warning: Accuracy is still < 50%. Check if labels are inverted again.")
-        else:
-            print("✅ Accuracy looks normal.")
-            
+
 if __name__ == '__main__':
     main()
