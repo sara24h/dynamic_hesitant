@@ -59,7 +59,7 @@ class SimpleAveragingEnsemble(nn.Module):
         final_output = stacked_out.mean(dim=1) # Average
         
         if return_details:
-            # For visualization compatibility
+            # Return format compatible with utils: output, weights, memberships, raw_outputs
             weights = torch.ones(x.size(0), len(self.models), device=x.device) / len(self.models)
             dummy_memberships = None
             return final_output, weights, dummy_memberships, stacked_out
@@ -118,7 +118,7 @@ def generate_lime_explanation(model, image_tensor, device):
 
 def generate_visualizations_internal(model, test_loader, device, vis_dir, model_names, num_gradcam, num_lime):
     print("="*70)
-    print("GENERATING VISUALIZATIONS (Ensemble)")
+    print("GENERATING VISUALIZATIONS (Simple Averaging Ensemble)")
     print("="*70)
     
     dirs = {k: os.path.join(vis_dir, k) for k in ['gradcam', 'lime', 'combined']}
@@ -134,7 +134,7 @@ def generate_visualizations_internal(model, test_loader, device, vis_dir, model_
     vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0)
 
     # Get target layer from the first model in the ensemble
-    base_model = model.models[0] if hasattr(model, 'models') else model
+    base_model = model.models[0]
     if hasattr(base_model, 'layer4'):
         target_layer = base_model.layer4[-1]
     else:
@@ -164,13 +164,13 @@ def generate_visualizations_internal(model, test_loader, device, vis_dir, model_
         img_np = image[0].cpu().permute(1, 2, 0).numpy()
 
         # --- GradCAM ---
+        overlay = None
         if idx < num_gradcam:
             try:
                 gradcam = GradCAM(model, target_layer)
                 image_grad = image.clone().detach().requires_grad_(True)
                 
                 # Forward ensemble manually to get prediction score
-                # Use the logic: maximize predicted class score
                 out_val = model(image_grad)[0]
                 score = out_val if pred_label == 1 else -out_val
                 
@@ -183,7 +183,6 @@ def generate_visualizations_internal(model, test_loader, device, vis_dir, model_
                 plt.imsave(os.path.join(dirs['gradcam'], filename), overlay)
             except Exception as e:
                 print(f"    GradCAM Error: {e}")
-                overlay = None
 
         # --- LIME ---
         if idx < num_lime and LIME_AVAILABLE:
@@ -210,7 +209,7 @@ def main():
     parser.add_argument('--dataset', type=str, required=True, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV', 'dfd'])
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
-    parser.add_argument('--save_dir', type=str, default='./output_ensemble_vis')
+    parser.add_argument('--save_dir', type=str, default='./output_simple_ensemble')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
@@ -240,7 +239,16 @@ def main():
     ensemble = SimpleAveragingEnsemble(models, MEANS, STDS).to(device)
 
     # Load Data
-    _, _, test_loader = create_dataloaders(args.data_dir, args.batch_size, args.dataset, False, 42, True)
+    print("Loading Data...")
+    # FIX: Corrected argument order to match original repository's create_dataloaders
+    train_loader, val_loader, test_loader = create_dataloaders(
+        args.data_dir, 
+        args.batch_size, 
+        args.dataset,       # dataset_type
+        False,              # is_distributed
+        42,                # seed
+        True                # is_main
+    )
 
     # Evaluate Ensemble
     print("\nEvaluating Ensemble...")
@@ -258,8 +266,8 @@ def main():
     print(f"Ensemble Accuracy: {acc:.2f}%")
 
     # Visualizations
-    os.makedirs(args.save_dir, exist_ok=True)
     vis_dir = os.path.join(args.save_dir, 'visualizations')
+    os.makedirs(args.save_dir, exist_ok=True)
     
     generate_visualizations_internal(
         ensemble, test_loader, device, vis_dir, args.model_names,
@@ -268,6 +276,7 @@ def main():
     
     # Plot ROC
     try:
+        print("Plotting ROC...")
         plot_roc_and_f1(ensemble, test_loader, device, args.save_dir, args.model_names, True)
     except Exception as e:
         print(f"Could not plot ROC: {e}")
