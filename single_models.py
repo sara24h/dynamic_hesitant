@@ -16,31 +16,47 @@ from dataset_utils import create_dataloaders
 
 # Import Visualization Utilities
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
-#from metrics_utils import plot_roc_and_f1
 
-# ================== WRAPPER FOR NORMALIZATION ==================
+# ================== SPECIAL CLASS FOR VISUALIZATION ==================
+class VisualizationModel(nn.Module):
+  
+    def __init__(self, base_model, mean, std):
+        super().__init__()
+        self.base_model = base_model
+        # ثبت mean و std به صورت بافر
+        self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
+
+    def forward(self, x):
+        # x ورودی خام (0.0 تا 1.0) است که GradCAM تحویل می‌دهد
+        # ما آن را نرمال‌سازی می‌کنیم تا مدل بتواند آن را بخواند
+        x_norm = (x - self.mean) / self.std
+        
+        # عبور از مدل اصلی
+        out = self.base_model(x_norm)
+        
+        # اگر مدل خروجی چندتایی داد، اولی را بگیر (Logits)
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        return out
+
+# ================== WRAPPER FOR EVALUATION ==================
 class NormalizationWrapper(nn.Module):
-    
+    """
+    کلاس استاندارد برای ارزیابی (Testing).
+    این کلاس ورودی را نرمال‌سازی می‌کند و خروجی می‌دهد.
+    """
     def __init__(self, model, mean, std):
         super().__init__()
         self.model = model
-        # Convert mean and std to tensors and reshape for (batch, channel, h, w)
         self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
 
     def forward(self, x, return_details=False):
-        # Normalize input using the FIXED values passed during init
         x_norm = (x - self.mean) / self.std
-        
-        # Pass through model
         out = self.model(x_norm)
-        
-        # Handle models that return tuples (e.g., (logits, features))
         if isinstance(out, (tuple, list)):
             out = out[0]
-        
-        # Compatibility fix: If caller asks for details, just return logits 
-        # (since single models don't have ensemble weights/memberships to return)
         return out
 
 # ================== MODEL LOADING ==================
@@ -76,7 +92,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
     print(f"All {len(models)} models loaded!\n")
     return models
 
-# ================== EVALUATION & VISUALIZATION ==================
+# ================== EVALUATION ==================
 @torch.no_grad()
 def evaluate_single_model(model, loader, device, name):
     model.eval()
@@ -120,11 +136,8 @@ def main():
     if len(args.model_names) != len(args.model_paths):
         raise ValueError("Number of model_names must match model_paths")
 
-    # Setup Device (No Distributed / DDP logic)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
-
-    # Create Save Directory
     os.makedirs(args.save_dir, exist_ok=True)
 
     # ================== FIXED NORMALIZATION VALUES ==================
@@ -153,25 +166,29 @@ def main():
         print(f"PROCESSING MODEL: {model_name}")
         print("="*70)
 
-        # 1. Wrap Model with Normalization (Compatible Wrapper)
-        wrapped_model = NormalizationWrapper(model, MEANS[i], STDS[i]).to(device)
+        # 1. Wrap Model for Evaluation (Normalizes Input)
+        eval_model = NormalizationWrapper(model, MEANS[i], STDS[i]).to(device)
         
-        # 2. Evaluate
-        acc, labels, preds = evaluate_single_model(wrapped_model, test_loader, device, model_name)
+        # 2. Wrap Model for Visualization (Accepts Raw Input, Normalizes Internally)
+        # این مدل مخصوص GradCAM است
+        vis_model = VisualizationModel(model, MEANS[i], STDS[i]).to(device)
+        
+        # 3. Evaluate
+        acc, labels, preds = evaluate_single_model(eval_model, test_loader, device, model_name)
         
         # Save metrics for this model
         model_results_dir = os.path.join(args.save_dir, model_name.replace(" ", "_"))
         os.makedirs(model_results_dir, exist_ok=True)
         
-        
-
         # 4. Generate Visualizations (GradCAM & LIME)
         vis_dir = os.path.join(model_results_dir, 'visualizations')
         print(f"\nGenerating Visualizations for {model_name} in {vis_dir}...")
+        print("Using optimized model wrapper for GradCAM/LIME...")
         
         try:
+            # ما مدل ویژوالیزیشن (vis_model) را پاس می‌دهیم، نه ارزیابی
             generate_visualizations(
-                model=wrapped_model, 
+                model=vis_model, 
                 data_loader=test_loader, 
                 device=device, 
                 save_dir=vis_dir, 
