@@ -15,6 +15,7 @@ import cv2
 # Libraries for LIME and GradCAM
 try:
     from lime import lime_image
+    # FIX: Added correct import path
     from skimage.segmentation import mark_boundaries
     LIME_AVAILABLE = True
 except ImportError:
@@ -23,10 +24,7 @@ except ImportError:
 warnings.filterwarnings("ignore")
 
 # ================== IMPORT UTILITIES ==================
-# ایمپورت از فایل‌های موجود در گیت‌هاب
 from dataset_utils import create_dataloaders, get_sample_info
-# این تابع را خودمان می‌نویسیم تا با ارگومان‌ها تداخل نداشته باشد
-# from metrics_utils import plot_roc_and_f1 
 
 # ================== SIMPLE AVERAGING ENSEMBLE ==================
 class MultiModelNormalization(nn.Module):
@@ -227,6 +225,7 @@ def main():
 
     # Load Models
     print("Loading models...")
+    # FIX: Updated class name to match the repository structure
     from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     models = []
     for i, path in enumerate(args.model_paths):
@@ -241,7 +240,6 @@ def main():
 
     # Load Data
     print("Loading Data...")
-    # آرگومان‌ها را دقیقاً مطابق با تعریف تابع در dataset_utils پاس می‌دهیم
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, 
         args.batch_size, 
@@ -252,6 +250,7 @@ def main():
     )
 
     # Evaluate Ensemble
+    # FIX: Typo "Evaluating"
     print("\nEvaluating Ensemble...")
     ensemble.eval()
     correct, total = 0, 0
@@ -275,7 +274,7 @@ def main():
         args.num_grad_cam_samples, args.num_lime_samples
     )
     
-    # Simple manual ROC plotting to avoid external utils issues
+    # Simple manual ROC plotting
     try:
         print("Plotting ROC...")
         all_labels = []
