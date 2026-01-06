@@ -23,7 +23,7 @@ from dataset_utils import (
     worker_init_fn
 )
 
-from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
+from visualization_single_utils.py import GradCAM, generate_lime_explanation, generate_visualizations
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
