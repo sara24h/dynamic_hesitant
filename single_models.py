@@ -163,17 +163,7 @@ def main():
         model_results_dir = os.path.join(args.save_dir, model_name.replace(" ", "_"))
         os.makedirs(model_results_dir, exist_ok=True)
         
-        # 3. Plot ROC and F1
-        # plot_roc_and_f1 likely calls model(x, return_details=True) internally.
-        # Our wrapper now handles that argument safely.
-        plot_roc_and_f1(
-            wrapped_model, 
-            test_loader, 
-            device, 
-            model_results_dir, 
-            [model_name], 
-            is_main=True
-        )
+        
 
         # 4. Generate Visualizations (GradCAM & LIME)
         vis_dir = os.path.join(model_results_dir, 'visualizations')
