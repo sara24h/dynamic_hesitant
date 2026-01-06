@@ -16,14 +16,11 @@ from dataset_utils import create_dataloaders
 
 # Import Visualization Utilities
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
-from metrics_utils import plot_roc_and_f1
+#from metrics_utils import plot_roc_and_f1
 
 # ================== WRAPPER FOR NORMALIZATION ==================
 class NormalizationWrapper(nn.Module):
-    """
-    Wrapper for Normalization that is compatible with older utility functions 
-    expecting 'return_details' argument (like plot_roc_and_f1).
-    """
+    
     def __init__(self, model, mean, std):
         super().__init__()
         self.model = model
