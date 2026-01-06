@@ -1,222 +1,278 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
 import os
 from tqdm import tqdm
 import numpy as np
 import warnings
 import argparse
 import json
-from typing import List
+import random
+import matplotlib.pyplot as plt
+import cv2
+
+# Libraries for LIME and GradCAM
+try:
+    from lime import lime_image
+    from skimage.segmentation import mark_boundaries
+    LIME_AVAILABLE = True
+except ImportError:
+    LIME_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
 
-# Import Dataset Utilities
-from dataset_utils import create_dataloaders
+# ================== IMPORT UTILITIES ==================
+from dataset_utils import create_dataloaders, get_sample_info
+from metrics_utils import plot_roc_and_f1
 
-# Import Visualization Utilities
-from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
-
-# ================== SPECIAL CLASS FOR VISUALIZATION ==================
-class VisualizationModel(nn.Module):
-  
-    def __init__(self, base_model, mean, std):
+# ================== SIMPLE AVERAGING ENSEMBLE ==================
+class MultiModelNormalization(nn.Module):
+    def __init__(self, means, stds):
         super().__init__()
-        self.base_model = base_model
-        # ثبت mean و std به صورت بافر
-        self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
-        self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
+        for i, (m, s) in enumerate(zip(means, stds)):
+            self.register_buffer(f'mean_{i}', torch.tensor(m).view(1, 3, 1, 1))
+            self.register_buffer(f'std_{i}', torch.tensor(s).view(1, 3, 1, 1))
 
-    def forward(self, x):
-        # x ورودی خام (0.0 تا 1.0) است که GradCAM تحویل می‌دهد
-        # ما آن را نرمال‌سازی می‌کنیم تا مدل بتواند آن را بخواند
-        x_norm = (x - self.mean) / self.std
-        
-        # عبور از مدل اصلی
-        out = self.base_model(x_norm)
-        
-        # اگر مدل خروجی چندتایی داد، اولی را بگیر (Logits)
-        if isinstance(out, (tuple, list)):
-            out = out[0]
-        return out
+    def forward(self, x, idx):
+        return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
-# ================== WRAPPER FOR EVALUATION ==================
-class NormalizationWrapper(nn.Module):
+class SimpleAveragingEnsemble(nn.Module):
     """
-    کلاس استاندارد برای ارزیابی (Testing).
-    این کلاس ورودی را نرمال‌سازی می‌کند و خروجی می‌دهد.
+    انسامبل ساده با میانگین‌گیری.
     """
-    def __init__(self, model, mean, std):
+    def __init__(self, models, means, stds):
         super().__init__()
-        self.model = model
-        self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
-        self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
+        self.models = nn.ModuleList(models)
+        self.normalizations = MultiModelNormalization(means, stds)
 
     def forward(self, x, return_details=False):
-        x_norm = (x - self.mean) / self.std
-        out = self.model(x_norm)
-        if isinstance(out, (tuple, list)):
-            out = out[0]
-        return out
-
-# ================== MODEL LOADING ==================
-def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.Module]:
-    try:
-        from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
-    except ImportError:
-        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal. Ensure 'model' directory exists.")
-
-    models = []
-    print(f"Loading {len(model_paths)} pruned models...")
-
-    for i, path in enumerate(model_paths):
-        if not os.path.exists(path):
-            print(f" [WARNING] File not found: {path}")
-            continue
+        outputs = []
+        for i, model in enumerate(self.models):
+            x_norm = self.normalizations(x, i)
+            out = model(x_norm)
+            if isinstance(out, (tuple, list)):
+                out = out[0]
+            outputs.append(out)
         
-        print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
+        stacked_out = torch.stack(outputs, dim=1) # (Batch, Num_Models, 1)
+        final_output = stacked_out.mean(dim=1) # Average
+        
+        if return_details:
+            # For visualization compatibility
+            weights = torch.ones(x.size(0), len(self.models), device=x.device) / len(self.models)
+            dummy_memberships = None
+            return final_output, weights, dummy_memberships, stacked_out
+        
+        return final_output
+
+# ================== VISUALIZATION UTILITIES (Internal) ==================
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        self._register_hooks()
+
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            self.activations = output.detach()
+        def backward_hook(module, grad_in, grad_out):
+            self.gradients = grad_out[0].detach()
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_full_backward_hook(backward_hook)
+
+    def generate(self, score):
+        self.model.zero_grad()
+        score.backward(retain_graph=True)
+        gradients = self.gradients[0]
+        activations = self.activations[0]
+        weights = gradients.mean(dim=[1, 2], keepdim=True)
+        cam = (weights * activations).sum(dim=0)
+        cam = F.relu(cam)
+        # Resize
+        cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), size=activations.shape[1:], mode='bilinear', align_corners=False)
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        return cam.squeeze().cpu().numpy()
+
+def generate_lime_explanation(model, image_tensor, device):
+    if not LIME_AVAILABLE: return None
+    img_np = image_tensor[0].cpu().permute(1, 2, 0).numpy()
+    if img_np.max() <= 1.0:
+        img_np = (img_np * 255).astype(np.uint8)
+    
+    explainer = lime_image.LimeImageExplainer()
+    def predict_fn(images):
+        batch = torch.from_numpy(images.transpose(0, 3, 1, 2)).float() / 255.0
+        batch = batch.to(device)
+        with torch.no_grad():
+            outputs, _, _, _ = model(batch, return_details=True) # Compatible with Ensemble
+            probs = torch.sigmoid(outputs).cpu().numpy()
+        return np.hstack([1 - probs, probs])
+
+    explanation = explainer.explain_instance(img_np, predict_fn, top_labels=1, hide_color=0, num_samples=1000)
+    temp, mask = explanation.get_image_and_mask(explanation.top_labels[0], positive_only=True, num_features=10, hide_rest=False)
+    lime_img = mark_boundaries(temp / 255.0, mask)
+    return cv2.resize(lime_img, (256, 256))
+
+def generate_visualizations_internal(model, test_loader, device, vis_dir, model_names, num_gradcam, num_lime):
+    print("="*70)
+    print("GENERATING VISUALIZATIONS (Ensemble)")
+    print("="*70)
+    
+    dirs = {k: os.path.join(vis_dir, k) for k in ['gradcam', 'lime', 'combined']}
+    for d in dirs.values(): os.makedirs(d, exist_ok=True)
+
+    full_dataset = test_loader.dataset
+    if hasattr(full_dataset, 'dataset'): full_dataset = full_dataset.dataset
+
+    total_samples = len(full_dataset)
+    vis_count = min(max(num_gradcam, num_lime), total_samples)
+    vis_indices = random.sample(range(total_samples), vis_count)
+    vis_dataset = Subset(full_dataset, vis_indices)
+    vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0)
+
+    # Get target layer from the first model in the ensemble
+    base_model = model.models[0] if hasattr(model, 'models') else model
+    if hasattr(base_model, 'layer4'):
+        target_layer = base_model.layer4[-1]
+    else:
+        target_layer = list(base_model.children())[-1]
+
+    for idx, (image, label_int) in enumerate(vis_loader):
+        image = image.to(device)
+        true_label = int(label_int.item())
+        
+        # --- Get Filename ---
         try:
-            ckpt = torch.load(path, map_location='cpu', weights_only=False)
-            model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
-            model.load_state_dict(ckpt['model_state_dict'])
-            model = model.to(device).eval()
-            param_count = sum(p.numel() for p in model.parameters())
-            print(f" → Parameters: {param_count:,}")
-            models.append(model)
-        except Exception as e:
-            print(f" [ERROR] Failed to load {path}: {e}")
-            continue
+            info = get_sample_info(full_dataset, vis_indices[idx])
+            img_path = info[0] if isinstance(info, (list, tuple)) else str(info)
+            img_name = os.path.basename(img_path)
+        except:
+            img_name = f"sample_{idx}"
 
-    if len(models) == 0:
-        raise ValueError("No models loaded!")
-    print(f"All {len(models)} models loaded!\n")
-    return models
+        print(f"  Processing {img_name} ({idx+1}/{len(vis_loader)})")
 
-# ================== EVALUATION ==================
-@torch.no_grad()
-def evaluate_single_model(model, loader, device, name):
-    model.eval()
-    correct = 0
-    total = 0
-    all_labels = []
-    all_preds = []
-
-    print(f"\nEvaluating {name}...")
-    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=False):
-        images, labels = images.to(device), labels.to(device).float()
+        with torch.no_grad():
+            output, weights, _, _ = model(image, return_details=True)
         
-        outputs = model(images)
-        preds_prob = torch.sigmoid(outputs.squeeze(1))
-        preds = (preds_prob > 0.5).long()
+        pred_prob = torch.sigmoid(output).item()
+        pred_label = 1 if pred_prob > 0.5 else 0
         
-        total += labels.size(0)
-        correct += preds.eq(labels.long()).sum().item()
-        
-        all_labels.extend(labels.cpu().numpy())
-        all_preds.extend(preds_prob.cpu().numpy())
+        filename = f"sample_{idx}_t{true_label}_p{pred_label}.png"
+        img_np = image[0].cpu().permute(1, 2, 0).numpy()
 
-    acc = 100. * correct / total
-    print(f" {name} Accuracy: {acc:.2f}%")
-    return acc, np.array(all_labels), np.array(all_preds)
+        # --- GradCAM ---
+        if idx < num_gradcam:
+            try:
+                gradcam = GradCAM(model, target_layer)
+                image_grad = image.clone().detach().requires_grad_(True)
+                
+                # Forward ensemble manually to get prediction score
+                # Use the logic: maximize predicted class score
+                out_val = model(image_grad)[0]
+                score = out_val if pred_label == 1 else -out_val
+                
+                cam = gradcam.generate(score)
+                cam_resized = cv2.resize(cam, (img_np.shape[1], img_np.shape[0]))
+                cam_uint8 = np.uint8(255 * cam_resized)
+                heatmap = cv2.applyColorMap(cam_uint8, cv2.COLORMAP_JET) / 255.0
+                overlay = (heatmap + img_np) / np.max(heatmap + img_np)
 
+                plt.imsave(os.path.join(dirs['gradcam'], filename), overlay)
+            except Exception as e:
+                print(f"    GradCAM Error: {e}")
+                overlay = None
 
+        # --- LIME ---
+        if idx < num_lime and LIME_AVAILABLE:
+            try:
+                lime_img = generate_lime_explanation(model, image, device)
+                plt.imsave(os.path.join(dirs['lime'], filename), lime_img)
+                
+                # Combined
+                if idx < num_gradcam and overlay is not None:
+                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                    axes[0].imshow(img_np); axes[0].set_title("Original"); axes[0].axis('off')
+                    axes[1].imshow(overlay); axes[1].set_title("GradCAM"); axes[1].axis('off')
+                    axes[2].imshow(lime_img); axes[2].set_title("LIME"); axes[2].axis('off')
+                    plt.suptitle(img_name)
+                    plt.savefig(os.path.join(dirs['combined'], filename), bbox_inches='tight')
+                    plt.close()
+            except Exception as e:
+                print(f"    LIME Error: {e}")
+
+# ================== MAIN SCRIPT ==================
 def main():
-    parser = argparse.ArgumentParser(description="Single Model Evaluation & Visualization")
-    parser.add_argument('--data_dir', type=str, required=True, help='Path to dataset root')
-    parser.add_argument('--dataset', type=str, required=True,
-                       choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV', 'dfd'])
-    parser.add_argument('--model_paths', type=str, nargs='+', required=True, help='Paths to .pt model files')
-    parser.add_argument('--model_names', type=str, nargs='+', required=True, help='Names for the models')
-    parser.add_argument('--save_dir', type=str, default='./output_single_eval', help='Directory to save results')
+    parser = argparse.ArgumentParser(description="Simple Averaging Ensemble with Visualization")
+    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--dataset', type=str, required=True, choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV', 'dfd'])
+    parser.add_argument('--model_paths', type=str, nargs='+', required=True)
+    parser.add_argument('--model_names', type=str, nargs='+', required=True)
+    parser.add_argument('--save_dir', type=str, default='./output_ensemble_vis')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
     args = parser.parse_args()
 
-    if len(args.model_names) != len(args.model_paths):
-        raise ValueError("Number of model_names must match model_paths")
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}\n")
-    os.makedirs(args.save_dir, exist_ok=True)
+    print(f"Using device: {device}")
 
-    # ================== FIXED NORMALIZATION VALUES ==================
+    # Normalization Stats
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-    
     MEANS = MEANS[:len(args.model_paths)]
     STDS = STDS[:len(args.model_paths)]
 
+    # Load Models
+    print("Loading models...")
+    from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
+    models = []
+    for i, path in enumerate(args.model_paths):
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
+        model.load_state_dict(ckpt['model_state_dict'])
+        models.append(model.to(device).eval())
+        print(f"  Loaded {args.model_names[i]}")
+
+    # Create Ensemble
+    ensemble = SimpleAveragingEnsemble(models, MEANS, STDS).to(device)
+
     # Load Data
-    print("Loading Data...")
-    _, _, test_loader = create_dataloaders(
-        args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=False, seed=42, is_main=True
-    )
+    _, _, test_loader = create_dataloaders(args.data_dir, args.batch_size, args.dataset, False, 42, True)
 
-    # Load Base Models
-    base_models = load_pruned_models(args.model_paths, device)
-
-    results_summary = {}
-
-    # ================== LOOP OVER MODELS ==================
-    for i, model in enumerate(base_models):
-        model_name = args.model_names[i]
-        print("="*70)
-        print(f"PROCESSING MODEL: {model_name}")
-        print("="*70)
-
-        # 1. Wrap Model for Evaluation (Normalizes Input)
-        eval_model = NormalizationWrapper(model, MEANS[i], STDS[i]).to(device)
-        
-        # 2. Wrap Model for Visualization (Accepts Raw Input, Normalizes Internally)
-        # این مدل مخصوص GradCAM است
-        vis_model = VisualizationModel(model, MEANS[i], STDS[i]).to(device)
-        
-        # 3. Evaluate
-        acc, labels, preds = evaluate_single_model(eval_model, test_loader, device, model_name)
-        
-        # Save metrics for this model
-        model_results_dir = os.path.join(args.save_dir, model_name.replace(" ", "_"))
-        os.makedirs(model_results_dir, exist_ok=True)
-        
-        # 4. Generate Visualizations (GradCAM & LIME)
-        vis_dir = os.path.join(model_results_dir, 'visualizations')
-        print(f"\nGenerating Visualizations for {model_name} in {vis_dir}...")
-        print("Using optimized model wrapper for GradCAM/LIME...")
-        
-        try:
-            # ما مدل ویژوالیزیشن (vis_model) را پاس می‌دهیم، نه ارزیابی
-            generate_visualizations(
-                model=vis_model, 
-                data_loader=test_loader, 
-                device=device, 
-                save_dir=vis_dir, 
-                model_names=[model_name],
-                num_grad_cam=args.num_grad_cam_samples,
-                num_lime=args.num_lime_samples,
-                dataset_name=args.dataset,
-                is_main=True
-            )
-            print(f"Visualizations saved successfully.")
-        except Exception as e:
-            print(f"Error generating visualizations: {e}")
-
-        results_summary[model_name] = {
-            'accuracy': acc,
-            'mean': MEANS[i],
-            'std': STDS[i]
-        }
-
-    # Save Final Summary
-    summary_path = os.path.join(args.save_dir, 'evaluation_summary.json')
-    with open(summary_path, 'w') as f:
-        json.dump(results_summary, f, indent=4)
+    # Evaluate Ensemble
+    print("\nEvaluating Ensemble...")
+    ensemble.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for images, labels in tqdm(test_loader):
+            images, labels = images.to(device), labels.to(device)
+            outputs = ensemble(images)
+            preds = (torch.sigmoid(outputs.squeeze(1)) > 0).long()
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
     
-    print("\n" + "="*70)
-    print("ALL MODELS PROCESSED.")
-    print(f"Summary saved to: {summary_path}")
-    print("="*70)
+    acc = 100 * correct / total
+    print(f"Ensemble Accuracy: {acc:.2f}%")
+
+    # Visualizations
+    os.makedirs(args.save_dir, exist_ok=True)
+    vis_dir = os.path.join(args.save_dir, 'visualizations')
+    
+    generate_visualizations_internal(
+        ensemble, test_loader, device, vis_dir, args.model_names,
+        args.num_grad_cam_samples, args.num_lime_samples
+    )
+    
+    # Plot ROC
+    try:
+        plot_roc_and_f1(ensemble, test_loader, device, args.save_dir, args.model_names, True)
+    except Exception as e:
+        print(f"Could not plot ROC: {e}")
+
+    print("Done.")
 
 if __name__ == "__main__":
     main()
