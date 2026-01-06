@@ -23,8 +23,10 @@ except ImportError:
 warnings.filterwarnings("ignore")
 
 # ================== IMPORT UTILITIES ==================
+# ایمپورت از فایل‌های موجود در گیت‌هاب
 from dataset_utils import create_dataloaders, get_sample_info
-from metrics_utils import plot_roc_and_f1
+# این تابع را خودمان می‌نویسیم تا با ارگومان‌ها تداخل نداشته باشد
+# from metrics_utils import plot_roc_and_f1 
 
 # ================== SIMPLE AVERAGING ENSEMBLE ==================
 class MultiModelNormalization(nn.Module):
@@ -66,7 +68,7 @@ class SimpleAveragingEnsemble(nn.Module):
         
         return final_output
 
-# ================== VISUALIZATION UTILITIES (Internal) ==================
+# ================== INTERNAL VISUALIZATION UTILS ==================
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -107,7 +109,7 @@ def generate_lime_explanation(model, image_tensor, device):
         batch = torch.from_numpy(images.transpose(0, 3, 1, 2)).float() / 255.0
         batch = batch.to(device)
         with torch.no_grad():
-            outputs, _, _, _ = model(batch, return_details=True) # Compatible with Ensemble
+            outputs, _, _, _ = model(batch, return_details=True) 
             probs = torch.sigmoid(outputs).cpu().numpy()
         return np.hstack([1 - probs, probs])
 
@@ -170,7 +172,6 @@ def generate_visualizations_internal(model, test_loader, device, vis_dir, model_
                 gradcam = GradCAM(model, target_layer)
                 image_grad = image.clone().detach().requires_grad_(True)
                 
-                # Forward ensemble manually to get prediction score
                 out_val = model(image_grad)[0]
                 score = out_val if pred_label == 1 else -out_val
                 
@@ -240,7 +241,7 @@ def main():
 
     # Load Data
     print("Loading Data...")
-    # FIX: Corrected argument order to match original repository's create_dataloaders
+    # آرگومان‌ها را دقیقاً مطابق با تعریف تابع در dataset_utils پاس می‌دهیم
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, 
         args.batch_size, 
@@ -274,10 +275,35 @@ def main():
         args.num_grad_cam_samples, args.num_lime_samples
     )
     
-    # Plot ROC
+    # Simple manual ROC plotting to avoid external utils issues
     try:
         print("Plotting ROC...")
-        plot_roc_and_f1(ensemble, test_loader, device, args.save_dir, args.model_names, True)
+        all_labels = []
+        all_preds = []
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images = images.to(device)
+                outputs = ensemble(images)
+                probs = torch.sigmoid(outputs).cpu().numpy()
+                all_labels.extend(labels.numpy())
+                all_preds.extend(probs)
+        
+        from sklearn.metrics import roc_curve, auc
+        fpr, tpr, _ = roc_curve(all_labels, all_preds)
+        roc_auc = auc(fpr, tpr)
+        
+        plt.figure()
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.4f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('Receiver operating characteristic')
+        plt.legend(loc="lower right")
+        plt.savefig(os.path.join(args.save_dir, 'roc_curve.png'))
+        plt.close()
+        print(f"ROC curve saved to {args.save_dir}")
     except Exception as e:
         print(f"Could not plot ROC: {e}")
 
