@@ -7,7 +7,7 @@ import numpy as np
 import warnings
 import argparse
 import json
-from typing import List  # اضافه شده برای رفع خطای احتمالی
+from typing import List
 
 warnings.filterwarnings("ignore")
 
@@ -21,8 +21,8 @@ from metrics_utils import plot_roc_and_f1
 # ================== WRAPPER FOR NORMALIZATION ==================
 class NormalizationWrapper(nn.Module):
     """
-    این کلاس مدل را با نرمال‌سازی خاص خودش می‌پیچد تا ورودی‌ها قبل از ورود به مدل
-    با Mean و Std ثابت و مربوط به همان مدل نرمال شوند.
+    Wrapper for Normalization that is compatible with older utility functions 
+    expecting 'return_details' argument (like plot_roc_and_f1).
     """
     def __init__(self, model, mean, std):
         super().__init__()
@@ -31,14 +31,19 @@ class NormalizationWrapper(nn.Module):
         self.register_buffer('mean', torch.tensor(mean).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor(std).view(1, 3, 1, 1))
 
-    def forward(self, x):
+    def forward(self, x, return_details=False):
         # Normalize input using the FIXED values passed during init
         x_norm = (x - self.mean) / self.std
+        
         # Pass through model
         out = self.model(x_norm)
+        
         # Handle models that return tuples (e.g., (logits, features))
         if isinstance(out, (tuple, list)):
             out = out[0]
+        
+        # Compatibility fix: If caller asks for details, just return logits 
+        # (since single models don't have ensemble weights/memberships to return)
         return out
 
 # ================== MODEL LOADING ==================
@@ -118,20 +123,17 @@ def main():
     if len(args.model_names) != len(args.model_paths):
         raise ValueError("Number of model_names must match model_paths")
 
-    # Setup Device
+    # Setup Device (No Distributed / DDP logic)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
 
     # Create Save Directory
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # ================== FIXED NORMALIZATION VALUES (Same as original code) ==================
-    # این مقادیر دقیقاً همان مقادیر ثابت هستند که در کد اول وجود داشتند
+    # ================== FIXED NORMALIZATION VALUES ==================
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
-    # Adjust lists to match number of models provided (Prevent index error if fewer models)
-    # اگر تعداد مدل‌ها کمتر از ۳ تا باشد، لیست کوتاه می‌شود. اگر بیشتر باشد باید به لیست اضافه کنید.
     MEANS = MEANS[:len(args.model_paths)]
     STDS = STDS[:len(args.model_paths)]
 
@@ -154,7 +156,7 @@ def main():
         print(f"PROCESSING MODEL: {model_name}")
         print("="*70)
 
-        # 1. Wrap Model with Normalization (Using Fixed Values)
+        # 1. Wrap Model with Normalization (Compatible Wrapper)
         wrapped_model = NormalizationWrapper(model, MEANS[i], STDS[i]).to(device)
         
         # 2. Evaluate
@@ -165,12 +167,14 @@ def main():
         os.makedirs(model_results_dir, exist_ok=True)
         
         # 3. Plot ROC and F1
+        # plot_roc_and_f1 likely calls model(x, return_details=True) internally.
+        # Our wrapper now handles that argument safely.
         plot_roc_and_f1(
             wrapped_model, 
             test_loader, 
             device, 
             model_results_dir, 
-            [model_name], # Pass as list
+            [model_name], 
             is_main=True
         )
 
@@ -196,7 +200,7 @@ def main():
 
         results_summary[model_name] = {
             'accuracy': acc,
-            'mean': MEANS[i], # ذخیره مقادیر استفاده شده برای اطمینان
+            'mean': MEANS[i],
             'std': STDS[i]
         }
 
