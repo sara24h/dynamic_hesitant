@@ -119,7 +119,7 @@ class FuzzyHesitantEnsemble(nn.Module):
         high_hesitancy_mask = (avg_hesitancy > self.hesitancy_threshold).unsqueeze(1)
         mask = torch.where(high_hesitancy_mask, torch.ones_like(mask), mask)
         final_mask = torch.zeros_like(final_weights)
-        final_mask.scatter_(1, sorted_indices, torch.clamp(mask, 0, 1)) # clamp added for safety
+        final_mask.scatter_(1, sorted_indices, torch.clamp(mask, 0, 1))
         return final_mask
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
@@ -207,8 +207,12 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    
+    # FIX: Check if distributed is initialized before all_reduce
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        
     acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main:
         print(f" {name}: {acc:.2f}%")
@@ -229,8 +233,12 @@ def evaluate_accuracy_ddp(model, loader, device):
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    
+    # FIX: Check if distributed is initialized
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        
     acc = 100. * correct_tensor.item() / total_tensor.item()
     return acc
 
@@ -259,11 +267,14 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         sum_hesitancy += memberships.var(dim=2).sum(dim=0)
 
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
-    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-    dist.all_reduce(sum_weights, op=dist.ReduceOp.SUM)
-    dist.all_reduce(sum_activation, op=dist.ReduceOp.SUM)
-    dist.all_reduce(sum_membership_vals, op=dist.ReduceOp.SUM)
-    dist.all_reduce(sum_hesitancy, op=dist.ReduceOp.SUM)
+    
+    # FIX: Check if distributed is initialized before all_reduce
+    if dist.is_initialized():
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_weights, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_activation, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_membership_vals, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_hesitancy, op=dist.ReduceOp.SUM)
 
     if is_main:
         total_correct = stats[0].item()
@@ -296,9 +307,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
-    """
-    تابع اصلاح‌شده training با نمایش جزئیات کامل
-    """
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -609,85 +617,49 @@ def main():
         }, final_model_path)
         print(f"Model saved: {final_model_path}")
 
-        # ================== MODIFIED VISUALIZATION SECTION ==================
+        # ================== VISUALIZATION SECTION ==================
         print("\n" + "="*70)
         print("GENERATING VISUALIZATIONS")
         print("="*70)
         
-        # Create a directory for visualizations
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         os.makedirs(vis_dir, exist_ok=True)
 
-        # 1. Prepare a fixed subset of data to ensure consistency across models
-        # We sample a small number of images from the test set
+        # 1. Prepare a fixed subset of data for consistency
         num_vis_samples = max(args.num_grad_cam_samples, args.num_lime_samples)
         
         print(f"Selecting {num_vis_samples} samples for visualization...")
         vis_dataset = test_loader.dataset
         
-        # Select random indices (without replacement) for visualization
-        # Use a fixed seed for reproducibility of visualization selection
+        # Select random indices
         rng = np.random.default_rng(seed=999)
         vis_indices = rng.choice(len(vis_dataset), size=num_vis_samples, replace=False)
         vis_subset = Subset(vis_dataset, vis_indices)
         
         # Create a new DataLoader for the visualization subset
-        # Note: Shuffle=False to keep the order consistent
         vis_loader = DataLoader(vis_subset, batch_size=1, shuffle=False, num_workers=2)
         
-        # Store images and labels for batch processing
-        vis_images = []
-        vis_labels = []
-        print("Preloading images for visualization...")
-        for img, lbl in vis_loader:
-            vis_images.append(img)
-            vis_labels.append(lbl)
-        
-        # Stack into a single batch tensor
-        vis_images_tensor = torch.cat(vis_images, dim=0).to(device)
-        vis_labels_tensor = torch.cat(vis_labels, dim=0).to(device)
-        print(f"Images loaded. Shape: {vis_images_tensor.shape}")
-
         # 2. Generate Visualizations for the Ensemble
         print("\nGenerating GradCAM and LIME for the ENSEMBLE model...")
         try:
-            # We assume generate_visualizations can handle a tensor and labels
             generate_visualizations(
-                ensemble_module, 
-                (vis_images_tensor, vis_labels_tensor), # Pass data as tuple (images, labels)
-                device, 
-                vis_dir, 
-                MODEL_NAMES,
-                args.num_grad_cam_samples, 
-                args.num_lime_samples,
-                args.dataset, 
-                is_main
-            )
+                ensemble_module, vis_loader, device, vis_dir, MODEL_NAMES,
+                args.num_grad_cam_samples, args.num_lime_samples,
+                args.dataset, is_main)
             print("Ensemble visualizations saved.")
         except Exception as e:
             print(f"Error generating ensemble visualizations: {e}")
 
         # 3. Generate Visualizations for Single Models
-        # We iterate over each base model and generate explanations for the SAME images
         print("\nGenerating GradCAM and LIME for SINGLE models...")
         for i, model in enumerate(base_models):
             model_name = MODEL_NAMES[i]
             print(f"  -> Processing single model: {model_name}")
             
-            # Create a specific directory for this single model
             single_vis_dir = os.path.join(vis_dir, f'single_model_{model_name}')
             os.makedirs(single_vis_dir, exist_ok=True)
             
-            # Note: generate_visualizations likely expects the model as first arg.
-            # However, single models usually require specific normalization.
-            # We wrap the model to include normalization, or we assume generate_visualizations handles it.
-            # Based on the original code structure, let's assume we might need to normalize inside
-            # or the visualization function handles raw inputs. 
-            # Ideally, we pass the normalization parameters if the function supports it, 
-            # or we temporarily wrap the model.
-            
-            # Here we create a simple wrapper to normalize input for the single model
-            # This ensures the model receives data in the format it was trained on.
+            # Wrapper to handle normalization specific to this single model
             class ModelWrapper(nn.Module):
                 def __init__(self, model, mean, std):
                     super().__init__()
@@ -704,23 +676,16 @@ def main():
 
             try:
                 generate_visualizations(
-                    wrapped_model, 
-                    (vis_images_tensor, vis_labels_tensor),
-                    device, 
-                    single_vis_dir, 
-                    [model_name], # Single name
-                    args.num_grad_cam_samples, 
-                    args.num_lime_samples,
-                    args.dataset, 
-                    is_main
-                )
+                    wrapped_model, vis_loader, device, single_vis_dir, [model_name], 
+                    args.num_grad_cam_samples, args.num_lime_samples,
+                    args.dataset, is_main)
                 print(f"     Saved visualizations for {model_name}")
             except Exception as e:
                 print(f"     Error generating visualizations for {model_name}: {e}")
 
         print("\nVisualization generation completed.")
         print("="*70)
-        # ====================================================================
+        # ==========================================================
 
 
     cleanup_distributed()
