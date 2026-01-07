@@ -12,7 +12,6 @@ import json
 import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
-
 from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
@@ -21,17 +20,11 @@ from dataset_utils import (
     UADFVDataset, 
     create_dataloaders, 
     get_sample_info, 
-    worker_init_fn
+    worker_init_fn,
+    DFDDataset
 )
 
-from dataset_utils import (
-    DFDDataset, 
-    create_dataloaders, 
-    get_sample_info, 
-    worker_init_fn
-)
-
-from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
+from visualization_utils import GradCAM, generate_lime_explanation
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -118,7 +111,7 @@ class FuzzyHesitantEnsemble(nn.Module):
         high_hesitancy_mask = (avg_hesitancy > self.hesitancy_threshold).unsqueeze(1)
         mask = torch.where(high_hesitancy_mask, torch.ones_like(mask), mask)
         final_mask = torch.zeros_like(final_weights)
-        final_mask.scatter_(1, sorted_indices, torch.clamp(mask, 0, 1))
+        final_mask.scatter_(1, sorted_indices, mask)
         return final_mask
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
@@ -206,11 +199,8 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    
-    if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-        
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main:
         print(f" {name}: {acc:.2f}%")
@@ -231,11 +221,8 @@ def evaluate_accuracy_ddp(model, loader, device):
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    
-    if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-        
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     acc = 100. * correct_tensor.item() / total_tensor.item()
     return acc
 
@@ -264,13 +251,11 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         sum_hesitancy += memberships.var(dim=2).sum(dim=0)
 
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
-    
-    if dist.is_initialized():
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-        dist.all_reduce(sum_weights, op=dist.ReduceOp.SUM)
-        dist.all_reduce(sum_activation, op=dist.ReduceOp.SUM)
-        dist.all_reduce(sum_membership_vals, op=dist.ReduceOp.SUM)
-        dist.all_reduce(sum_hesitancy, op=dist.ReduceOp.SUM)
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    dist.all_reduce(sum_weights, op=dist.ReduceOp.SUM)
+    dist.all_reduce(sum_activation, op=dist.ReduceOp.SUM)
+    dist.all_reduce(sum_membership_vals, op=dist.ReduceOp.SUM)
+    dist.all_reduce(sum_hesitancy, op=dist.ReduceOp.SUM)
 
     if is_main:
         total_correct = stats[0].item()
@@ -303,6 +288,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
+    """
+    تابع اصلاح‌شده training با نمایش جزئیات کامل
+    """
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -445,6 +433,284 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     return best_val_acc, history
 
 
+# ================== VISUALIZATION FUNCTIONS ==================
+def generate_visualizations_for_all_models(ensemble_module, base_models, test_loader, device, 
+                                          vis_dir, MODEL_NAMES, MEANS, STDS,
+                                          num_gradcam_samples, num_lime_samples, 
+                                          dataset_type, is_main):
+    """
+    تابع جدید برای تولید visualizations برای ensemble و همه مدل‌های تکی
+    """
+    if not is_main:
+        return
+    
+    os.makedirs(vis_dir, exist_ok=True)
+    print("\n" + "="*70)
+    print("GENERATING VISUALIZATIONS FOR ALL MODELS")
+    print("="*70)
+    
+    # انتخاب نمونه‌های مشترک
+    all_images = []
+    all_labels = []
+    all_indices = []
+    
+    for idx, (images, labels) in enumerate(test_loader):
+        all_images.append(images)
+        all_labels.append(labels)
+        all_indices.extend(range(idx * test_loader.batch_size, 
+                                idx * test_loader.batch_size + len(images)))
+        if len(all_images) * test_loader.batch_size >= max(num_gradcam_samples, num_lime_samples):
+            break
+    
+    all_images = torch.cat(all_images, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    
+    # تعیین نمونه‌ها برای Grad-CAM و LIME
+    gradcam_indices = list(range(min(num_gradcam_samples, len(all_images))))
+    lime_indices = list(range(min(num_lime_samples, len(all_images))))
+    
+    selected_images_gradcam = all_images[gradcam_indices]
+    selected_labels_gradcam = all_labels[gradcam_indices]
+    
+    selected_images_lime = all_images[lime_indices]
+    selected_labels_lime = all_labels[lime_indices]
+    
+    print(f"\nSelected {len(gradcam_indices)} samples for Grad-CAM")
+    print(f"Selected {len(lime_indices)} samples for LIME\n")
+    
+    # 1. Visualizations برای Ensemble
+    print("Generating visualizations for ENSEMBLE model...")
+    ensemble_vis_dir = os.path.join(vis_dir, 'ensemble')
+    os.makedirs(ensemble_vis_dir, exist_ok=True)
+    
+    generate_ensemble_gradcam(ensemble_module, selected_images_gradcam, 
+                            selected_labels_gradcam, device, 
+                            ensemble_vis_dir, MODEL_NAMES)
+    
+    generate_ensemble_lime(ensemble_module, selected_images_lime,
+                          selected_labels_lime, device,
+                          ensemble_vis_dir, dataset_type)
+    
+    # 2. Visualizations برای هر مدل تکی
+    for model_idx, (model, model_name) in enumerate(zip(base_models, MODEL_NAMES)):
+        print(f"\nGenerating visualizations for {model_name}...")
+        model_vis_dir = os.path.join(vis_dir, f'model_{model_idx+1}_{model_name}')
+        os.makedirs(model_vis_dir, exist_ok=True)
+        
+        # Normalize کردن تصاویر برای این مدل
+        normalizer = MultiModelNormalization([MEANS[model_idx]], [STDS[model_idx]]).to(device)
+        
+        # Grad-CAM برای مدل تکی
+        generate_single_model_gradcam(model, normalizer, selected_images_gradcam,
+                                     selected_labels_gradcam, device,
+                                     model_vis_dir, model_name)
+        
+        # LIME برای مدل تکی
+        generate_single_model_lime(model, normalizer, selected_images_lime,
+                                  selected_labels_lime, device,
+                                  model_vis_dir, model_name, dataset_type)
+    
+    print("\n" + "="*70)
+    print("ALL VISUALIZATIONS COMPLETED!")
+    print(f"Saved to: {vis_dir}")
+    print("="*70 + "\n")
+
+
+def generate_ensemble_gradcam(ensemble_module, images, labels, device, save_dir, model_names):
+    """تولید Grad-CAM برای مدل ensemble"""
+    import matplotlib.pyplot as plt
+    import cv2
+    
+    gradcam_dir = os.path.join(save_dir, 'gradcam')
+    os.makedirs(gradcam_dir, exist_ok=True)
+    
+    # استفاده از layer مناسب - معمولاً آخرین لایه کانولوشنی
+    target_layer = None
+    for name, module in ensemble_module.named_modules():
+        if isinstance(module, nn.Conv2d):
+            target_layer = module
+    
+    if target_layer is None:
+        print("Warning: No Conv2d layer found for Grad-CAM")
+        return
+    
+    gradcam = GradCAM(ensemble_module, target_layer)
+    
+    for idx in range(len(images)):
+        img = images[idx:idx+1].to(device)
+        label = labels[idx].item()
+        
+        # تولید Grad-CAM
+        cam = gradcam.generate_cam(img, target_class=None)
+        
+        # نرمال‌سازی برای نمایش
+        img_np = img[0].cpu().numpy().transpose(1, 2, 0)
+        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
+        
+        # Resize کردن CAM
+        cam_resized = cv2.resize(cam, (img_np.shape[1], img_np.shape[0]))
+        
+        # ایجاد heatmap
+        heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+        
+        # ترکیب تصویر اصلی و heatmap
+        superimposed = heatmap * 0.4 + img_np * 0.6
+        
+        # ذخیره تصویر
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes[0].imshow(img_np)
+        axes[0].set_title(f'Original (Label: {label})')
+        axes[0].axis('off')
+        
+        axes[1].imshow(cam_resized, cmap='jet')
+        axes[1].set_title('Grad-CAM')
+        axes[1].axis('off')
+        
+        axes[2].imshow(superimposed)
+        axes[2].set_title('Overlay')
+        axes[2].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(gradcam_dir, f'ensemble_gradcam_sample_{idx}.png'), 
+                   dpi=150, bbox_inches='tight')
+        plt.close()
+
+
+def generate_ensemble_lime(ensemble_module, images, labels, device, save_dir, dataset_type):
+    """تولید LIME برای مدل ensemble"""
+    lime_dir = os.path.join(save_dir, 'lime')
+    os.makedirs(lime_dir, exist_ok=True)
+    
+    for idx in range(len(images)):
+        img = images[idx:idx+1].to(device)
+        label = labels[idx].item()
+        
+        # تابع predict برای LIME
+        def predict_fn(x):
+            x_tensor = torch.from_numpy(x).permute(0, 3, 1, 2).float().to(device)
+            with torch.no_grad():
+                outputs, _ = ensemble_module(x_tensor)
+                probs = torch.sigmoid(outputs).cpu().numpy()
+            return np.concatenate([1 - probs, probs], axis=1)
+        
+        # تولید توضیح LIME
+        img_np = img[0].cpu().numpy().transpose(1, 2, 0)
+        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
+        
+        explanation = generate_lime_explanation(
+            img_np, predict_fn, label, 
+            save_path=os.path.join(lime_dir, f'ensemble_lime_sample_{idx}.png'),
+            dataset_type=dataset_type
+        )
+
+
+def generate_single_model_gradcam(model, normalizer, images, labels, device, 
+                                 save_dir, model_name):
+    """تولید Grad-CAM برای یک مدل تکی"""
+    import matplotlib.pyplot as plt
+    import cv2
+    
+    gradcam_dir = os.path.join(save_dir, 'gradcam')
+    os.makedirs(gradcam_dir, exist_ok=True)
+    
+    # پیدا کردن آخرین لایه Conv2d
+    target_layer = None
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            target_layer = module
+    
+    if target_layer is None:
+        print(f"Warning: No Conv2d layer found for {model_name}")
+        return
+    
+    # wrapper برای مدل که normalization را انجام دهد
+    class NormalizedModel(nn.Module):
+        def __init__(self, model, normalizer):
+            super().__init__()
+            self.model = model
+            self.normalizer = normalizer
+        
+        def forward(self, x):
+            x = self.normalizer(x, 0)
+            return self.model(x)
+    
+    wrapped_model = NormalizedModel(model, normalizer).to(device).eval()
+    gradcam = GradCAM(wrapped_model, target_layer)
+    
+    for idx in range(len(images)):
+        img = images[idx:idx+1].to(device)
+        label = labels[idx].item()
+        
+        # تولید Grad-CAM
+        cam = gradcam.generate_cam(img, target_class=None)
+        
+        # نرمال‌سازی برای نمایش
+        img_np = img[0].cpu().numpy().transpose(1, 2, 0)
+        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
+        
+        # Resize کردن CAM
+        cam_resized = cv2.resize(cam, (img_np.shape[1], img_np.shape[0]))
+        
+        # ایجاد heatmap
+        heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+        
+        # ترکیب
+        superimposed = heatmap * 0.4 + img_np * 0.6
+        
+        # ذخیره
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes[0].imshow(img_np)
+        axes[0].set_title(f'Original (Label: {label})')
+        axes[0].axis('off')
+        
+        axes[1].imshow(cam_resized, cmap='jet')
+        axes[1].set_title(f'{model_name} - Grad-CAM')
+        axes[1].axis('off')
+        
+        axes[2].imshow(superimposed)
+        axes[2].set_title('Overlay')
+        axes[2].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(gradcam_dir, f'{model_name}_gradcam_sample_{idx}.png'),
+                   dpi=150, bbox_inches='tight')
+        plt.close()
+
+
+def generate_single_model_lime(model, normalizer, images, labels, device,
+                              save_dir, model_name, dataset_type):
+    """تولید LIME برای یک مدل تکی"""
+    lime_dir = os.path.join(save_dir, 'lime')
+    os.makedirs(lime_dir, exist_ok=True)
+    
+    for idx in range(len(images)):
+        img = images[idx:idx+1].to(device)
+        label = labels[idx].item()
+        
+        # تابع predict
+        def predict_fn(x):
+            x_tensor = torch.from_numpy(x).permute(0, 3, 1, 2).float().to(device)
+            x_norm = normalizer(x_tensor, 0)
+            with torch.no_grad():
+                outputs = model(x_norm)
+                if isinstance(outputs, (tuple, list)):
+                    outputs = outputs[0]
+                probs = torch.sigmoid(outputs).cpu().numpy()
+            return np.concatenate([1 - probs, probs], axis=1)
+        
+        # تولید توضیح
+        img_np = img[0].cpu().numpy().transpose(1, 2, 0)
+        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
+        
+        explanation = generate_lime_explanation(
+            img_np, predict_fn, label,
+            save_path=os.path.join(lime_dir, f'{model_name}_lime_sample_{idx}.png'),
+            dataset_type=dataset_type
+        )
+
+
 # ================== DISTRIBUTED SETUP ==================
 def setup_distributed():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -465,6 +731,7 @@ def setup_distributed():
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
+
 
 # ================== MAIN FUNCTION ==================
 def main():
@@ -613,92 +880,14 @@ def main():
         }, final_model_path)
         print(f"Model saved: {final_model_path}")
 
-        # ================== VISUALIZATION SECTION (FIXED) ==================
-        print("\n" + "="*70)
-        print("GENERATING VISUALIZATIONS")
-        print("="*70)
-        
+        # تولید visualizations برای همه مدل‌ها
         vis_dir = os.path.join(args.save_dir, 'visualizations')
-        os.makedirs(vis_dir, exist_ok=True)
-
-        # 1. Prepare a fixed subset of data for consistency
-        num_vis_samples = max(args.num_grad_cam_samples, args.num_lime_samples)
-        
-        print(f"Selecting {num_vis_samples} samples for visualization...")
-        vis_dataset = test_loader.dataset
-        
-        # Select random indices
-        rng = np.random.default_rng(seed=999)
-        vis_indices = rng.choice(len(vis_dataset), size=num_vis_samples, replace=False)
-        vis_subset = Subset(vis_dataset, vis_indices)
-        
-        # Create a new DataLoader for the visualization subset
-        vis_loader = DataLoader(vis_subset, batch_size=1, shuffle=False, num_workers=2)
-        
-        # 2. Generate Visualizations for the Ensemble
-        print("\nGenerating GradCAM and LIME for the ENSEMBLE model...")
-        try:
-            generate_visualizations(
-                ensemble_module, vis_loader, device, vis_dir, MODEL_NAMES,
-                args.num_grad_cam_samples, args.num_lime_samples,
-                args.dataset, is_main)
-            print("Ensemble visualizations saved.")
-        except Exception as e:
-            print(f"Error generating ensemble visualizations: {e}")
-
-        # 3. Generate Visualizations for Single Models
-        print("\nGenerating GradCAM and LIME for SINGLE models...")
-        
-        # Helper class to normalize data on-the-fly for specific models
-        class NormalizedDataset(torch.utils.data.Dataset):
-            def __init__(self, subset, mean, std):
-                self.subset = subset
-                self.mean = torch.tensor(mean).view(1, 3, 1, 1)
-                self.std = torch.tensor(std).view(1, 3, 1, 1)
-            
-            def __len__(self):
-                return len(self.subset)
-            
-            def __getitem__(self, idx):
-                img, label = self.subset[idx]
-                # Normalize image
-                img_norm = (img - self.mean) / self.std
-                return img_norm, label
-
-        for i, model in enumerate(base_models):
-            model_name = MODEL_NAMES[i]
-            print(f"  -> Processing single model: {model_name}")
-            
-            single_vis_dir = os.path.join(vis_dir, f'single_model_{model_name}')
-            os.makedirs(single_vis_dir, exist_ok=True)
-            
-            # Create normalized dataset for this model
-            norm_subset = NormalizedDataset(vis_subset, MEANS[i], STDS[i])
-            norm_vis_loader = DataLoader(norm_subset, batch_size=1, shuffle=False, num_workers=2)
-
-            try:
-                # Pass the ORIGINAL model and NORMALIZED data
-                generate_visualizations(
-                    model, 
-                    norm_vis_loader, 
-                    device, 
-                    single_vis_dir, 
-                    [model_name], 
-                    args.num_grad_cam_samples, 
-                    args.num_lime_samples,
-                    args.dataset, 
-                    is_main
-                )
-                print(f"     Saved visualizations for {model_name}")
-            except Exception as e:
-                print(f"     Error generating visualizations for {model_name}: {e}")
-                import traceback
-                traceback.print_exc()
-
-        print("\nVisualization generation completed.")
-        print("="*70)
-        # ====================================================================
-
+        generate_visualizations_for_all_models(
+            ensemble_module, base_models, test_loader, device, vis_dir,
+            MODEL_NAMES, MEANS, STDS,
+            args.num_grad_cam_samples, args.num_lime_samples,
+            args.dataset, is_main
+        )
 
     cleanup_distributed()
 
