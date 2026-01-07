@@ -197,11 +197,15 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
-    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-    acc = 100. * correct_tensor.item() / total_tensor.item()
+    if dist.is_initialized():
+        correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+        total_tensor = torch.tensor(total, dtype=torch.long, device=device)
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        correct = correct_tensor.item()
+        total = total_tensor.item()
+    
+    acc = 100. * correct / total
     if is_main:
         print(f" {name}: {acc:.2f}%")
     return acc
@@ -219,11 +223,15 @@ def evaluate_accuracy_ddp(model, loader, device):
         total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
-    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-    acc = 100. * correct_tensor.item() / total_tensor.item()
+    if dist.is_initialized():
+        correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+        total_tensor = torch.tensor(total, dtype=torch.long, device=device)
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        correct = correct_tensor.item()
+        total = total_tensor.item()
+    
+    acc = 100. * correct / total
     return acc
 
 
@@ -250,16 +258,17 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         sum_membership_vals += memberships.sum(dim=0)
         sum_hesitancy += memberships.var(dim=2).sum(dim=0)
 
-    stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
-    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-    dist.all_reduce(sum_weights, op=dist.ReduceOp.SUM)
-    dist.all_reduce(sum_activation, op=dist.ReduceOp.SUM)
-    dist.all_reduce(sum_membership_vals, op=dist.ReduceOp.SUM)
-    dist.all_reduce(sum_hesitancy, op=dist.ReduceOp.SUM)
-
-    if is_main:
+    if dist.is_initialized():
+        stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_weights, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_activation, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_membership_vals, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_hesitancy, op=dist.ReduceOp.SUM)
         total_correct = stats[0].item()
         total_samples = stats[1].item()
+
+    if is_main:
         acc = 100. * total_correct / total_samples
         avg_weights = (sum_weights / total_samples).cpu().numpy()
         activation_percentages = (sum_activation / total_samples * 100).cpu().numpy()
