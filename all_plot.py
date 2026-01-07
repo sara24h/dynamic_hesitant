@@ -13,7 +13,6 @@ import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 
-# فرض بر این است که فایل‌های utility شما در همان مسیر هستند
 from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
@@ -208,7 +207,6 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     
-    # FIX: Check if distributed is initialized before all_reduce
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
@@ -234,7 +232,6 @@ def evaluate_accuracy_ddp(model, loader, device):
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     
-    # FIX: Check if distributed is initialized
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
@@ -268,7 +265,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
     
-    # FIX: Check if distributed is initialized before all_reduce
     if dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
         dist.all_reduce(sum_weights, op=dist.ReduceOp.SUM)
@@ -617,7 +613,7 @@ def main():
         }, final_model_path)
         print(f"Model saved: {final_model_path}")
 
-        # ================== VISUALIZATION SECTION ==================
+        # ================== VISUALIZATION SECTION (FIXED) ==================
         print("\n" + "="*70)
         print("GENERATING VISUALIZATIONS")
         print("="*70)
@@ -652,6 +648,23 @@ def main():
 
         # 3. Generate Visualizations for Single Models
         print("\nGenerating GradCAM and LIME for SINGLE models...")
+        
+        # Helper class to normalize data on-the-fly for specific models
+        class NormalizedDataset(torch.utils.data.Dataset):
+            def __init__(self, subset, mean, std):
+                self.subset = subset
+                self.mean = torch.tensor(mean).view(1, 3, 1, 1)
+                self.std = torch.tensor(std).view(1, 3, 1, 1)
+            
+            def __len__(self):
+                return len(self.subset)
+            
+            def __getitem__(self, idx):
+                img, label = self.subset[idx]
+                # Normalize image
+                img_norm = (img - self.mean) / self.std
+                return img_norm, label
+
         for i, model in enumerate(base_models):
             model_name = MODEL_NAMES[i]
             print(f"  -> Processing single model: {model_name}")
@@ -659,33 +672,32 @@ def main():
             single_vis_dir = os.path.join(vis_dir, f'single_model_{model_name}')
             os.makedirs(single_vis_dir, exist_ok=True)
             
-            # Wrapper to handle normalization specific to this single model
-            class ModelWrapper(nn.Module):
-                def __init__(self, model, mean, std):
-                    super().__init__()
-                    self.model = model
-                    self.mean = torch.tensor(mean).view(1, 3, 1, 1).to(device)
-                    self.std = torch.tensor(std).view(1, 3, 1, 1).to(device)
-                
-                def forward(self, x):
-                    x_norm = (x - self.mean) / self.std
-                    return self.model(x_norm)
-
-            wrapped_model = ModelWrapper(model, MEANS[i], STDS[i])
-            wrapped_model.eval()
+            # Create normalized dataset for this model
+            norm_subset = NormalizedDataset(vis_subset, MEANS[i], STDS[i])
+            norm_vis_loader = DataLoader(norm_subset, batch_size=1, shuffle=False, num_workers=2)
 
             try:
+                # Pass the ORIGINAL model and NORMALIZED data
                 generate_visualizations(
-                    wrapped_model, vis_loader, device, single_vis_dir, [model_name], 
-                    args.num_grad_cam_samples, args.num_lime_samples,
-                    args.dataset, is_main)
+                    model, 
+                    norm_vis_loader, 
+                    device, 
+                    single_vis_dir, 
+                    [model_name], 
+                    args.num_grad_cam_samples, 
+                    args.num_lime_samples,
+                    args.dataset, 
+                    is_main
+                )
                 print(f"     Saved visualizations for {model_name}")
             except Exception as e:
                 print(f"     Error generating visualizations for {model_name}: {e}")
+                import traceback
+                traceback.print_exc()
 
         print("\nVisualization generation completed.")
         print("="*70)
-        # ==========================================================
+        # ====================================================================
 
 
     cleanup_distributed()
