@@ -24,7 +24,14 @@ from dataset_utils import (
     DFDDataset
 )
 
-from visualization_utils import GradCAM, generate_lime_explanation
+from visualization_utils import generate_lime_explanation
+try:
+    from pytorch_grad_cam import GradCAM as PytorchGradCAM
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+    USE_PYTORCH_GRADCAM = True
+except ImportError:
+    USE_PYTORCH_GRADCAM = False
+    print("Warning: pytorch-grad-cam not available, skipping Grad-CAM visualizations")
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -527,63 +534,81 @@ def generate_visualizations_for_all_models(ensemble_module, base_models, test_lo
 
 def generate_ensemble_gradcam(ensemble_module, images, labels, device, save_dir, model_names):
     """تولید Grad-CAM برای مدل ensemble"""
+    if not USE_PYTORCH_GRADCAM:
+        print("Skipping Grad-CAM: pytorch-grad-cam not available")
+        return
+        
     import matplotlib.pyplot as plt
     import cv2
     
     gradcam_dir = os.path.join(save_dir, 'gradcam')
     os.makedirs(gradcam_dir, exist_ok=True)
     
-    # استفاده از layer مناسب - معمولاً آخرین لایه کانولوشنی
-    target_layer = None
-    for name, module in ensemble_module.named_modules():
+    # پیدا کردن لایه target - از hesitant_fuzzy استفاده می‌کنیم
+    target_layers = []
+    for module in ensemble_module.hesitant_fuzzy.feature_net.modules():
         if isinstance(module, nn.Conv2d):
-            target_layer = module
+            target_layers.append(module)
     
-    if target_layer is None:
+    if not target_layers:
         print("Warning: No Conv2d layer found for Grad-CAM")
         return
     
-    gradcam = GradCAM(ensemble_module, target_layer)
+    # استفاده از آخرین لایه
+    target_layer = [target_layers[-1]]
     
-    for idx in range(len(images)):
-        img = images[idx:idx+1].to(device)
-        label = labels[idx].item()
+    # ایجاد wrapper برای مدل
+    class EnsembleWrapper(nn.Module):
+        def __init__(self, ensemble):
+            super().__init__()
+            self.ensemble = ensemble
         
-        # تولید Grad-CAM
-        cam = gradcam.generate_cam(img, target_class=None)
+        def forward(self, x):
+            output, _ = self.ensemble(x)
+            return output.squeeze(1)
+    
+    wrapped_model = EnsembleWrapper(ensemble_module).eval()
+    
+    try:
+        cam = PytorchGradCAM(model=wrapped_model, target_layers=target_layer)
         
-        # نرمال‌سازی برای نمایش
-        img_np = img[0].cpu().numpy().transpose(1, 2, 0)
-        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-        
-        # Resize کردن CAM
-        cam_resized = cv2.resize(cam, (img_np.shape[1], img_np.shape[0]))
-        
-        # ایجاد heatmap
-        heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
-        
-        # ترکیب تصویر اصلی و heatmap
-        superimposed = heatmap * 0.4 + img_np * 0.6
-        
-        # ذخیره تصویر
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        axes[0].imshow(img_np)
-        axes[0].set_title(f'Original (Label: {label})')
-        axes[0].axis('off')
-        
-        axes[1].imshow(cam_resized, cmap='jet')
-        axes[1].set_title('Grad-CAM')
-        axes[1].axis('off')
-        
-        axes[2].imshow(superimposed)
-        axes[2].set_title('Overlay')
-        axes[2].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(gradcam_dir, f'ensemble_gradcam_sample_{idx}.png'), 
-                   dpi=150, bbox_inches='tight')
-        plt.close()
+        for idx in range(len(images)):
+            img = images[idx:idx+1].to(device)
+            label = labels[idx].item()
+            
+            # تولید CAM
+            grayscale_cam = cam(input_tensor=img, targets=None)
+            grayscale_cam = grayscale_cam[0, :]
+            
+            # نرمال‌سازی تصویر برای نمایش
+            img_np = img[0].cpu().numpy().transpose(1, 2, 0)
+            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+            
+            # ایجاد visualization
+            visualization = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
+            
+            # ذخیره تصویر
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            axes[0].imshow(img_np)
+            axes[0].set_title(f'Original (Label: {label})')
+            axes[0].axis('off')
+            
+            axes[1].imshow(grayscale_cam, cmap='jet')
+            axes[1].set_title('Grad-CAM Heatmap')
+            axes[1].axis('off')
+            
+            axes[2].imshow(visualization)
+            axes[2].set_title('Overlay')
+            axes[2].axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(gradcam_dir, f'ensemble_gradcam_sample_{idx}.png'), 
+                       dpi=150, bbox_inches='tight')
+            plt.close()
+    except Exception as e:
+        print(f"Error generating ensemble Grad-CAM: {e}")
+    finally:
+        del cam
 
 
 def generate_ensemble_lime(ensemble_module, images, labels, device, save_dir, dataset_type):
@@ -617,21 +642,27 @@ def generate_ensemble_lime(ensemble_module, images, labels, device, save_dir, da
 def generate_single_model_gradcam(model, normalizer, images, labels, device, 
                                  save_dir, model_name):
     """تولید Grad-CAM برای یک مدل تکی"""
+    if not USE_PYTORCH_GRADCAM:
+        print("Skipping Grad-CAM: pytorch-grad-cam not available")
+        return
+        
     import matplotlib.pyplot as plt
-    import cv2
     
     gradcam_dir = os.path.join(save_dir, 'gradcam')
     os.makedirs(gradcam_dir, exist_ok=True)
     
-    # پیدا کردن آخرین لایه Conv2d
-    target_layer = None
-    for name, module in model.named_modules():
+    # پیدا کردن لایه‌های Conv2d
+    target_layers = []
+    for module in model.modules():
         if isinstance(module, nn.Conv2d):
-            target_layer = module
+            target_layers.append(module)
     
-    if target_layer is None:
+    if not target_layers:
         print(f"Warning: No Conv2d layer found for {model_name}")
         return
+    
+    # استفاده از آخرین لایه
+    target_layer = [target_layers[-1]]
     
     # wrapper برای مدل که normalization را انجام دهد
     class NormalizedModel(nn.Module):
@@ -642,50 +673,53 @@ def generate_single_model_gradcam(model, normalizer, images, labels, device,
         
         def forward(self, x):
             x = self.normalizer(x, 0)
-            return self.model(x)
+            out = self.model(x)
+            if isinstance(out, (tuple, list)):
+                out = out[0]
+            return out.squeeze(1)
     
     wrapped_model = NormalizedModel(model, normalizer).to(device).eval()
-    gradcam = GradCAM(wrapped_model, target_layer)
     
-    for idx in range(len(images)):
-        img = images[idx:idx+1].to(device)
-        label = labels[idx].item()
+    try:
+        cam = PytorchGradCAM(model=wrapped_model, target_layers=target_layer)
         
-        # تولید Grad-CAM
-        cam = gradcam.generate_cam(img, target_class=None)
-        
-        # نرمال‌سازی برای نمایش
-        img_np = img[0].cpu().numpy().transpose(1, 2, 0)
-        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-        
-        # Resize کردن CAM
-        cam_resized = cv2.resize(cam, (img_np.shape[1], img_np.shape[0]))
-        
-        # ایجاد heatmap
-        heatmap = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
-        
-        # ترکیب
-        superimposed = heatmap * 0.4 + img_np * 0.6
-        
-        # ذخیره
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        axes[0].imshow(img_np)
-        axes[0].set_title(f'Original (Label: {label})')
-        axes[0].axis('off')
-        
-        axes[1].imshow(cam_resized, cmap='jet')
-        axes[1].set_title(f'{model_name} - Grad-CAM')
-        axes[1].axis('off')
-        
-        axes[2].imshow(superimposed)
-        axes[2].set_title('Overlay')
-        axes[2].axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(gradcam_dir, f'{model_name}_gradcam_sample_{idx}.png'),
-                   dpi=150, bbox_inches='tight')
-        plt.close()
+        for idx in range(len(images)):
+            img = images[idx:idx+1].to(device)
+            label = labels[idx].item()
+            
+            # تولید CAM
+            grayscale_cam = cam(input_tensor=img, targets=None)
+            grayscale_cam = grayscale_cam[0, :]
+            
+            # نرمال‌سازی برای نمایش
+            img_np = img[0].cpu().numpy().transpose(1, 2, 0)
+            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+            
+            # ایجاد visualization
+            visualization = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
+            
+            # ذخیره
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            axes[0].imshow(img_np)
+            axes[0].set_title(f'Original (Label: {label})')
+            axes[0].axis('off')
+            
+            axes[1].imshow(grayscale_cam, cmap='jet')
+            axes[1].set_title(f'{model_name} - Grad-CAM')
+            axes[1].axis('off')
+            
+            axes[2].imshow(visualization)
+            axes[2].set_title('Overlay')
+            axes[2].axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(gradcam_dir, f'{model_name}_gradcam_sample_{idx}.png'),
+                       dpi=150, bbox_inches='tight')
+            plt.close()
+    except Exception as e:
+        print(f"Error generating Grad-CAM for {model_name}: {e}")
+    finally:
+        del cam
 
 
 def generate_single_model_lime(model, normalizer, images, labels, device,
@@ -711,13 +745,16 @@ def generate_single_model_lime(model, normalizer, images, labels, device,
         
         # تولید توضیح
         img_np = img[0].cpu().numpy().transpose(1, 2, 0)
-        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
+        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
         
-        explanation = generate_lime_explanation(
-            img_np, predict_fn, label,
-            save_path=os.path.join(lime_dir, f'{model_name}_lime_sample_{idx}.png'),
-            dataset_type=dataset_type
-        )
+        try:
+            explanation = generate_lime_explanation(
+                img_np, predict_fn, label,
+                save_path=os.path.join(lime_dir, f'{model_name}_lime_sample_{idx}.png'),
+                dataset_type=dataset_type
+            )
+        except Exception as e:
+            print(f"Error generating LIME for {model_name} sample {idx}: {e}")
 
 
 # ================== DISTRIBUTED SETUP ==================
