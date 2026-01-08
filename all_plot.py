@@ -14,6 +14,13 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 from metrics_utils import plot_roc_and_f1
 
+# ایمپورت‌های جدید برای ذخیره سازی LIME
+import matplotlib.pyplot as plt
+try:
+    from skimage.segmentation import mark_boundaries
+except ImportError:
+    mark_boundaries = None
+
 warnings.filterwarnings("ignore")
 
 from dataset_utils import (
@@ -632,11 +639,27 @@ def generate_ensemble_lime(ensemble_module, images, labels, device, save_dir, da
         img_np = img[0].cpu().numpy().transpose(1, 2, 0)
         img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
         
+        # --- اصلاح شده: فراخوانی بدون آرگومان save_path ---
         explanation = generate_lime_explanation(
             img_np, predict_fn, label, 
-            save_path=os.path.join(lime_dir, f'ensemble_lime_sample_{idx}.png'),
             dataset_type=dataset_type
         )
+        
+        # --- اضافه شده: ذخیره سازی دستی تصویر ---
+        if explanation is not None and mark_boundaries is not None:
+            try:
+                temp, mask = explanation.get_image_and_mask(
+                    explanation.top_labels[0], 
+                    positive_only=True, 
+                    num_features=5, 
+                    hide_rest=False
+                )
+                plt.imshow(mark_boundaries(temp / 255.0, mask))
+                plt.title(f"Ensemble LIME - Label: {label}")
+                plt.savefig(os.path.join(lime_dir, f'ensemble_lime_sample_{idx}.png'))
+                plt.close()
+            except Exception as save_e:
+                print(f"Could not save LIME image for sample {idx}: {save_e}")
 
 
 def generate_single_model_gradcam(model, normalizer, images, labels, device, 
@@ -755,15 +778,13 @@ def generate_single_model_lime(model, normalizer, images, labels, device,
             )
             
             # --- اضافه شده: ذخیره سازی دستی ---
-            if explanation is not None:
-                 from skimage.segmentation import mark_boundaries
+            if explanation is not None and mark_boundaries is not None:
                  temp, mask = explanation.get_image_and_mask(
                     explanation.top_labels[0], 
                     positive_only=True, 
                     num_features=5, 
                     hide_rest=False
                 )
-                import matplotlib.pyplot as plt
                 plt.imshow(mark_boundaries(temp / 255.0, mask))
                 plt.title(f"{model_name} LIME - Label: {label}")
                 plt.savefig(os.path.join(lime_dir, f'{model_name}_lime_sample_{idx}.png'))
