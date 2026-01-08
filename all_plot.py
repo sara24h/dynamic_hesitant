@@ -626,56 +626,8 @@ def generate_ensemble_gradcam(ensemble_module, images, labels, device, save_dir,
         del cam
 
 
-def generate_ensemble_lime(ensemble_module, images, labels, device, save_dir):
-    """تولید LIME برای مدل ensemble"""
-    lime_dir = os.path.join(save_dir, 'lime')
-    os.makedirs(lime_dir, exist_ok=True)
-    
-    for idx in range(len(images)):
-        img = images[idx:idx+1].to(device)
-        label = labels[idx].item()
-        
-        # تابع predict برای LIME
-        def predict_fn(x):
-            x_tensor = torch.from_numpy(x).permute(0, 3, 1, 2).float().to(device)
-            with torch.no_grad():
-                outputs, _ = ensemble_module(x_tensor)
-                probs = torch.sigmoid(outputs).cpu().numpy()
-            return np.concatenate([1 - probs, probs], axis=1)
-        
-        # تولید توضیح LIME
-        img_np = img[0].cpu().numpy().transpose(1, 2, 0)
-        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
-        
-        # FIX: Pass label (int) as 3rd argument, removed dataset_type
-        try:
-            explanation = generate_lime_explanation(
-                img_np, predict_fn, label
-            )
-            
-            # ذخیره سازی دستی تصویر
-            if explanation is not None and mark_boundaries is not None:
-                try:
-                    temp, mask = explanation.get_image_and_mask(
-                        explanation.top_labels[0], 
-                        positive_only=True, 
-                        num_features=5, 
-                        hide_rest=False
-                    )
-                    plt.imshow(mark_boundaries(temp / 255.0, mask))
-                    plt.title(f"Ensemble LIME - Label: {label}")
-                    plt.savefig(os.path.join(lime_dir, f'ensemble_lime_sample_{idx}.png'))
-                    plt.close()
-                except Exception as save_e:
-                    print(f"Could not save LIME image for sample {idx}: {save_e}")
-        except Exception as te:
-             # Fallback if arguments still don't match
-             print(f"LIME Warning: {te}. Skipping visualization for sample {idx}.")
-
-
-def generate_single_model_gradcam(model, normalizer, images, labels, device, 
-                                 save_dir, model_name):
-    """تولید Grad-CAM برای یک مدل تکی"""
+def generate_ensemble_gradcam(ensemble_module, images, labels, device, save_dir, model_names):
+    """تولید Grad-CAM برای مدل ensemble - اصلاح شده"""
     if not USE_PYTORCH_GRADCAM:
         print("Skipping Grad-CAM: pytorch-grad-cam not available")
         return
@@ -685,20 +637,160 @@ def generate_single_model_gradcam(model, normalizer, images, labels, device,
     gradcam_dir = os.path.join(save_dir, 'gradcam')
     os.makedirs(gradcam_dir, exist_ok=True)
     
-    # پیدا کردن لایه‌های Conv2d
+    # پیدا کردن لایه target
+    target_layers = []
+    for module in ensemble_module.hesitant_fuzzy.feature_net.modules():
+        if isinstance(module, nn.Conv2d):
+            target_layers.append(module)
+    
+    if not target_layers:
+        print("Warning: No Conv2d layer found for Grad-CAM")
+        return
+    
+    target_layer = [target_layers[-1]]
+    
+    class EnsembleWrapper(nn.Module):
+        def __init__(self, ensemble):
+            super().__init__()
+            self.ensemble = ensemble
+        
+        def forward(self, x):
+            output, _ = self.ensemble(x)
+            return output.squeeze(1)
+    
+    wrapped_model = EnsembleWrapper(ensemble_module).eval()
+    
+    try:
+        cam = PytorchGradCAM(model=wrapped_model, target_layers=target_layer)
+        
+        for idx in range(len(images)):
+            img = images[idx:idx+1].to(device)
+            label = int(labels[idx].item())  # ✅ تبدیل به int
+            
+            # ✅ FIX: targets باید None باشد یا یک لیست از اشیاء خاص
+            targets = None  # استفاده از highest scoring class
+            
+            grayscale_cam = cam(input_tensor=img, targets=targets)
+            grayscale_cam = grayscale_cam[0, :]
+            
+            # نرمال‌سازی تصویر
+            img_np = img[0].cpu().numpy().transpose(1, 2, 0)
+            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+            
+            visualization = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
+            
+            # ذخیره تصویر
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            axes[0].imshow(img_np)
+            axes[0].set_title(f'Original (Label: {label})')
+            axes[0].axis('off')
+            
+            axes[1].imshow(grayscale_cam, cmap='jet')
+            axes[1].set_title('Grad-CAM Heatmap')
+            axes[1].axis('off')
+            
+            axes[2].imshow(visualization)
+            axes[2].set_title('Overlay')
+            axes[2].axis('off')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(gradcam_dir, f'ensemble_gradcam_sample_{idx}.png'), 
+                       dpi=150, bbox_inches='tight')
+            plt.close()
+            
+    except Exception as e:
+        print(f"Error generating ensemble Grad-CAM: {e}")
+    finally:
+        if 'cam' in locals():
+            del cam
+
+
+def generate_ensemble_lime(ensemble_module, images, labels, device, save_dir):
+    """تولید LIME برای مدل ensemble - اصلاح شده"""
+    try:
+        from lime import lime_image
+    except ImportError:
+        print("LIME not available - skipping")
+        return
+    
+    lime_dir = os.path.join(save_dir, 'lime')
+    os.makedirs(lime_dir, exist_ok=True)
+    
+    # ✅ ایجاد explainer یک بار
+    explainer = lime_image.LimeImageExplainer()
+    
+    for idx in range(len(images)):
+        img = images[idx:idx+1].to(device)
+        label = int(labels[idx].item())
+        
+        def predict_fn(x):
+            """تابع prediction برای LIME"""
+            x_tensor = torch.from_numpy(x).permute(0, 3, 1, 2).float().to(device)
+            with torch.no_grad():
+                outputs, _ = ensemble_module(x_tensor)
+                probs = torch.sigmoid(outputs).cpu().numpy()
+            return np.concatenate([1 - probs, probs], axis=1)
+        
+        # آماده‌سازی تصویر
+        img_np = img[0].cpu().numpy().transpose(1, 2, 0)
+        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
+        img_np = (img_np * 255).astype(np.uint8)  # ✅ LIME نیاز به uint8 دارد
+        
+        try:
+            # ✅ تولید explanation
+            explanation = explainer.explain_instance(
+                img_np,
+                predict_fn,
+                top_labels=2,
+                hide_color=0,
+                num_samples=100
+            )
+            
+            # ذخیره تصویر
+            if mark_boundaries is not None:
+                temp, mask = explanation.get_image_and_mask(
+                    label, 
+                    positive_only=True, 
+                    num_features=5, 
+                    hide_rest=False
+                )
+                
+                import matplotlib.pyplot as plt
+                plt.figure(figsize=(10, 5))
+                plt.imshow(mark_boundaries(temp / 255.0, mask))
+                plt.title(f"Ensemble LIME - True Label: {label}")
+                plt.axis('off')
+                plt.savefig(os.path.join(lime_dir, f'ensemble_lime_sample_{idx}.png'),
+                           bbox_inches='tight', dpi=150)
+                plt.close()
+                
+        except Exception as e:
+            print(f"LIME Error for sample {idx}: {e}")
+
+
+# ✅ همین تغییرات را برای توابع single model هم اعمال کنید:
+def generate_single_model_gradcam(model, normalizer, images, labels, device, 
+                                 save_dir, model_name):
+    """تولید Grad-CAM برای مدل تکی - اصلاح شده"""
+    if not USE_PYTORCH_GRADCAM:
+        return
+        
+    import matplotlib.pyplot as plt
+    
+    gradcam_dir = os.path.join(save_dir, 'gradcam')
+    os.makedirs(gradcam_dir, exist_ok=True)
+    
     target_layers = []
     for module in model.modules():
         if isinstance(module, nn.Conv2d):
             target_layers.append(module)
     
     if not target_layers:
-        print(f"Warning: No Conv2d layer found for {model_name}")
+        print(f"Warning: No Conv2d layers in {model_name}")
         return
     
-    # استفاده از آخرین لایه
     target_layer = [target_layers[-1]]
     
-    # wrapper برای مدل که normalization را انجام دهد
     class NormalizedModel(nn.Module):
         def __init__(self, model, normalizer):
             super().__init__()
@@ -719,23 +811,18 @@ def generate_single_model_gradcam(model, normalizer, images, labels, device,
         
         for idx in range(len(images)):
             img = images[idx:idx+1].to(device)
-            label = labels[idx].item()
+            label = int(labels[idx].item())
             
-            # FIX: Pass None as targets
-            targets = None
+            targets = None  # ✅ اصلاح شده
             
-            # تولید CAM
             grayscale_cam = cam(input_tensor=img, targets=targets)
             grayscale_cam = grayscale_cam[0, :]
             
-            # نرمال‌سازی برای نمایش
             img_np = img[0].cpu().numpy().transpose(1, 2, 0)
             img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
             
-            # ایجاد visualization
             visualization = show_cam_on_image(img_np, grayscale_cam, use_rgb=True)
             
-            # ذخیره
             fig, axes = plt.subplots(1, 3, figsize=(15, 5))
             axes[0].imshow(img_np)
             axes[0].set_title(f'Original (Label: {label})')
@@ -750,62 +837,15 @@ def generate_single_model_gradcam(model, normalizer, images, labels, device,
             axes[2].axis('off')
             
             plt.tight_layout()
-            plt.savefig(os.path.join(gradcam_dir, f'{model_name}_gradcam_sample_{idx}.png'),
+            plt.savefig(os.path.join(gradcam_dir, f'{model_name}_gradcam_{idx}.png'),
                        dpi=150, bbox_inches='tight')
             plt.close()
-    except Exception as e:
-        print(f"Error generating Grad-CAM for {model_name}: {e}")
-    finally:
-        del cam
-
-
-def generate_single_model_lime(model, normalizer, images, labels, device,
-                              save_dir, model_name):
-    """تولید LIME برای یک مدل تکی"""
-    lime_dir = os.path.join(save_dir, 'lime')
-    os.makedirs(lime_dir, exist_ok=True)
-    
-    for idx in range(len(images)):
-        img = images[idx:idx+1].to(device)
-        label = labels[idx].item()
-        
-        # تابع predict
-        def predict_fn(x):
-            x_tensor = torch.from_numpy(x).permute(0, 3, 1, 2).float().to(device)
-            x_norm = normalizer(x_tensor, 0)
-            with torch.no_grad():
-                outputs = model(x_norm)
-                if isinstance(outputs, (tuple, list)):
-                    outputs = outputs[0]
-                probs = torch.sigmoid(outputs).cpu().numpy()
-            return np.concatenate([1 - probs, probs], axis=1)
-        
-        # تولید توضیح
-        img_np = img[0].cpu().numpy().transpose(1, 2, 0)
-        img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
-        
-        try:
-            # FIX: Pass label (int) as 3rd arg
-            explanation = generate_lime_explanation(
-                img_np, predict_fn, label
-            )
             
-            # ذخیره سازی دستی
-            if explanation is not None and mark_boundaries is not None:
-                 temp, mask = explanation.get_image_and_mask(
-                    explanation.top_labels[0], 
-                    positive_only=True, 
-                    num_features=5, 
-                    hide_rest=False
-                )
-                 plt.imshow(mark_boundaries(temp / 255.0, mask))
-                 plt.title(f"{model_name} LIME - Label: {label}")
-                 plt.savefig(os.path.join(lime_dir, f'{model_name}_lime_sample_{idx}.png'))
-                 plt.close()
-
-        except Exception as e:
-            print(f"Error generating LIME for {model_name} sample {idx}: {e}")
-
+    except Exception as e:
+        print(f"Error in Grad-CAM for {model_name}: {e}")
+    finally:
+        if 'cam' in locals():
+            del cam
 
 # ================== DISTRIBUTED SETUP ==================
 def setup_distributed():
@@ -1000,4 +1040,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-print(f"Successfully updated {file_path} with corrected code.")
+
