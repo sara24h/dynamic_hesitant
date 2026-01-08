@@ -584,10 +584,11 @@ def generate_ensemble_gradcam(ensemble_module, images, labels, device, save_dir,
         
         for idx in range(len(images)):
             img = images[idx:idx+1].to(device)
+            # FIX: Extract label as int, do NOT pass as target to gradcam for simplicity
+            # or ensure we handle targets list correctly if needed.
+            # Here we pass None to targets to use highest scoring class.
             label = labels[idx].item()
             
-            # Fix: Pass None as targets to use highest scoring class, 
-            # or create a ClassifierTarget if specific class is needed.
             targets = None 
             
             # تولید CAM
@@ -646,7 +647,7 @@ def generate_ensemble_lime(ensemble_module, images, labels, device, save_dir):
         img_np = img[0].cpu().numpy().transpose(1, 2, 0)
         img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
         
-        # Fix: Removed dataset_type argument, passed label (integer) as 3rd arg
+        # FIX: Pass label (int) as 3rd argument, removed dataset_type
         try:
             explanation = generate_lime_explanation(
                 img_np, predict_fn, label
@@ -720,7 +721,7 @@ def generate_single_model_gradcam(model, normalizer, images, labels, device,
             img = images[idx:idx+1].to(device)
             label = labels[idx].item()
             
-            # Fix: Targets handling
+            # FIX: Pass None as targets
             targets = None
             
             # تولید CAM
@@ -784,7 +785,7 @@ def generate_single_model_lime(model, normalizer, images, labels, device,
         img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
         
         try:
-            # Fix: Passed label (integer) as 3rd arg
+            # FIX: Pass label (int) as 3rd arg
             explanation = generate_lime_explanation(
                 img_np, predict_fn, label
             )
@@ -998,3 +999,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+print(f"Successfully updated {file_path} with corrected code.")
