@@ -785,10 +785,10 @@ def generate_single_model_lime(model, normalizer, images, labels, device,
                     num_features=5, 
                     hide_rest=False
                 )
-                plt.imshow(mark_boundaries(temp / 255.0, mask))
-                plt.title(f"{model_name} LIME - Label: {label}")
-                plt.savefig(os.path.join(lime_dir, f'{model_name}_lime_sample_{idx}.png'))
-                plt.close()
+                 plt.imshow(mark_boundaries(temp / 255.0, mask))
+                 plt.title(f"{model_name} LIME - Label: {label}")
+                 plt.savefig(os.path.join(lime_dir, f'{model_name}_lime_sample_{idx}.png'))
+                 plt.close()
 
         except Exception as e:
             print(f"Error generating LIME for {model_name} sample {idx}: {e}")
