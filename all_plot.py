@@ -748,11 +748,27 @@ def generate_single_model_lime(model, normalizer, images, labels, device,
         img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
         
         try:
+            # --- اصلاح شده: آرگومان save_path حذف شد ---
             explanation = generate_lime_explanation(
                 img_np, predict_fn, label,
-                save_path=os.path.join(lime_dir, f'{model_name}_lime_sample_{idx}.png'),
                 dataset_type=dataset_type
             )
+            
+            # --- اضافه شده: ذخیره سازی دستی ---
+            if explanation is not None:
+                 from skimage.segmentation import mark_boundaries
+                 temp, mask = explanation.get_image_and_mask(
+                    explanation.top_labels[0], 
+                    positive_only=True, 
+                    num_features=5, 
+                    hide_rest=False
+                )
+                import matplotlib.pyplot as plt
+                plt.imshow(mark_boundaries(temp / 255.0, mask))
+                plt.title(f"{model_name} LIME - Label: {label}")
+                plt.savefig(os.path.join(lime_dir, f'{model_name}_lime_sample_{idx}.png'))
+                plt.close()
+
         except Exception as e:
             print(f"Error generating LIME for {model_name} sample {idx}: {e}")
 
