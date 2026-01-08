@@ -586,8 +586,8 @@ def generate_ensemble_gradcam(ensemble_module, images, labels, device, save_dir,
             img = images[idx:idx+1].to(device)
             label = labels[idx].item()
             
-            # Fix: Ensure targets is a list of integers or None, not a scalar
-            # None defaults to predicting the highest scoring class
+            # Fix: Pass None as targets to use highest scoring class, 
+            # or create a ClassifierTarget if specific class is needed.
             targets = None 
             
             # تولید CAM
@@ -646,7 +646,7 @@ def generate_ensemble_lime(ensemble_module, images, labels, device, save_dir):
         img_np = img[0].cpu().numpy().transpose(1, 2, 0)
         img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min())
         
-        # Fix: Removed dataset_type argument
+        # Fix: Removed dataset_type argument, passed label (integer) as 3rd arg
         try:
             explanation = generate_lime_explanation(
                 img_np, predict_fn, label
@@ -667,8 +667,8 @@ def generate_ensemble_lime(ensemble_module, images, labels, device, save_dir):
                     plt.close()
                 except Exception as save_e:
                     print(f"Could not save LIME image for sample {idx}: {save_e}")
-        except TypeError as te:
-             # Fallback if arguments still don't match, try with minimal args
+        except Exception as te:
+             # Fallback if arguments still don't match
              print(f"LIME Warning: {te}. Skipping visualization for sample {idx}.")
 
 
@@ -784,7 +784,7 @@ def generate_single_model_lime(model, normalizer, images, labels, device,
         img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
         
         try:
-            # Fix: Removed dataset_type
+            # Fix: Passed label (integer) as 3rd arg
             explanation = generate_lime_explanation(
                 img_np, predict_fn, label
             )
@@ -802,8 +802,6 @@ def generate_single_model_lime(model, normalizer, images, labels, device,
                  plt.savefig(os.path.join(lime_dir, f'{model_name}_lime_sample_{idx}.png'))
                  plt.close()
 
-        except TypeError as te:
-             print(f"LIME Warning: {te}. Skipping visualization for {model_name} sample {idx}.")
         except Exception as e:
             print(f"Error generating LIME for {model_name} sample {idx}: {e}")
 
