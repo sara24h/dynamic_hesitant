@@ -9,7 +9,55 @@ from typing import List, Tuple
 from sklearn.model_selection import train_test_split
 from PIL import Image
 
-# ================== DATASET CLASSES ==================
+class CustomGenAIDataset(Dataset):
+  
+    def __init__(self, root_dir, fake_classes, real_class, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.samples = []
+      
+        self.label_map = {
+            'fake': 0,
+            'real': 1
+        }
+
+        # --- بخش لود کردن تصاویر Fake ---
+        print(f"[CustomDataset] Loading Fake images from: {fake_classes}")
+        for class_name in fake_classes:
+            class_path = os.path.join(root_dir, class_name)
+            if os.path.exists(class_path):
+                # اگر عکس‌ها مستقیماً در پوشه هستند
+                files = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                for img_file in files:
+                    img_path = os.path.join(class_path, img_file)
+                    self.samples.append((img_path, self.label_map['fake']))
+            else:
+                print(f"[Warning] Path not found: {class_path}")
+
+        # --- بخش لود کردن تصاویر Real ---
+        print(f"[CustomDataset] Loading Real images from: {real_class}")
+        real_path = os.path.join(root_dir, real_class)
+        if os.path.exists(real_path):
+            files = [f for f in os.listdir(real_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            for img_file in files:
+                img_path = os.path.join(real_path, img_file)
+                self.samples.append((img_path, self.label_map['real']))
+        else:
+            print(f"[Warning] Path not found: {real_path}")
+
+        print(f"[CustomDataset] Total loaded images: {len(self.samples)}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
 class UADFVDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
@@ -47,8 +95,6 @@ class DFDDataset(Dataset):
         self.samples = []
         self.class_to_idx = {'fake': 1, 'real': 0}
 
-        # اگر split مشخص شده باشد (مثل 'train') فقط آن را لود می‌کند
-        # اگر split=None باشد، کل پوشه‌ها (train, val, test) را لود می‌کند
         search_dirs = [split] if split else ['train', 'val', 'test']
         
         for s in search_dirs:
@@ -61,7 +107,6 @@ class DFDDataset(Dataset):
                 if not os.path.isdir(video_path):
                     continue
                 
-                # تشخیص لیبل
                 if 'fake' in video_folder.lower():
                     label = 1
                 elif 'real' in video_folder.lower():
@@ -90,6 +135,7 @@ class TransformSubset(Subset):
         self.transform = transform
 
     def __getitem__(self, idx):
+       
         img_path, label = self.dataset.samples[self.indices[idx]]
         img = Image.open(img_path).convert('RGB')
         if self.transform:
@@ -97,6 +143,7 @@ class TransformSubset(Subset):
         return img, label
 
 # ================== UTILITY FUNCTIONS ==================
+
 def get_sample_info(dataset, index):
     if hasattr(dataset, 'samples'):
         return dataset.samples[index]
@@ -106,147 +153,103 @@ def get_sample_info(dataset, index):
         raise AttributeError("Cannot find samples in dataset")
 
 
-def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    all_video_ids = set()
+def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+   
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
+    num_samples = len(dataset)
+    indices = list(range(num_samples))
     
+    labels = [dataset.samples[i][1] for i in indices]
+
+    # تقسیم به Train+Val و Test
+    train_val_indices, test_indices = train_test_split(
+        indices, test_size=test_ratio, random_state=seed, stratify=labels)
+    
+    # محاسبه نسبت مجدد برای Val نسبت به باقی‌مانده
+    train_val_labels = [labels[i] for i in train_val_indices]
+    val_size = val_ratio / (train_ratio + val_ratio)
+    
+    # تقسیم به Train و Val
+    train_indices, val_indices = train_test_split(
+        train_val_indices, test_size=val_size, random_state=seed, stratify=train_val_labels)
+        
+    return train_indices, val_indices, test_indices
+
+
+def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    # (کدهای قبلی بدون تغییر - برای اختصار حفظ شده)
+    all_video_ids = set()
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
-        
-        # منطق UADFV: حذف _fake از انتهای نام
         if '_fake' in dir_name:
             video_id = dir_name.replace('_fake', '')
         else:
             video_id = dir_name
-            
         all_video_ids.add(video_id)
 
     all_video_ids = sorted(list(all_video_ids))
     print(f"[Split] Found {len(all_video_ids)} unique video pairs (Real+Fake).")
 
-    train_val_ids, test_ids = train_test_split(
-        all_video_ids,
-        test_size=test_ratio,
-        random_state=seed
-    )
-    
+    train_val_ids, test_ids = train_test_split(all_video_ids, test_size=test_ratio, random_state=seed)
     val_size_adjusted = val_ratio / (train_ratio + val_ratio)
-    train_ids, val_ids = train_test_split(
-        train_val_ids,
-        test_size=val_size_adjusted,
-        random_state=seed
-    )
+    train_ids, val_ids = train_test_split(train_val_ids, test_size=val_size_adjusted, random_state=seed)
     
-    print(f"[Split] Videos -> Train: {len(train_ids)}, Val: {len(val_ids)}, Test: {len(test_ids)}")
-
     train_indices = []
     val_indices = []
     test_indices = []
     
     for idx, (img_path, label) in enumerate(dataset.samples):
         dir_name = os.path.basename(os.path.dirname(img_path))
-        
         if '_fake' in dir_name:
             vid_id = dir_name.replace('_fake', '')
         else:
             vid_id = dir_name
             
-        if vid_id in test_ids:
-            test_indices.append(idx)
-        elif vid_id in val_ids:
-            val_indices.append(idx)
-        elif vid_id in train_ids:
-            train_indices.append(idx)
-        else:
-            print(f"[Warning] Video ID {vid_id} not found in splits!")
+        if vid_id in test_ids: test_indices.append(idx)
+        elif vid_id in val_ids: val_indices.append(idx)
+        elif vid_id in train_ids: train_indices.append(idx)
             
-    print(f"[Split] Frames -> Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
     return train_indices, val_indices, test_indices
 
 
 def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-   
+    # (کدهای قبلی بدون تغییر - برای اختصار حفظ شده)
     all_video_ids = set()
-    
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
- 
-        
         vid_id = dir_name
-        if vid_id.startswith('fake_'):
-            vid_id = vid_id.replace('fake_', '', 1)
-        elif vid_id.startswith('real_'):
-            vid_id = vid_id.replace('real_', '', 1)
-        elif '_fake' in vid_id: # پشتیبانی از حالت‌ دیگر
-            vid_id = vid_id.replace('_fake', '_')
-        elif '_real' in vid_id:
-            vid_id = vid_id.replace('_real', '_')
-            
+        if vid_id.startswith('fake_'): vid_id = vid_id.replace('fake_', '', 1)
+        elif vid_id.startswith('real_'): vid_id = vid_id.replace('real_', '', 1)
+        elif '_fake' in vid_id: vid_id = vid_id.replace('_fake', '_')
+        elif '_real' in vid_id: vid_id = vid_id.replace('_real', '_')
         all_video_ids.add(vid_id)
 
     all_video_ids = sorted(list(all_video_ids))
-    print(f"[Split] Found {len(all_video_ids)} unique video IDs.")
-
-    train_val_ids, test_ids = train_test_split(
-        all_video_ids,
-        test_size=test_ratio,
-        random_state=seed
-    )
-    
+    train_val_ids, test_ids = train_test_split(all_video_ids, test_size=test_ratio, random_state=seed)
     val_size_adjusted = val_ratio / (train_ratio + val_ratio)
-    train_ids, val_ids = train_test_split(
-        train_val_ids,
-        test_size=val_size_adjusted,
-        random_state=seed
-    )
+    train_ids, val_ids = train_test_split(train_val_ids, test_size=val_size_adjusted, random_state=seed)
     
-    print(f"[Split] Videos -> Train: {len(train_ids)}, Val: {len(val_ids)}, Test: {len(test_ids)}")
-
-    train_indices = []
-    val_indices = []
-    test_indices = []
-    
+    train_indices, val_indices, test_indices = [], [], []
     for idx, (img_path, label) in enumerate(dataset.samples):
         dir_name = os.path.basename(os.path.dirname(img_path))
-        
         vid_id = dir_name
-        if vid_id.startswith('fake_'):
-            vid_id = vid_id.replace('fake_', '', 1)
-        elif vid_id.startswith('real_'):
-            vid_id = vid_id.replace('real_', '', 1)
-        elif '_fake' in vid_id:
-            vid_id = vid_id.replace('_fake', '_')
-        elif '_real' in vid_id:
-            vid_id = vid_id.replace('_real', '_')
+        if vid_id.startswith('fake_'): vid_id = vid_id.replace('fake_', '', 1)
+        elif vid_id.startswith('real_'): vid_id = vid_id.replace('real_', '', 1)
+        elif '_fake' in vid_id: vid_id = vid_id.replace('_fake', '_')
+        elif '_real' in vid_id: vid_id = vid_id.replace('_real', '_')
             
-        if vid_id in test_ids:
-            test_indices.append(idx)
-        elif vid_id in val_ids:
-            val_indices.append(idx)
-        elif vid_id in train_ids:
-            train_indices.append(idx)
-        else:
-            print(f"[Warning] Video ID {vid_id} not found in splits!")
+        if vid_id in test_ids: test_indices.append(idx)
+        elif vid_id in val_ids: val_indices.append(idx)
+        elif vid_id in train_ids: train_indices.append(idx)
             
-    print(f"[Split] Frames -> Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
-    return train_indices, val_indices, test_indices
-
-
-def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
-    num_samples = len(dataset)
-    indices = list(range(num_samples))
-    labels = [dataset.samples[i][1] for i in indices]
-
-    train_val_indices, test_indices = train_test_split(
-        indices, test_size=test_ratio, random_state=seed, stratify=labels)
-    train_val_labels = [labels[i] for i in train_val_indices]
-    val_size = val_ratio / (train_ratio + val_ratio)
-    train_indices, val_indices = train_test_split(
-        train_val_indices, test_size=val_size, random_state=seed, stratify=train_val_labels)
     return train_indices, val_indices, test_indices
 
 
 def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
+    """
+    این تابع مدیریت‌کننده اصلی لود کردن دیتاست است.
+    اگر dataset_type برابر 'custom_genai' باشد، از کلاس جدید استفاده می‌کند.
+    """
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
@@ -254,22 +257,40 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
     }
 
     print(f"\n[Dataset Loading] Processing: {dataset_type}")
+
+    if dataset_type == 'custom_genai':
+     
+        fake_folders = ['DALL-E', 'DeepFaceLab', 'Face2Face', 'FaceShifter', 
+                        'FaceSwap', 'Midjourney', 'NeuralTextures', 'Stable Diffusion', 'StyleGAN']
+        real_folder = 'Real'
+        
+        temp_transform = transforms.Compose([transforms.ToTensor()])
+        full_dataset = CustomGenAIDataset(
+            base_dir, 
+            fake_classes=fake_folders, 
+            real_class=real_folder, 
+            transform=temp_transform
+        )
+        print("[Dataset Loading] Custom GenAI Dataset loaded.")
+        
     
-    if dataset_type == 'uadfV':
+        train_indices, val_indices, test_indices = create_standard_reproducible_split(
+            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
+        )
+        
+    elif dataset_type == 'uadfV':
         if not os.path.exists(base_dir):
             raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = UADFVDataset(base_dir, transform=temp_transform)
-        print("[Dataset Loading] UADFVDataset loaded.")
+        train_indices, val_indices, test_indices = create_video_level_uadfV_split(full_dataset, seed=seed)
 
     elif dataset_type == 'dfd':
         if not os.path.exists(base_dir):
             raise FileNotFoundError(f"DFD dataset directory not found: {base_dir}")
-        
         temp_transform = transforms.Compose([transforms.ToTensor()])
-        # قرار دادن split=None باعث می‌شود کل ۸۵ هزار فریم لود شود
         full_dataset = DFDDataset(base_dir, split=None, transform=temp_transform)
-        print(f"[Dataset Loading] DFDDataset loaded with {len(full_dataset)} images.")
+        train_indices, val_indices, test_indices = create_video_level_dfd_split(full_dataset, seed=seed)
         
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
@@ -287,46 +308,11 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
-        print(f"[Dataset Loading] ImageFolder loaded from: {dataset_dir}")
+        # ساختار ساده تصویری است
+        train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
 
-    # 2. Structure Detection Logic
-    # اگر دیتاست UADFV یا DFD است، ساختار ویدئویی فرض می‌شود
-    is_video_structure = False
-    if dataset_type in ['uadfV', 'dfd']:
-        is_video_structure = True
-    else:
-        # برای دیتاست‌های دیگر تشخیص خودکار
-        sample_path = full_dataset.samples[0][0]
-        immediate_parent = os.path.basename(os.path.dirname(sample_path))
-        is_video_structure = immediate_parent not in full_dataset.classes
-
-    print(f"[Structure Detection] Video Level: {is_video_structure}")
-    
-    if is_video_structure:
-        print("[Structure Decision] >> Detected VIDEO/NESTED structure. Using Video-Level Split.")
-        if dataset_type == 'uadfV':
-            train_indices, val_indices, test_indices = create_video_level_uadfV_split(
-                full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
-            )
-        elif dataset_type == 'dfd':
-            train_indices, val_indices, test_indices = create_video_level_dfd_split(
-                full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
-            )
-        else:
-            # Fallback for other video structures (like wild dataset if needed)
-            # در اینجا می‌توان از متد استاندارد استفاده کرد یا یک متد عمومی ویدئویی نوشت
-            # فعلاً برای اطمینان از استاندارد استفاده می‌کنیم
-            train_indices, val_indices, test_indices = create_standard_reproducible_split(
-                full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
-            )
-    else:
-        print("[Structure Decision] >> Detected FLAT IMAGE structure. Using Standard Stratified Split.")
-        train_indices, val_indices, test_indices = create_standard_reproducible_split(
-            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
-        )
-        
     return full_dataset, train_indices, val_indices, test_indices
 
 
@@ -360,6 +346,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
     ])
 
     if dataset_type == 'wild':
+    
         splits = ['train', 'valid', 'test']
         datasets_dict = {}
         for split in splits:
@@ -394,10 +381,13 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
     else:
+        # مدیریت همه دیتاست‌های دیگر (uadfV, dfd, custom_genai, و ...)
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
+            
         full_dataset, train_indices, val_indices, test_indices = prepare_dataset(
             base_dir, dataset_type, seed=seed)
+        
         if is_main:
             print(f"\nDataset Stats:")
             print(f" Total: {len(full_dataset):,} images")
@@ -405,23 +395,10 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
             print(f" Valid: {len(val_indices):,} ({len(val_indices)/len(full_dataset)*100:.1f}%)")
             print(f" Test: {len(test_indices):,} ({len(test_indices)/len(full_dataset)*100:.1f}%)\n")
 
-        # اعمال Transform ها
-        if dataset_type == 'uadfV':
-            # UADFV خودش کلاس Dataset سفارشی دارد و مستقیماً ترنسفرم را قبول می‌کند
-            train_dataset = Subset(full_dataset, train_indices)
-            val_dataset = Subset(full_dataset, val_indices)
-            test_dataset = Subset(full_dataset, test_indices)
-            # این جایگزین بخش اعمال Transform ها در کد شما شود
-        # برای همه دیتاست‌های لیستی (UADFV, DFD, etc.)
-            train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
-            val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
-            test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
-        else:
-            # برای DFD و سایر دیتاست‌ها از TransformSubset استفاده می‌کنیم
-            # چون ImageFolder و DFDDataset در Subset معمولی ترنسفرم را به درستی هندل نمی‌کنند
-            train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
-            val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
-            test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
+        # اعمال Transform ها با استفاده از TransformSubset
+        train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
+        val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
+        test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
 
         train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_distributed else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
@@ -445,3 +422,15 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
         print(f" Batches → Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
         print("="*70 + "\n")
     return train_loader, val_loader, test_loader
+                           
+if __name__ == '__main__':
+    path_to_dataset = '/path/to/your/root/dataset'
+    
+    train_loader, val_loader, test_loader = create_dataloaders(
+        base_dir=path_to_dataset,
+        batch_size=32,
+        num_workers=4,
+        dataset_type='custom_genai',  
+        is_distributed=False,
+        seed=42
+    )
