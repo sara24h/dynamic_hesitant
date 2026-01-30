@@ -21,12 +21,11 @@ class CustomGenAIDataset(Dataset):
             'real': 1
         }
 
-        # --- بخش لود کردن تصاویر Fake ---
         print(f"[CustomDataset] Loading Fake images from: {fake_classes}")
         for class_name in fake_classes:
             class_path = os.path.join(root_dir, class_name)
             if os.path.exists(class_path):
-                # اگر عکس‌ها مستقیماً در پوشه هستند
+                
                 files = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
                 for img_file in files:
                     img_path = os.path.join(class_path, img_file)
@@ -34,7 +33,7 @@ class CustomGenAIDataset(Dataset):
             else:
                 print(f"[Warning] Path not found: {class_path}")
 
-        # --- بخش لود کردن تصاویر Real ---
+       
         print(f"[CustomDataset] Loading Real images from: {real_class}")
         real_path = os.path.join(root_dir, real_class)
         if os.path.exists(real_path):
@@ -213,7 +212,7 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
 
 
 def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    # (کدهای قبلی بدون تغییر - برای اختصار حفظ شده)
+  
     all_video_ids = set()
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
@@ -246,10 +245,7 @@ def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_
 
 
 def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
-    """
-    این تابع مدیریت‌کننده اصلی لود کردن دیتاست است.
-    اگر dataset_type برابر 'custom_genai' باشد، از کلاس جدید استفاده می‌کند.
-    """
+   
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
@@ -260,8 +256,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
 
     if dataset_type == 'custom_genai':
      
-        fake_folders = ['DALL-E', 'DeepFaceLab', 'Face2Face', 'FaceShifter', 
-                        'FaceSwap', 'Midjourney', 'NeuralTextures', 'Stable Diffusion', 'StyleGAN']
+        fake_folders = ['DALL-E', 'DeepFaceLab', 'Midjourney', 'Stable Diffusion']
         real_folder = 'Real'
         
         temp_transform = transforms.Compose([transforms.ToTensor()])
