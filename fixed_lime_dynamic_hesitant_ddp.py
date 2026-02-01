@@ -1,4 +1,3 @@
-%%writefile /kaggle/working/dynamic_hesitant/fixed_lime_dynamic_hesitant_ddp.py
 
 import torch
 import torch.nn as nn
