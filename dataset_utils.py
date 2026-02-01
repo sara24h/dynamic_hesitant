@@ -9,13 +9,13 @@ from typing import List, Tuple
 from sklearn.model_selection import train_test_split
 from PIL import Image
 
-# ================== DATASETS ==================
-
 class CustomGenAIDataset(Dataset):
     """
     کلاس اصلاح شده برای پشتیبانی از دو ساختار:
     1. Flat: class_name/folder (ساختار قبلی)
     2. Hierarchical: class_name/split/fake|real (ساختار جدید درختی)
+    
+    اصلاحیه: برای کلاس 'real' اگر در حالت hierarchical باشیم، فرض می‌کنیم فایل‌ها مستقیماً در split_path هستند.
     """
     def __init__(self, root_dir, fake_classes, real_class, transform=None, hierarchical=False):
         self.root_dir = root_dir
@@ -25,25 +25,48 @@ class CustomGenAIDataset(Dataset):
 
         if hierarchical:
             # ================= ساختار جدید (Tree: class_name/train|test/fake|real) =================
-            # ما داده‌ها را یکجا بارگذاری می‌کنیم تا بعداً به نسبت 70-15-15 تقسیم کنیم.
-            # در اینجا فقط "train" و "test" موجود هستند. فرض بر این است که کل دیتاست در این دو پوشه است.
             splits_to_load = ['train', 'test'] 
             
             print(f"[CustomDataset] Loading HIERARCHICAL structure from: {root_dir}")
             print(f" -> Splits detected: {splits_to_load}")
 
             for class_name in fake_classes + [real_class]:
+                is_real_class = (class_name == real_class)
                 print(f"   Processing class: {class_name}")
+                
                 for split in splits_to_load:
                     split_path = os.path.join(root_dir, class_name, split)
-                    if os.path.exists(split_path):
-                        for label_name in ['fake', 'real']:
-                            label_path = os.path.join(split_path, label_name)
-                            if os.path.exists(label_path):
-                                files = [f for f in os.listdir(label_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                                for img_file in files:
-                                    img_path = os.path.join(label_path, img_file)
-                                    self.samples.append((img_path, self.label_map[label_name]))
+                    
+                    if not os.path.exists(split_path):
+                        continue
+
+                    # منطق اصلاح شده: برای کلاس real، به دنبال زیرپوشه نگرد (مگر اینکه ساختار به شکل real/train/real باشد)
+                    # برای کلاس fake، حتما به دنبال زیرپوشه 'fake' بگرد
+                    search_paths = []
+                    
+                    if is_real_class:
+                        # حالت 1: real/train/*.jpg (فایل‌ها مستقیما در پوشه train هستند)
+                        # حالت 2: real/train/real/*.jpg (ساختار استاندارد درختی)
+                        # اول حالت استاندارد را چک میکنیم، اگر نبود همان پوشه فعلی را میگیریم
+                        potential_real_subfolder = os.path.join(split_path, 'real')
+                        if os.path.exists(potential_real_subfolder):
+                            search_paths.append(potential_real_subfolder)
+                        else:
+                            search_paths.append(split_path)
+                    else:
+                        # برای کلاس‌های fake حتما باید داخل پوشه fake برویم
+                        label_path = os.path.join(split_path, 'fake')
+                        if os.path.exists(label_path):
+                            search_paths.append(label_path)
+                    
+                    # جستجو در مسیرهای یافت شده
+                    for target_path in search_paths:
+                        if os.path.exists(target_path):
+                            files = [f for f in os.listdir(target_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                            for img_file in files:
+                                img_path = os.path.join(target_path, img_file)
+                                label = self.label_map['real'] if is_real_class else self.label_map['fake']
+                                self.samples.append((img_path, label))
         else:
             # ================= ساختار قبلی (Flat: class_name/folder) =================
             print(f"[CustomDataset] Loading FLAT structure from: {root_dir}")
@@ -76,7 +99,16 @@ class CustomGenAIDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
-        image = Image.open(img_path).convert('RGB')
+        
+        # مدیریت خطاهای احتمالی هنگام باز کردن عکس
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"\n[ERROR] Corrupt image found at: {img_path}")
+            print(f"Error details: {e}\n")
+            # ایجاد یک تصویر سیاه برای جلوگیری از کرش کردن برنامه در بچ
+            image = Image.new('RGB', (256, 256))
+            
         if self.transform:
             image = self.transform(image)
         return image, label
