@@ -1,11 +1,4 @@
-ساختار واقعی دیتاست شما کاملاً با چیزی که کد قبلی انتظار داشت (هر کلاس دارای پوشه train/test جداگانه) فرق دارد. در دیتاست شما، تقسیم‌بندی train و test در **لایه بالاتر** قرار دارد و زیر آن کلاس‌ها (insightface, photoshop و ...) قرار گرفته‌اند.
 
-ساختار شما به این صورت است:
-`data/train/insightface/fake/...` و `data/test/insightface/fake/...`
-
-کد زیر دقیقاً برای این ساختار نوشته شده است. لطفاً کل محتوای `dataset_utils.py` را با این کد جایگزین کنید:
-
-```python
 import torch
 from torch.utils.data import DataLoader, Subset, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -473,4 +466,3 @@ if __name__ == '__main__':
         is_distributed=False,
         seed=42
     )
-```
