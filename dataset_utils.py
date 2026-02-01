@@ -87,46 +87,6 @@ class UADFVDataset(Dataset):
         return image, label
 
 
-class DFDDataset(Dataset):
-    def __init__(self, root_dir, split=None, transform=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.samples = []
-        self.class_to_idx = {'fake': 1, 'real': 0}
-
-        search_dirs = [split] if split else ['train', 'val', 'test']
-        
-        for s in search_dirs:
-            split_path = os.path.join(root_dir, s)
-            if not os.path.exists(split_path):
-                continue
-                
-            for video_folder in os.listdir(split_path):
-                video_path = os.path.join(split_path, video_folder)
-                if not os.path.isdir(video_path):
-                    continue
-                
-                if 'fake' in video_folder.lower():
-                    label = 1
-                elif 'real' in video_folder.lower():
-                    label = 0
-                else:
-                    continue
-
-                for img_file in os.listdir(video_path):
-                    if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        self.samples.append((os.path.join(video_path, img_file), label))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        image = Image.open(img_path).convert('RGB')
-        if self.transform:
-            image = self.transform(image)
-        return image, label
-
 class TransformSubset(Subset):
     """Subset with custom transform"""
     def __init__(self, dataset, indices, transform):
@@ -279,13 +239,6 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = UADFVDataset(base_dir, transform=temp_transform)
         train_indices, val_indices, test_indices = create_video_level_uadfV_split(full_dataset, seed=seed)
-
-    elif dataset_type == 'dfd':
-        if not os.path.exists(base_dir):
-            raise FileNotFoundError(f"DFD dataset directory not found: {base_dir}")
-        temp_transform = transforms.Compose([transforms.ToTensor()])
-        full_dataset = DFDDataset(base_dir, split=None, transform=temp_transform)
-        train_indices, val_indices, test_indices = create_video_level_dfd_split(full_dataset, seed=seed)
         
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
