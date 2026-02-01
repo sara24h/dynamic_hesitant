@@ -9,40 +9,65 @@ from typing import List, Tuple
 from sklearn.model_selection import train_test_split
 from PIL import Image
 
+# ================== DATASETS ==================
+
 class CustomGenAIDataset(Dataset):
-  
-    def __init__(self, root_dir, fake_classes, real_class, transform=None):
+    """
+    کلاس اصلاح شده برای پشتیبانی از دو ساختار:
+    1. Flat: class_name/folder (ساختار قبلی)
+    2. Hierarchical: class_name/split/fake|real (ساختار جدید درختی)
+    """
+    def __init__(self, root_dir, fake_classes, real_class, transform=None, hierarchical=False):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
-      
-        self.label_map = {
-            'fake': 0,
-            'real': 1
-        }
+        self.label_map = {'fake': 0, 'real': 1}
 
-        print(f"[CustomDataset] Loading Fake images from: {fake_classes}")
-        for class_name in fake_classes:
-            class_path = os.path.join(root_dir, class_name)
-            if os.path.exists(class_path):
-                
-                files = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                for img_file in files:
-                    img_path = os.path.join(class_path, img_file)
-                    self.samples.append((img_path, self.label_map['fake']))
-            else:
-                print(f"[Warning] Path not found: {class_path}")
+        if hierarchical:
+            # ================= ساختار جدید (Tree: class_name/train|test/fake|real) =================
+            # ما داده‌ها را یکجا بارگذاری می‌کنیم تا بعداً به نسبت 70-15-15 تقسیم کنیم.
+            # در اینجا فقط "train" و "test" موجود هستند. فرض بر این است که کل دیتاست در این دو پوشه است.
+            splits_to_load = ['train', 'test'] 
+            
+            print(f"[CustomDataset] Loading HIERARCHICAL structure from: {root_dir}")
+            print(f" -> Splits detected: {splits_to_load}")
 
-       
-        print(f"[CustomDataset] Loading Real images from: {real_class}")
-        real_path = os.path.join(root_dir, real_class)
-        if os.path.exists(real_path):
-            files = [f for f in os.listdir(real_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-            for img_file in files:
-                img_path = os.path.join(real_path, img_file)
-                self.samples.append((img_path, self.label_map['real']))
+            for class_name in fake_classes + [real_class]:
+                print(f"   Processing class: {class_name}")
+                for split in splits_to_load:
+                    split_path = os.path.join(root_dir, class_name, split)
+                    if os.path.exists(split_path):
+                        for label_name in ['fake', 'real']:
+                            label_path = os.path.join(split_path, label_name)
+                            if os.path.exists(label_path):
+                                files = [f for f in os.listdir(label_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                                for img_file in files:
+                                    img_path = os.path.join(label_path, img_file)
+                                    self.samples.append((img_path, self.label_map[label_name]))
         else:
-            print(f"[Warning] Path not found: {real_path}")
+            # ================= ساختار قبلی (Flat: class_name/folder) =================
+            print(f"[CustomDataset] Loading FLAT structure from: {root_dir}")
+            
+            print(f" -> Loading Fake images from: {fake_classes}")
+            for class_name in fake_classes:
+                class_path = os.path.join(root_dir, class_name)
+                if os.path.exists(class_path):
+                    files = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                    for img_file in files:
+                        img_path = os.path.join(class_path, img_file)
+                        self.samples.append((img_path, self.label_map['fake']))
+                else:
+                    print(f"[Warning] Path not found: {class_path}")
+
+            print(f" -> Loading Real images from: {real_class}")
+            real_path = os.path.join(root_dir, real_class)
+            if os.path.exists(real_path):
+                files = [f for f in os.listdir(real_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                for img_file in files:
+                    img_path = os.path.join(real_path, img_file)
+                    self.samples.append((img_path, self.label_map['real']))
+            else:
+                print(f"[Warning] Path not found: {real_path}")
 
         print(f"[CustomDataset] Total loaded images: {len(self.samples)}")
 
@@ -94,7 +119,6 @@ class TransformSubset(Subset):
         self.transform = transform
 
     def __getitem__(self, idx):
-       
         img_path, label = self.dataset.samples[self.indices[idx]]
         img = Image.open(img_path).convert('RGB')
         if self.transform:
@@ -113,7 +137,7 @@ def get_sample_info(dataset, index):
 
 
 def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-   
+    """تقسیم داده‌ها به نسبت 70-15-15"""
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     num_samples = len(dataset)
     indices = list(range(num_samples))
@@ -136,7 +160,6 @@ def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15,
 
 
 def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    # (کدهای قبلی بدون تغییر - برای اختصار حفظ شده)
     all_video_ids = set()
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
@@ -172,7 +195,6 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
 
 
 def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-  
     all_video_ids = set()
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
@@ -205,7 +227,6 @@ def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_
 
 
 def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
-   
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
@@ -215,7 +236,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
     print(f"\n[Dataset Loading] Processing: {dataset_type}")
 
     if dataset_type == 'custom_genai':
-     
+        # ساختار قبلی (Flat)
         fake_folders = ['DALL-E', 'DeepFaceLab', 'Midjourney','StyleGAN']
         real_folder = 'Real'
         
@@ -224,11 +245,30 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
             base_dir, 
             fake_classes=fake_folders, 
             real_class=real_folder, 
-            transform=temp_transform
+            transform=temp_transform,
+            hierarchical=False
         )
-        print("[Dataset Loading] Custom GenAI Dataset loaded.")
-        
+        print("[Dataset Loading] Custom GenAI Dataset (Flat) loaded.")
+        train_indices, val_indices, test_indices = create_standard_reproducible_split(
+            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
+        )
     
+    elif dataset_type == 'custom_genai_tree':
+        # ======================= ساختار جدید (Tree) =======================
+        fake_folders = ['insightface', 'photoshop', 'stablediffusion v1.5', 'stylegan']
+        real_folder = 'real' # توجه: پوشه real در روت است
+        
+        temp_transform = transforms.Compose([transforms.ToTensor()])
+        full_dataset = CustomGenAIDataset(
+            base_dir, 
+            fake_classes=fake_folders, 
+            real_class=real_folder, 
+            transform=temp_transform,
+            hierarchical=True # فعال‌سازی حالت درختی
+        )
+        print("[Dataset Loading] Custom GenAI Dataset (Tree) loaded.")
+        
+        # ایجاد تقسیم 70-15-15
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
             full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
         )
@@ -256,7 +296,6 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
-        # ساختار ساده تصویری است
         train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
@@ -294,7 +333,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
     ])
 
     if dataset_type == 'wild':
-    
         splits = ['train', 'valid', 'test']
         datasets_dict = {}
         for split in splits:
@@ -329,7 +367,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
     else:
-        # مدیریت همه دیتاست‌های دیگر (uadfV, dfd, custom_genai, و ...)
+        # مدیریت همه دیتاست‌های دیگر (uadfV, dfd, custom_genai, custom_genai_tree)
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
             
@@ -378,7 +416,7 @@ if __name__ == '__main__':
         base_dir=path_to_dataset,
         batch_size=32,
         num_workers=4,
-        dataset_type='custom_genai',  
+        dataset_type='custom_genai_tree',  # <-- اینجا را برای تست جدید تغییر دهید
         is_distributed=False,
         seed=42
     )
