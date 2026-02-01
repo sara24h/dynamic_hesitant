@@ -1,3 +1,5 @@
+%%writefile /kaggle/working/dynamic_hesitant/fixed_lime_dynamic_hesitant_ddp.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,19 +14,35 @@ import json
 import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
-from metrics_utils import plot_roc_and_f1
+
+# Importing visualization libraries
+try:
+    from grad_cam import GradCAM
+    from lime import lime_image
+except ImportError:
+    print("[Warning] GradCAM or LIME not fully installed, visualization might be limited.")
 
 warnings.filterwarnings("ignore")
 
+# Import custom utilities
 from dataset_utils import (
     UADFVDataset, 
-    CustomGenAIDataset, # اضافه شد
+    CustomGenAIDataset, 
     create_dataloaders, 
     get_sample_info, 
     worker_init_fn
 )
 
-from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
+# Ensure visualization_utils is handled gracefully
+try:
+    from visualization_utils import generate_visualizations
+except ImportError:
+    print("[Warning] visualization_utils not found. Skipping import.")
+
+try:
+    from metrics_utils import plot_roc_and_f1
+except ImportError:
+    print("[Warning] metrics_utils not found. Skipping import.")
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -164,7 +182,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
             model = model.to(device).eval()
             param_count = sum(p.numel() for p in model.parameters())
             if is_main:
-                print(f" → Parameters: {param_count:,}")
+                print(f" -> Parameters: {param_count:,}")
             models.append(model)
         except Exception as e:
             if is_main:
@@ -269,8 +287,8 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"\n{'='*70}")
         print(f"{name.upper()} SET RESULTS")
         print(f"{'='*70}")
-        print(f" → Accuracy: {acc:.3f}%")
-        print(f" → Total Samples: {total_samples:,}")
+        print(f" -> Accuracy: {acc:.3f}%")
+        print(f" -> Total Samples: {total_samples:,}")
         print(f"\nAverage Model Weights:")
         for i, (w, mname) in enumerate(zip(avg_weights, model_names)):
             print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
@@ -280,7 +298,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"\nHesitant Membership Values:")
         for i, mname in enumerate(model_names):
             mu_str = ", ".join([f"{v:.3f}" for v in avg_membership[i]])
-            print(f" {i+1:2d}. {mname:<25}: μ = [{mu_str}] | Hesitancy = {avg_hesitancy[i]:.4f}")
+            print(f" {i+1:2d}. {mname:<25}: mu = [{mu_str}] | Hesitancy = {avg_hesitancy[i]:.4f}")
         print(f"{'='*70}")
         return acc, avg_weights.tolist(), activation_percentages.tolist()
     return 0.0, [0.0]*len(model_names), [0.0]*len(model_names)
@@ -288,9 +306,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
-    """
-    تابع اصلاح‌شده training با نمایش جزئیات کامل
-    """
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -395,11 +410,11 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             print(f"{'-'*70}")
             print(f"  {'Cumsum activated in:':<30}  {avg_cumsum_usage:.2f}% of samples")
             if avg_cumsum_usage > 50:
-                print(f"  {'Status:':<30}  ✓ Efficient")
+                print(f"  {'Status:':<30}  Efficient")
             elif avg_cumsum_usage > 20:
-                print(f"  {'Status:':<30}  ≈ Moderate")
+                print(f"  {'Status:':<30}  Moderate")
             else:
-                print(f"  {'Status:':<30}  ✗ Low efficiency")
+                print(f"  {'Status:':<30}  Low efficiency")
             print(f"  {'All models used in:':<30}  {100-avg_cumsum_usage:.2f}% of samples")
             
             print(f"\n{'Model Activation Frequency:':^70}")
@@ -419,7 +434,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
                 'val_acc': val_acc,
                 'history': history
             }, save_path)
-            print(f"\n✓ Best model saved → {val_acc:.2f}%")
+            print(f"\n Best model saved -> {val_acc:.2f}%")
 
         if is_main:
             print()
@@ -463,7 +478,7 @@ def main():
     parser.add_argument('--num_memberships', type=int, default=3)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
-        parser.add_argument('--dataset', type=str, required=True,
+    parser.add_argument('--dataset', type=str, required=True,
                        choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai', 'custom_genai_tree'])
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
@@ -495,6 +510,7 @@ def main():
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
+    # Adjust MEANS/STDS if you have more/less models loaded
     MEANS = MEANS[:len(args.model_paths)]
     STDS = STDS[:len(args.model_paths)]
 
@@ -517,7 +533,6 @@ def main():
         total = sum(p.numel() for p in ensemble.parameters())
         print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
-    # اگر دیتاست DFD انتخاب شود، create_dataloaders از dataset_utils آن را هندل می‌کند
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
@@ -539,7 +554,7 @@ def main():
     best_idx = individual_accs.index(best_single)
 
     if is_main:
-        print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+        print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) -> {best_single:.2f}%")
         print("="*70)
 
     best_val_acc, history = train_hesitant_fuzzy(
@@ -602,23 +617,25 @@ def main():
         }, final_model_path)
         print(f"Model saved: {final_model_path}")
 
-        vis_dir = os.path.join(args.save_dir, 'visualizations')
-        generate_visualizations(
-            ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
-            args.num_grad_cam_samples, args.num_lime_samples,
-            args.dataset, is_main)
+        if 'generate_visualizations' in globals():
+            vis_dir = os.path.join(args.save_dir, 'visualizations')
+            generate_visualizations(
+                ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
+                args.num_grad_cam_samples, args.num_lime_samples,
+                args.dataset, is_main)
 
     cleanup_distributed()
 
     if is_main:
-        plot_roc_and_f1(
-            ensemble_module,
-            test_loader, 
-            device, 
-            args.save_dir, 
-            MODEL_NAMES,
-            is_main
-        )
+        if 'plot_roc_and_f1' in globals():
+            plot_roc_and_f1(
+                ensemble_module,
+                test_loader, 
+                device, 
+                args.save_dir, 
+                MODEL_NAMES,
+                is_main
+            )
 
 if __name__ == "__main__":
     main()
