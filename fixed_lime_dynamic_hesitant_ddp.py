@@ -1,3 +1,5 @@
+%%writefile /kaggle/working/dynamic_hesitant/fixed_lime_dynamic_hesitant_ddp.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -505,7 +507,6 @@ def main():
         print(f"Models: {len(args.model_paths)}")
         print("="*70 + "\n")
 
-    # Normalization stats for the models (ensure these match your training stats)
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
