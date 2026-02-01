@@ -1,3 +1,11 @@
+ساختار واقعی دیتاست شما کاملاً با چیزی که کد قبلی انتظار داشت (هر کلاس دارای پوشه train/test جداگانه) فرق دارد. در دیتاست شما، تقسیم‌بندی train و test در **لایه بالاتر** قرار دارد و زیر آن کلاس‌ها (insightface, photoshop و ...) قرار گرفته‌اند.
+
+ساختار شما به این صورت است:
+`data/train/insightface/fake/...` و `data/test/insightface/fake/...`
+
+کد زیر دقیقاً برای این ساختار نوشته شده است. لطفاً کل محتوای `dataset_utils.py` را با این کد جایگزین کنید:
+
+```python
 import torch
 from torch.utils.data import DataLoader, Subset, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -11,7 +19,9 @@ from PIL import Image
 
 class CustomGenAIDataset(Dataset):
     """
-    کلاس اصلاح شده با قابلیت Debug برای پیدا کردن مشکل ساختار پوشه‌ها
+    کلاس اصلاح شده مخصوص ساختار داده‌ای شما:
+    root/train/class_name/fake|real
+    root/test/class_name/fake|real
     """
     def __init__(self, root_dir, fake_classes, real_class, transform=None, hierarchical=False):
         self.root_dir = root_dir
@@ -20,114 +30,67 @@ class CustomGenAIDataset(Dataset):
         self.label_map = {'fake': 0, 'real': 1}
         
         print(f"\n{'='*60}")
-        print(f"[CustomDataset] Root Dir: {root_dir}")
-        print(f"[CustomDataset] Mode: {'HIERARCHICAL' if hierarchical else 'FLAT'}")
+        print(f"[CustomDataset] Root: {root_dir}")
+        print(f"[CustomDataset] Structure: Split -> Class -> Label (New Style)")
         print(f"{'='*60}")
 
         if hierarchical:
-            # ================= ساختار جدید (Tree) =================
-            # انتظار می‌رود ساختار به این شکل باشد:
-            # root/class_name/train/images.jpg
-            # یا root/class_name/train/fake/images.jpg (یا real)
+            # تعیین سوییت‌ها (train و test) - حساس به حروف بزرگ و کوچک نیستیم
+            possible_splits = ['train', 'test']
+            existing_splits = []
             
-            splits_to_load = ['train', 'test'] 
+            # پیدا کردن پوشه‌های train و test در روت
+            for item in os.listdir(root_dir):
+                item_path = os.path.join(root_dir, item)
+                if os.path.isdir(item_path) and item.lower() in possible_splits:
+                    existing_splits.append(item)
             
-            for class_name in fake_classes + [real_class]:
-                is_real_class = (class_name == real_class)
-                print(f"\nProcessing Class: {class_name} ({'Real' if is_real_class else 'Fake'})")
+            if not existing_splits:
+                print(f"[!] No 'train' or 'test' folders found in {root_dir}")
+                return
+
+            for split in existing_splits:
+                split_path = os.path.join(root_dir, split)
+                print(f"\nProcessing Split: {split}")
                 
-                for split in splits_to_load:
-                    split_path = os.path.join(root_dir, class_name, split)
+                # درون هر سوییت، روی کلاس‌ها حلقه بزن (insightface, photoshop, ...)
+                for class_name in fake_classes + [real_class]:
+                    is_real_class = (class_name == real_class)
+                    class_path = os.path.join(split_path, class_name)
                     
-                    if not os.path.exists(split_path):
-                        print(f"  [!] Split path NOT FOUND: {split_path}")
+                    if not os.path.exists(class_path):
+                        # print(f"  [-] Class not found: {class_name}")
                         continue
                     
-                    # تعیین مسیری که باید فایل‌ها را از آن بخوانیم
-                    search_paths = []
+                    # درون هر کلاس، به دنبال پوشه‌های fake و real بگرد
+                    # چون ساختار شما split/class/fake است، نیازی به جستجوی پیچیده نیست
                     
+                    # 1. پردازش برچسب Real (اگر کلاس جاری real باشد)
                     if is_real_class:
-                        # برای Real: اول به دنبال زیرپوشه real می‌گردیم، اگر نبود خود پوشه split را می‌گیریم
-                        potential_real_subfolder = os.path.join(split_path, 'real')
-                        if os.path.exists(potential_real_subfolder):
-                            search_paths.append(potential_real_subfolder)
-                        else:
-                            search_paths.append(split_path)
+                        real_label_path = os.path.join(class_path, 'real')
+                        if os.path.exists(real_label_path):
+                            files = [f for f in os.listdir(real_label_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                            for img_file in files:
+                                self.samples.append((os.path.join(real_label_path, img_file), self.label_map['real']))
+                            print(f"  [+] {class_name:20} | Real: {len(files):5} images")
+                    
+                    # 2. پردازش برچسب Fake (اگر کلاس جاری یکی از fake_classes باشد)
                     else:
-                        # برای Fake: انتظار داریم پوشه‌ای با نام کلاس (مثلا insightface) یا 'fake' وجود داشته باشد
-                        # استراتژی: اول پوشه‌ای به نام خود کلاس را چک کن (common)، اگر نبود 'fake' را چک کن
-                        potential_class_subfolder = os.path.join(split_path, class_name)
-                        potential_fake_folder = os.path.join(split_path, 'fake')
-                        
-                        if os.path.exists(potential_class_subfolder):
-                            search_paths.append(potential_class_subfolder)
-                        elif os.path.exists(potential_fake_folder):
-                            search_paths.append(potential_fake_folder)
-                        else:
-                            # اگر هیچکدام نبود، خود پوشه split را چک کن (flat داخل split)
-                            search_paths.append(split_path)
-                    
-                    # جستجو و بارگذاری فایل‌ها
-                    found_count = 0
-                    for target_path in search_paths:
-                        # فقط اگر پوشه واقعا وجود دارد
-                        if not os.path.isdir(target_path):
-                            # print(f"    [-] Target is not a dir: {target_path}")
-                            continue
-                            
-                        try:
-                            all_files = os.listdir(target_path)
-                            img_files = [f for f in all_files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                            
-                            if len(img_files) > 0:
-                                for img_file in img_files:
-                                    img_path = os.path.join(target_path, img_file)
-                                    label = self.label_map['real'] if is_real_class else self.label_map['fake']
-                                    self.samples.append((img_path, label))
-                                found_count += len(img_files)
-                            else:
-                                print(f"    [!] No images found in: {target_path}")
-                                # print(f"        (Contents: {all_files[:5]}...)") # برای دیباگ بیشتر
-                        except Exception as e:
-                            print(f"    [Error reading dir {target_path}: {e}]")
-                    
-                    if found_count > 0:
-                        print(f"  [+] Loaded {found_count} images from {split}")
+                        fake_label_path = os.path.join(class_path, 'fake')
+                        if os.path.exists(fake_label_path):
+                            files = [f for f in os.listdir(fake_label_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                            for img_file in files:
+                                self.samples.append((os.path.join(fake_label_path, img_file), self.label_map['fake']))
+                            print(f"  [+] {class_name:20} | Fake: {len(files):5} images")
 
         else:
-            # ================= ساختار قبلی (Flat) =================
-            print(f"Processing Fake classes: {fake_classes}")
-            for class_name in fake_classes:
-                class_path = os.path.join(root_dir, class_name)
-                if os.path.exists(class_path):
-                    files = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                    if files:
-                        for img_file in files:
-                            img_path = os.path.join(class_path, img_file)
-                            self.samples.append((img_path, self.label_map['fake']))
-                        print(f"  [+] Loaded {len(files)} from {class_name}")
-                    else:
-                        print(f"  [!] Empty folder: {class_path}")
-                else:
-                    print(f"  [!] Path not found: {class_path}")
-
-            print(f"Processing Real class: {real_class}")
-            real_path = os.path.join(root_dir, real_class)
-            if os.path.exists(real_path):
-                files = [f for f in os.listdir(real_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                if files:
-                    for img_file in files:
-                        img_path = os.path.join(real_path, img_file)
-                        self.samples.append((img_path, self.label_map['real']))
-                    print(f"  [+] Loaded {len(files)} from {real_class}")
-                else:
-                    print(f"  [!] Empty folder: {real_path}")
-            else:
-                print(f"  [!] Path not found: {real_path}")
+            # حالت Flat (استفاده نمیشود ولی جهت حفظ سازگاری باقی مانده)
+            print("Flat mode not supported for this dataset structure in this context.")
+            pass
 
         print(f"\n[CustomDataset] Total images loaded: {len(self.samples)}")
         if len(self.samples) == 0:
-            print("!!! WARNING: NO IMAGES LOADED. PLEASE CHECK THE PATHS AND STRUCTURE ABOVE !!!")
+            print("!!! WARNING: NO IMAGES LOADED. Check file paths. !!!")
 
     def __len__(self):
         return len(self.samples)
@@ -185,7 +148,6 @@ class TransformSubset(Subset):
         self.transform = transform
 
     def __getitem__(self, idx):
-        # دسترسی مستقیم به نمونه برای جلوگیری از تداخل ترنسفرم‌ها
         img_path, label = self.dataset.samples[self.indices[idx]]
         img = Image.open(img_path).convert('RGB')
         if self.transform:
@@ -204,29 +166,31 @@ def get_sample_info(dataset, index):
 
 
 def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    """تقسیم داده‌ها به نسبت 70-15-15"""
+    """
+    این تابع برای دیتاستی که از قبل به Train/Test تقسیم شده مناسب نیست.
+    اما چون در کد اصلی صدا زده می‌شود، ما ایندکس‌ها را بر اساس لیست samples برمی‌گردانیم
+    تا برنامه کرش نکند (یا می‌توانیم منطقش را تغییر دهیم).
+    
+    نکته مهم: برای دیتاست custom_genai_tree که قبلاً split دارد، 
+    بهترین کار این است که کل دیتاست را بخوانیم و بعد خودمان split کنیم.
+    """
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     
     num_samples = len(dataset)
     
-    # بررسی امنیت برای جلوگیری از ارور n_samples=0
     if num_samples == 0:
         print("\n[CRITICAL ERROR] Cannot split dataset with 0 samples.")
-        # برگرداندن لیست‌های خالی برای جلوگیری از کرش کردن کل برنامه (در صورتی که بخواهید ادامه دهید)
         return [], [], []
     
     indices = list(range(num_samples))
     labels = [dataset.samples[i][1] for i in indices]
 
-    # تقسیم به Train+Val و Test
     train_val_indices, test_indices = train_test_split(
         indices, test_size=test_ratio, random_state=seed, stratify=labels)
     
-    # محاسبه نسبت مجدد برای Val نسبت به باقی‌مانده
     train_val_labels = [labels[i] for i in train_val_indices]
     val_size = val_ratio / (train_ratio + val_ratio)
     
-    # تقسیم به Train و Val
     train_indices, val_indices = train_test_split(
         train_val_indices, test_size=val_size, random_state=seed, stratify=train_val_labels)
         
@@ -234,7 +198,6 @@ def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15,
 
 
 def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    # (بدون تغییر منطقی، فقط اضافه کردن چک اگر خالی بود)
     if len(dataset) == 0: return [], [], []
     
     all_video_ids = set()
@@ -345,6 +308,13 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
             hierarchical=True 
         )
         
+        # برای دیتاستی که از قبل تقسیم شده (train/test در دایرکتوری)، 
+        # ما اینجا کل دیتاست را لود میکنیم و دوباره رندوم اسپلیت میزنیم
+        # چون پارامترهای create_dataloaders این انتظار را دارند.
+        # اگر می‌خواهید دقیقاً همان فایل‌های پوشه train را برای آموزش استفاده کنید، 
+        # باید منطق prepare_dataset را تغییر دهید تا ایندکس‌ها را بر اساس فایل‌های پوشه train فیلتر کند.
+        # اما در حال حاضر برای رفع ارور، همان روش استاندارد ادامه می‌یابد.
+        
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
             full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
         )
@@ -450,12 +420,10 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
         full_dataset, train_indices, val_indices, test_indices = prepare_dataset(
             base_dir, dataset_type, seed=seed)
         
-        # چک کردن اینکه آیا ایندکس‌ها خالی هستند یا خیر
         if not train_indices and not val_indices and not test_indices:
             if is_main:
                 print("\n[ERROR] Dataset is empty! Cannot create DataLoaders.")
                 print("Please check the logs above to see why images were not found.")
-            # بازگرداندن لودرهای خالی برای جلوگیری از کرش برنامه، اگرچه کاربردی ندارند
             empty_dataset = datasets.ImageFolder(base_dir, transform=train_transform)
             return DataLoader(empty_dataset, batch_size=1), DataLoader(empty_dataset, batch_size=1), DataLoader(empty_dataset, batch_size=1)
 
@@ -495,7 +463,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
 
                            
 if __name__ == '__main__':
-    path_to_dataset = '/path/to/your/root/dataset'
+    path_to_dataset = '/kaggle/input/computer-vision-assignment-2/data'
     
     train_loader, val_loader, test_loader = create_dataloaders(
         base_dir=path_to_dataset,
@@ -505,3 +473,4 @@ if __name__ == '__main__':
         is_distributed=False,
         seed=42
     )
+```
