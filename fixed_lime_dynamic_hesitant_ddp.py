@@ -23,13 +23,6 @@ from dataset_utils import (
     worker_init_fn
 )
 
-from dataset_utils import (
-    DFDDataset, 
-    create_dataloaders, 
-    get_sample_info, 
-    worker_init_fn
-)
-
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
 
 # ================== UTILITY FUNCTIONS ==================
@@ -471,7 +464,7 @@ def main():
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
     parser.add_argument('--dataset', type=str, required=True,
-                   choices=['wild', 'real_fake', 'hard_fake_real', 'deepflux', 'uadfV', 'dfd', 'custom_genai'])
+                   choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai'])
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
     parser.add_argument('--data_dir', type=str, required=True)
@@ -492,7 +485,6 @@ def main():
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
 
-    # ایجاد مسیر ذخیره‌سازی مخصوص این دیتاست برای جلوگیری از تداخل
     if args.run_name:
         current_save_dir = os.path.join(args.save_dir, f"{args.dataset}_{args.run_name}")
     else:
@@ -567,7 +559,6 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    # ارزیابی نهایی و چاپ دقت
     ensemble_test_acc, ensemble_weights, activation_percentages = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
@@ -576,9 +567,7 @@ def main():
         print("\n" + "="*70)
         print("SAVING PREDICTIONS FOR PLOTTING")
         print("="*70)
-        
-        # استخراج لیبل‌ها و خروجی‌ها (Probabilities)
-        # نکته: این تابع باید قبلاً تعریف شده باشد (در مرحله قبل توضیح دادم)
+       
         all_labels, all_outputs = get_predictions_and_labels(ensemble_module, test_loader, device)
         
         # ذخیره در فایل
@@ -598,7 +587,6 @@ def main():
         print(f"  - Outputs shape: {all_outputs.shape}")
         print("="*70)
 
-    # بخش ویژوالایزیشن معمولی (اختیاری)
     if is_main:
         # اگر می‌خواهید ROC تکی هم رسم شود این خط را بگذارید، اما برای رسم همزمان فایل‌ها را نادیده بگیرید
         # plot_roc_and_f1(...) 
