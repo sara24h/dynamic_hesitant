@@ -18,6 +18,14 @@ warnings.filterwarnings("ignore")
 
 from dataset_utils import (
     UADFVDataset, 
+    CustomGenAIDataset, # اضافه شد
+    create_dataloaders, 
+    get_sample_info, 
+    worker_init_fn
+)
+
+from dataset_utils import (
+    DFDDataset, 
     create_dataloaders, 
     get_sample_info, 
     worker_init_fn
@@ -454,7 +462,6 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 # ================== MAIN FUNCTION ==================
-# ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Optimized Fuzzy Hesitant Ensemble Training")
     parser.add_argument('--epochs', type=int, default=30)
@@ -463,8 +470,9 @@ def main():
     parser.add_argument('--num_memberships', type=int, default=3)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
+    # تغییر ۱: اضافه کردن 'dfd' به choices
     parser.add_argument('--dataset', type=str, required=True,
-                   choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai'])
+                       choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai'])
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
     parser.add_argument('--data_dir', type=str, required=True)
@@ -472,10 +480,6 @@ def main():
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
     parser.add_argument('--seed', type=int, default=42)
-    
-    # آرگومان جدید برای مشخص کردن نام دیتاست برای ذخیره‌سازی (اختیاری)
-    parser.add_argument('--run_name', type=str, default=None, help="Custom name for the run to avoid overwriting previous runs")
-    
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
@@ -485,16 +489,16 @@ def main():
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
 
-    if args.run_name:
-        current_save_dir = os.path.join(args.save_dir, f"{args.dataset}_{args.run_name}")
-    else:
-        current_save_dir = os.path.join(args.save_dir, args.dataset)
-    
     if is_main:
         print("="*70)
-        print(f"DATASET: {args.dataset.upper()}")
-        print(f"SAVE DIRECTORY: {current_save_dir}")
+        print(f"OPTIMIZED FUZZY HESITANT ENSEMBLE TRAINING")
+        print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
+        print(f"Dataset: {args.dataset}")
+        print(f"Data directory: {args.data_dir}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Models: {len(args.model_paths)}")
+        print("="*70 + "\n")
 
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
@@ -516,41 +520,47 @@ def main():
     if world_size > 1:
         ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
-    # بارگذاری دیتالودرها برای دیتاست فعلی
+    if is_main:
+        trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in ensemble.parameters())
+        print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
+
+    # اگر دیتاست DFD انتخاب شود، create_dataloaders از dataset_utils آن را هندل می‌کند
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
 
-    # بررسی اینکه آیا مدل آموزش دیده وجود دارد یا خیر
-    ckpt_path = os.path.join(current_save_dir, 'best_hesitant_fuzzy.pt')
-    
+    if is_main:
+        print("\n" + "="*70)
+        print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
+        print("="*70)
+
+    individual_accs = []
+    for i, model in enumerate(base_models):
+        acc = evaluate_single_model_ddp(
+            model, test_loader, device,
+            f"Model {i+1} ({MODEL_NAMES[i]})",
+            MEANS[i], STDS[i], is_main)
+        individual_accs.append(acc)
+
+    best_single = max(individual_accs)
+    best_idx = individual_accs.index(best_single)
+
+    if is_main:
+        print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+        print("="*70)
+
+    best_val_acc, history = train_hesitant_fuzzy(
+        ensemble, train_loader, val_loader,
+        args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
+
+    ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
     if os.path.exists(ckpt_path):
-        if is_main:
-            print(f"Found existing trained model for {args.dataset}. Loading...")
-        
-        # لود کردن مدل
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         hesitant_net = ensemble.module.hesitant_fuzzy if hasattr(ensemble, 'module') else ensemble.hesitant_fuzzy
         hesitant_net.load_state_dict(ckpt['hesitant_state_dict'])
-        
-        # لود کردن تاریخچه برای اطلاعات
-        history = ckpt.get('history', {})
         if is_main:
-            print("Model loaded successfully.\n")
-    else:
-        if is_main:
-            print("No trained model found. Starting training...\n")
-        
-        # اگر مدل نبود، آموزش را انجام بده
-        best_val_acc, history = train_hesitant_fuzzy(
-            ensemble, train_loader, val_loader,
-            args.epochs, args.lr, device, current_save_dir, is_main, MODEL_NAMES)
-        
-        # لود کردن بهترین مدل بعد از آموزش
-        if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            hesitant_net = ensemble.module.hesitant_fuzzy if hasattr(ensemble, 'module') else ensemble.hesitant_fuzzy
-            hesitant_net.load_state_dict(ckpt['hesitant_state_dict'])
+            print("Best model loaded.\n")
 
     if is_main:
         print("\n" + "="*70)
@@ -558,41 +568,65 @@ def main():
         print("="*70)
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
-    
     ensemble_test_acc, ensemble_weights, activation_percentages = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
-    # ================== NEW SECTION: SAVE PREDICTIONS ==================
     if is_main:
         print("\n" + "="*70)
-        print("SAVING PREDICTIONS FOR PLOTTING")
+        print("FINAL COMPARISON")
         print("="*70)
-       
-        all_labels, all_outputs = get_predictions_and_labels(ensemble_module, test_loader, device)
-        
-        # ذخیره در فایل
-        results_data = {
-            'labels': all_labels,
-            'outputs': all_outputs,  # این امتیازات (Logits یا Probs) هستند
-            'dataset_name': args.dataset
-        }
-        
-        # نام فایل: مثلا wild_results.npz
-        results_filename = f"{args.dataset}_results.npz"
-        results_path = os.path.join(args.save_dir, results_filename)
-        
-        np.savez_compressed(results_path, **results_data)
-        print(f"Predictions saved to: {results_path}")
-        print(f"  - Labels shape: {all_labels.shape}")
-        print(f"  - Outputs shape: {all_outputs.shape}")
+        print(f"Best Single Model: {best_single:.2f}%")
+        print(f"Ensemble Accuracy: {ensemble_test_acc:.2f}%")
+        print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
 
-    if is_main:
-        # اگر می‌خواهید ROC تکی هم رسم شود این خط را بگذارید، اما برای رسم همزمان فایل‌ها را نادیده بگیرید
-        # plot_roc_and_f1(...) 
-        pass
+        final_results = {
+            'best_single_model': {
+                'name': MODEL_NAMES[best_idx],
+                'accuracy': float(best_single)
+            },
+            'ensemble': {
+                'test_accuracy': float(ensemble_test_acc),
+                'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)},
+                'activation_percentages': {name: float(p) for name, p in zip(MODEL_NAMES, activation_percentages)}
+            },
+            'improvement': float(ensemble_test_acc - best_single),
+            'training_history': history
+        }
+
+        results_path = os.path.join(args.save_dir, 'final_results.json')
+        with open(results_path, 'w') as f:
+            json.dump(final_results, f, indent=4)
+        print(f"\nResults saved: {results_path}")
+
+        final_model_path = os.path.join(args.save_dir, 'final_ensemble_model.pt')
+        torch.save({
+            'ensemble_state_dict': ensemble_module.state_dict(),
+            'hesitant_fuzzy_state_dict': ensemble_module.hesitant_fuzzy.state_dict(),
+            'test_accuracy': ensemble_test_acc,
+            'model_names': MODEL_NAMES,
+            'means': MEANS,
+            'stds': STDS
+        }, final_model_path)
+        print(f"Model saved: {final_model_path}")
+
+        vis_dir = os.path.join(args.save_dir, 'visualizations')
+        generate_visualizations(
+            ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
+            args.num_grad_cam_samples, args.num_lime_samples,
+            args.dataset, is_main)
 
     cleanup_distributed()
+
+    if is_main:
+        plot_roc_and_f1(
+            ensemble_module,
+            test_loader, 
+            device, 
+            args.save_dir, 
+            MODEL_NAMES,
+            is_main
+        )
 
 if __name__ == "__main__":
     main()
