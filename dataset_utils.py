@@ -24,11 +24,9 @@ class CustomGenAIDataset(Dataset):
         print(f"{'='*60}")
 
         if hierarchical:
-            # تعیین سوییت‌ها (train و test) - حساس به حروف بزرگ و کوچک نیستیم
             possible_splits = ['train', 'test']
             existing_splits = []
             
-            # پیدا کردن پوشه‌های train و test در روت
             for item in os.listdir(root_dir):
                 item_path = os.path.join(root_dir, item)
                 if os.path.isdir(item_path) and item.lower() in possible_splits:
@@ -42,7 +40,6 @@ class CustomGenAIDataset(Dataset):
                 split_path = os.path.join(root_dir, split)
                 print(f"\nProcessing Split: {split}")
                 
-                # درون هر سوییت، روی کلاس‌ها حلقه بزن (insightface, photoshop, ...)
                 for class_name in fake_classes + [real_class]:
                     is_real_class = (class_name == real_class)
                     class_path = os.path.join(split_path, class_name)
@@ -50,7 +47,6 @@ class CustomGenAIDataset(Dataset):
                     if not os.path.exists(class_path):
                         continue
                     
-                    # 1. پردازش برچسب Real (اگر کلاس جاری real باشد)
                     if is_real_class:
                         real_label_path = os.path.join(class_path, 'real')
                         if os.path.exists(real_label_path):
@@ -58,8 +54,6 @@ class CustomGenAIDataset(Dataset):
                             for img_file in files:
                                 self.samples.append((os.path.join(real_label_path, img_file), self.label_map['real']))
                             print(f"  [+] {class_name:20} | Real: {len(files):5} images")
-                    
-                    # 2. پردازش برچسب Fake (اگر کلاس جاری یکی از fake_classes باشد)
                     else:
                         fake_label_path = os.path.join(class_path, 'fake')
                         if os.path.exists(fake_label_path):
@@ -69,7 +63,6 @@ class CustomGenAIDataset(Dataset):
                             print(f"  [+] {class_name:20} | Fake: {len(files):5} images")
 
         else:
-            # حالت Flat (استفاده نمیشود ولی جهت حفظ سازگاری باقی مانده)
             print("Flat mode not supported for this dataset structure in this context.")
             pass
 
@@ -127,17 +120,20 @@ class UADFVDataset(Dataset):
 
 
 class TransformSubset(Subset):
-    """Subset with custom transform"""
+    """Subset with custom transform - FIXED"""
     def __init__(self, dataset, indices, transform):
         super().__init__(dataset, indices)
         self.transform = transform
 
     def __getitem__(self, idx):
-        # دسترسی به سوریس دیتاست برای بدست آوردن مسیر و لیبل
+        # دریافت مسیر و لیبل از دیتاست اصلی
         img_path, label = self.dataset.samples[self.indices[idx]]
         img = Image.open(img_path).convert('RGB')
+        
+        # اعمال ترانسفرم (بسیار مهم: حتما باید اینجا اعمال شود)
         if self.transform:
             img = self.transform(img)
+            
         return img, label
 
 # ================== UTILITY FUNCTIONS ==================
@@ -152,9 +148,6 @@ def get_sample_info(dataset, index):
 
 
 def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    """
-    تقسیم استاندارد دیتاست به سه بخش
-    """
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     
     num_samples = len(dataset)
@@ -289,8 +282,6 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
             hierarchical=True 
         )
         
-        # برای دیتاستی که از قبل تقسیم شده (train/test در دایرکتوری)، 
-        # ما اینجا کل دیتاست را لود میکنیم و دوباره رندوم اسپلیت میزنیم
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
             full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
         )
@@ -339,12 +330,10 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
         print(f"Creating DataLoaders (Dataset: {dataset_type})")
         print("="*70)
 
-    # ================== اصلاحات اعمال شده ==================
-    # تغییر Resize(256) به Resize((256, 256)) برای همسان‌سازی تمام ابعاد
-    # و جایگزینی CenterCrop با RandomCrop در تست برای اطمینان از خروجی 256x256
-    
+    # ================== FIX APPLIED HERE ==================
+    # تغییر Resize(256) به Resize((256, 256)) برای همسان‌سازی ابعاد تصاویر
     train_transform = transforms.Compose([
-        transforms.Resize((256, 256)),  # اصلاح شده: اطمینان از مربعی شدن تصویر
+        transforms.Resize((256, 256)),  # <--- اصلاح شده
         transforms.RandomCrop(256),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(10),
@@ -353,8 +342,8 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
     ])
 
     val_test_transform = transforms.Compose([
-        transforms.Resize((256, 256)),  # اصلاح شده: اطمینان از مربعی شدن تصویر
-        transforms.RandomCrop(256),     # اصلاح شده: استفاده از RandomCrop برای تضمین سایز خروجی
+        transforms.Resize((256, 256)),  # <--- اصلاح شده
+        transforms.RandomCrop(256),     # <--- برای اطمینان از سایز 256x256 در تست
         transforms.ToTensor(),
     ])
     # ========================================================
@@ -394,7 +383,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
     else:
-        # مدیریت همه دیتاست‌های دیگر
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
             
@@ -441,7 +429,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
         print(f" Batches → Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
         print("="*70 + "\n")
     return train_loader, val_loader, test_loader
-
                            
 if __name__ == '__main__':
     path_to_dataset = '/kaggle/input/computer-vision-assignment-2/data'
