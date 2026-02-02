@@ -11,11 +11,7 @@ from sklearn.model_selection import train_test_split
 from PIL import Image
 
 class CustomGenAIDataset(Dataset):
-    """
-    کلاس اصلاح شده مخصوص ساختار داده‌ای شما:
-    root/train/class_name/fake|real
-    root/test/class_name/fake|real
-    """
+  
     def __init__(self, root_dir, fake_classes, real_class, transform=None, hierarchical=False):
         self.root_dir = root_dir
         self.transform = transform
@@ -52,11 +48,7 @@ class CustomGenAIDataset(Dataset):
                     class_path = os.path.join(split_path, class_name)
                     
                     if not os.path.exists(class_path):
-                        # print(f"  [-] Class not found: {class_name}")
                         continue
-                    
-                    # درون هر کلاس، به دنبال پوشه‌های fake و real بگرد
-                    # چون ساختار شما split/class/fake است، نیازی به جستجوی پیچیده نیست
                     
                     # 1. پردازش برچسب Real (اگر کلاس جاری real باشد)
                     if is_real_class:
@@ -141,6 +133,7 @@ class TransformSubset(Subset):
         self.transform = transform
 
     def __getitem__(self, idx):
+        # دسترسی به سوریس دیتاست برای بدست آوردن مسیر و لیبل
         img_path, label = self.dataset.samples[self.indices[idx]]
         img = Image.open(img_path).convert('RGB')
         if self.transform:
@@ -160,12 +153,7 @@ def get_sample_info(dataset, index):
 
 def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
     """
-    این تابع برای دیتاستی که از قبل به Train/Test تقسیم شده مناسب نیست.
-    اما چون در کد اصلی صدا زده می‌شود، ما ایندکس‌ها را بر اساس لیست samples برمی‌گردانیم
-    تا برنامه کرش نکند (یا می‌توانیم منطقش را تغییر دهیم).
-    
-    نکته مهم: برای دیتاست custom_genai_tree که قبلاً split دارد، 
-    بهترین کار این است که کل دیتاست را بخوانیم و بعد خودمان split کنیم.
+    تقسیم استاندارد دیتاست به سه بخش
     """
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     
@@ -303,11 +291,6 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         
         # برای دیتاستی که از قبل تقسیم شده (train/test در دایرکتوری)، 
         # ما اینجا کل دیتاست را لود میکنیم و دوباره رندوم اسپلیت میزنیم
-        # چون پارامترهای create_dataloaders این انتظار را دارند.
-        # اگر می‌خواهید دقیقاً همان فایل‌های پوشه train را برای آموزش استفاده کنید، 
-        # باید منطق prepare_dataset را تغییر دهید تا ایندکس‌ها را بر اساس فایل‌های پوشه train فیلتر کند.
-        # اما در حال حاضر برای رفع ارور، همان روش استاندارد ادامه می‌یابد.
-        
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
             full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
         )
@@ -356,8 +339,12 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
         print(f"Creating DataLoaders (Dataset: {dataset_type})")
         print("="*70)
 
+    # ================== اصلاحات اعمال شده ==================
+    # تغییر Resize(256) به Resize((256, 256)) برای همسان‌سازی تمام ابعاد
+    # و جایگزینی CenterCrop با RandomCrop در تست برای اطمینان از خروجی 256x256
+    
     train_transform = transforms.Compose([
-        transforms.Resize(256),
+        transforms.Resize((256, 256)),  # اصلاح شده: اطمینان از مربعی شدن تصویر
         transforms.RandomCrop(256),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(10),
@@ -366,10 +353,11 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
     ])
 
     val_test_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(256),
+        transforms.Resize((256, 256)),  # اصلاح شده: اطمینان از مربعی شدن تصویر
+        transforms.RandomCrop(256),     # اصلاح شده: استفاده از RandomCrop برای تضمین سایز خروجی
         transforms.ToTensor(),
     ])
+    # ========================================================
 
     if dataset_type == 'wild':
         splits = ['train', 'valid', 'test']
