@@ -1,4 +1,3 @@
-
 import torch
 from torch.utils.data import DataLoader, Subset, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -331,20 +330,23 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
         print("="*70)
 
     # ================== FIX APPLIED HERE ==================
-    # تغییر Resize(256) به Resize((256, 256)) برای همسان‌سازی ابعاد تصاویر
+    # اصلاح شده: RandomCrop حذف شد تا از خطای سایز متفاوت جلوگیری شود
+    
     train_transform = transforms.Compose([
-        transforms.Resize((256, 256)),  # <--- اصلاح شده
-        transforms.RandomCrop(256),
-        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.Resize((256, 256)),       # تغییر سایز قطعی به 256x256
+        transforms.RandomHorizontalFlip(p=0.5), 
         transforms.RandomRotation(10),
         transforms.ColorJitter(0.2, 0.2),
         transforms.ToTensor(),
+        # نرمال‌سازی اختیاری: اگر مدل شما نیاز دارد این خط را فعال کنید
+        # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
     val_test_transform = transforms.Compose([
-        transforms.Resize((256, 256)),  # <--- اصلاح شده
-        transforms.RandomCrop(256),     # <--- برای اطمینان از سایز 256x256 در تست
+        transforms.Resize((256, 256)),       # تغییر سایز قطعی به 256x256
         transforms.ToTensor(),
+        # نرمال‌سازی اختیاری: اگر مدل شما نیاز دارد این خط را فعال کنید
+        # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     # ========================================================
 
