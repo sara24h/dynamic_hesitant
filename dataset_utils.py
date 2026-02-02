@@ -117,9 +117,8 @@ class UADFVDataset(Dataset):
             image = self.transform(image)
         return image, label
 
-
 class TransformSubset(Subset):
-    """Subset with custom transform - FIXED"""
+    """Subset with custom transform - SAFELY FIXED"""
     def __init__(self, dataset, indices, transform):
         super().__init__(dataset, indices)
         self.transform = transform
@@ -127,12 +126,26 @@ class TransformSubset(Subset):
     def __getitem__(self, idx):
         # دریافت مسیر و لیبل از دیتاست اصلی
         img_path, label = self.dataset.samples[self.indices[idx]]
+        
+        # باز کردن تصویر
         img = Image.open(img_path).convert('RGB')
         
-        # اعمال ترانسفرم (بسیار مهم: حتما باید اینجا اعمال شود)
+        # --- بخش اصلاح شده و امن ---
         if self.transform:
             img = self.transform(img)
-            
+        
+        # چک کردن نهایی سایز: اگر تصویر هنوز سایز 256x256 ندارد، آن را ریسایز کن
+        # این کار جلوی خطای stack را می‌گیرد حتی اگر ترانسفرم اصلی مشکل داشته باشد
+        if img.shape[1] != 256 or img.shape[2] != 256:
+             # این چک فقط وقتی فعال است که img تنسور باشد (پس از ToTensor)
+             # اگر قبل از ToTensor باشد، پیل متد resize دارد.
+             # از آنجایی که ToTensor آخرین ترانسفرم ماست، img الان یک تنسور است.
+             
+             # تبدیل موقت به PIL برای ریسایز امن
+             import torchvision.transforms.functional as TF
+             img = TF.resize(img, [256, 256])
+        # -----------------------------
+
         return img, label
 
 # ================== UTILITY FUNCTIONS ==================
@@ -338,15 +351,13 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
         transforms.RandomRotation(10),
         transforms.ColorJitter(0.2, 0.2),
         transforms.ToTensor(),
-        # نرمال‌سازی اختیاری: اگر مدل شما نیاز دارد این خط را فعال کنید
-        # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        
     ])
 
     val_test_transform = transforms.Compose([
         transforms.Resize((256, 256)),       # تغییر سایز قطعی به 256x256
         transforms.ToTensor(),
-        # نرمال‌سازی اختیاری: اگر مدل شما نیاز دارد این خط را فعال کنید
-        # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+       
     ])
     # ========================================================
 
