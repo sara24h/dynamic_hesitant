@@ -195,18 +195,49 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
     return models
 
 
-# ================== EVALUATION FUNCTIONS ==================
+# پیدا کنید این بخش را در فایل خودتان و کامل جایگزین کنید:
+
+# اضافه کردن ایمپورت‌های لازم در بالای فایل (اگر وجود ندارند):
+from torchvision import transforms
+
 @torch.no_grad()
 def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device,
                               name: str, mean: Tuple[float, float, float],
                               std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
+    
+    # --- FIX: تعریف ترانسفرم برای رفع مشکل سایز ---
+    # این ترانسفرم تضمین می‌کند که تمام تصاویر ورودی به مدل 256x256 باشند
+    fix_size_transform = transforms.Compose([
+        transforms.ToPILImage(),       # تبدیل تنسور به عکس
+        transforms.Resize((256, 256)), # ریسایز اجباری به 256
+        transforms.ToTensor()          # تبدیل دوباره به تنسور
+    ])
+    # ---------------------------------------------
+
     correct = 0
     total = 0
+    
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
-        images, labels = images.to(device), labels.to(device).float()
+        # تصاویر معمولاً از دیتالودر به صورت CPU می‌آیند
+        # اگر دیتالودر شما Tensor برمی‌گرداند:
+        if isinstance(images, torch.Tensor):
+            # اعمال ترانسفرم اصلاح‌کننده سایز روی تمام تصاویر بچ
+            # (این بخش ممکن است کمی کند باشد، اما برای رفع خطا ضروری است)
+            processed_images = []
+            for img in images:
+                # تبدیل به CPU برای ترنسفرم‌های پیلو
+                img_cpu = img.cpu()
+                processed_images.append(fix_size_transform(img_cpu))
+            images = torch.stack(processed_images).to(device)
+        else:
+            # اگر دیتالودر PIL Image می‌دهد (که بعید است با خطای شما)
+            pass
+
+        labels = labels.to(device).float()
         images = normalizer(images, 0)
+        
         out = model(images)
         if isinstance(out, (tuple, list)):
             out = out[0]
@@ -218,11 +249,11 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    
     acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main:
         print(f" {name}: {acc:.2f}%")
     return acc
-
 
 @torch.no_grad()
 def evaluate_accuracy_ddp(model, loader, device):
