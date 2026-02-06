@@ -216,7 +216,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
 
     if dataset_type == 'custom_genai':
      
-        fake_folders = ['DALL-E', 'DeepFaceLab', 'Midjourney']
+        fake_folders = ['DALL-E', 'DeepFaceLab', 'Midjourney','StyleGAN']
         real_folder = 'Real'
         
         temp_transform = transforms.Compose([transforms.ToTensor()])
