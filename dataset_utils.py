@@ -9,23 +9,21 @@ from typing import List, Tuple
 from sklearn.model_selection import train_test_split
 from PIL import Image
 
+# ================== DATASET CLASSES ==================
+
 class CustomGenAIDataset(Dataset):
-  
+    """دیتاست قبلی برای ساختار قدیمی (DALL-E, StyleGAN, Real در کنار هم)"""
     def __init__(self, root_dir, fake_classes, real_class, transform=None):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
       
-        self.label_map = {
-            'fake': 0,
-            'real': 1
-        }
+        self.label_map = {'fake': 0, 'real': 1}
 
-        print(f"[CustomDataset] Loading Fake images from: {fake_classes}")
+        print(f"[Old CustomDataset] Loading Fake images from: {fake_classes}")
         for class_name in fake_classes:
             class_path = os.path.join(root_dir, class_name)
             if os.path.exists(class_path):
-                
                 files = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
                 for img_file in files:
                     img_path = os.path.join(class_path, img_file)
@@ -33,8 +31,7 @@ class CustomGenAIDataset(Dataset):
             else:
                 print(f"[Warning] Path not found: {class_path}")
 
-       
-        print(f"[CustomDataset] Loading Real images from: {real_class}")
+        print(f"[Old CustomDataset] Loading Real images from: {real_class}")
         real_path = os.path.join(root_dir, real_class)
         if os.path.exists(real_path):
             files = [f for f in os.listdir(real_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
@@ -44,7 +41,75 @@ class CustomGenAIDataset(Dataset):
         else:
             print(f"[Warning] Path not found: {real_path}")
 
-        print(f"[CustomDataset] Total loaded images: {len(self.samples)}")
+        print(f"[Old CustomDataset] Total loaded images: {len(self.samples)}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
+class NewGenAIDataset(Dataset):
+    """
+    دیتاست جدید برای ساختار:
+    root/
+      train/ (fake, real)
+      test/
+      insightface/
+      ...
+    """
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.samples = []
+        self.label_map = {'fake': 0, 'real': 1}
+        
+        # لیست پوشه‌هایی که مشخصاً شامل تصاویر Fake هستند
+        single_class_fake_folders = [
+            'test', 
+            'insightface', 
+            'photoshop', 
+            'stablediffusion v1.5', 
+            'stylegan'
+        ]
+        
+        # 1. بارگذاری از پوشه train (شامل fake و real)
+        train_dir = os.path.join(root_dir, 'train')
+        if os.path.exists(train_dir):
+            print(f"[New Dataset] Scanning TRAIN folder: {train_dir}")
+            for subclass in ['fake', 'real']:
+                subclass_path = os.path.join(train_dir, subclass)
+                if os.path.exists(subclass_path):
+                    files = [f for f in os.listdir(subclass_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                    for img_file in files:
+                        img_path = os.path.join(subclass_path, img_file)
+                        self.samples.append((img_path, self.label_map[subclass]))
+                    print(f"  - Loaded {len(files)} images from train/{subclass}")
+                else:
+                    print(f"[Warning] Path not found: {subclass_path}")
+        else:
+            print(f"[Warning] TRAIN directory not found: {train_dir}")
+
+        # 2. بارگذاری از پوشه‌های مستقل Fake
+        print(f"[New Dataset] Scanning SINGLE-CLASS FAKE folders...")
+        for folder_name in single_class_fake_folders:
+            folder_path = os.path.join(root_dir, folder_name)
+            if os.path.exists(folder_path):
+                files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                for img_file in files:
+                    img_path = os.path.join(folder_path, img_file)
+                    # همه این پوشه‌ها Fake هستند
+                    self.samples.append((img_path, self.label_map['fake']))
+                print(f"  - Loaded {len(files)} images from {folder_name} (Fake)")
+            else:
+                print(f"[Warning] Path not found: {folder_path}")
+
+        print(f"[New Dataset] Total loaded images: {len(self.samples)}")
 
     def __len__(self):
         return len(self.samples)
@@ -94,7 +159,6 @@ class TransformSubset(Subset):
         self.transform = transform
 
     def __getitem__(self, idx):
-       
         img_path, label = self.dataset.samples[self.indices[idx]]
         img = Image.open(img_path).convert('RGB')
         if self.transform:
@@ -113,30 +177,26 @@ def get_sample_info(dataset, index):
 
 
 def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-   
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     num_samples = len(dataset)
     indices = list(range(num_samples))
-    
     labels = [dataset.samples[i][1] for i in indices]
 
-    # تقسیم به Train+Val و Test
+    # Split Train+Val vs Test
     train_val_indices, test_indices = train_test_split(
         indices, test_size=test_ratio, random_state=seed, stratify=labels)
     
-    # محاسبه نسبت مجدد برای Val نسبت به باقی‌مانده
-    train_val_labels = [labels[i] for i in train_val_indices]
-    val_size = val_ratio / (train_ratio + val_ratio)
+    # Calculate adjusted ratio for Val
+    val_size_adjusted = val_ratio / (train_ratio + val_ratio)
     
-    # تقسیم به Train و Val
+    # Split Train vs Val
     train_indices, val_indices = train_test_split(
-        train_val_indices, test_size=val_size, random_state=seed, stratify=train_val_labels)
+        train_val_indices, test_size=val_size_adjusted, random_state=seed, stratify=[labels[i] for i in train_val_indices])
         
     return train_indices, val_indices, test_indices
 
 
 def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    # (کدهای قبلی بدون تغییر - برای اختصار حفظ شده)
     all_video_ids = set()
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
@@ -153,9 +213,7 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
     val_size_adjusted = val_ratio / (train_ratio + val_ratio)
     train_ids, val_ids = train_test_split(train_val_ids, test_size=val_size_adjusted, random_state=seed)
     
-    train_indices = []
-    val_indices = []
-    test_indices = []
+    train_indices, val_indices, test_indices = [], [], []
     
     for idx, (img_path, label) in enumerate(dataset.samples):
         dir_name = os.path.basename(os.path.dirname(img_path))
@@ -172,7 +230,6 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
 
 
 def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-  
     all_video_ids = set()
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
@@ -215,8 +272,8 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
     print(f"\n[Dataset Loading] Processing: {dataset_type}")
 
     if dataset_type == 'custom_genai':
-     
-        fake_folders = ['DALL-E', 'DeepFaceLab', 'Midjourney','StyleGAN']
+        # دیتاست قبلی (ساختار قدیمی)
+        fake_folders = ['DALL-E', 'DeepFaceLab', 'Midjourney', 'StyleGAN']
         real_folder = 'Real'
         
         temp_transform = transforms.Compose([transforms.ToTensor()])
@@ -226,13 +283,21 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
             real_class=real_folder, 
             transform=temp_transform
         )
-        print("[Dataset Loading] Custom GenAI Dataset loaded.")
-        
-    
+        print("[Dataset Loading] Custom GenAI (Old) Dataset loaded.")
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
             full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
         )
         
+    elif dataset_type == 'custom_genai_v2':
+        # >>> دیتاست جدید (ساختار جدید با پوشه train و پوشه‌های تک‌کلاسه) <<<
+        temp_transform = transforms.Compose([transforms.ToTensor()])
+        full_dataset = NewGenAIDataset(base_dir, transform=temp_transform)
+        
+        print("[Dataset Loading] Custom GenAI V2 (New) Dataset loaded.")
+        train_indices, val_indices, test_indices = create_standard_reproducible_split(
+            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
+        )
+
     elif dataset_type == 'uadfV':
         if not os.path.exists(base_dir):
             raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
@@ -256,7 +321,6 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
-        # ساختار ساده تصویری است
         train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
@@ -294,7 +358,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
     ])
 
     if dataset_type == 'wild':
-    
         splits = ['train', 'valid', 'test']
         datasets_dict = {}
         for split in splits:
@@ -329,7 +392,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
     else:
-        # مدیریت همه دیتاست‌های دیگر (uadfV, dfd, custom_genai, و ...)
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
             
@@ -343,7 +405,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
             print(f" Valid: {len(val_indices):,} ({len(val_indices)/len(full_dataset)*100:.1f}%)")
             print(f" Test: {len(test_indices):,} ({len(test_indices)/len(full_dataset)*100:.1f}%)\n")
 
-        # اعمال Transform ها با استفاده از TransformSubset
         train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
@@ -367,18 +428,21 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
 
     if is_main:
         print(f"DataLoaders ready! Batch size: {batch_size}")
-        print(f" Batches → Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
+        print(f" Batches → Train: {len(train_loader)}, Val: {len(test_loader)}, Test: {len(test_loader)}")
         print("="*70 + "\n")
     return train_loader, val_loader, test_loader
                            
 if __name__ == '__main__':
-    path_to_dataset = '/path/to/your/root/dataset'
+    # مسیر دیتاست جدید را اینجا وارد کنید
+    # این مسیر باید شامل پوشه‌های train, test, insightface و ... باشد
+    path_to_new_dataset = '/path/to/your/new/dataset' 
     
+    # برای استفاده از دیتاست جدید، از dataset_type='custom_genai_v2' استفاده کنید
     train_loader, val_loader, test_loader = create_dataloaders(
-        base_dir=path_to_dataset,
+        base_dir=path_to_new_dataset,
         batch_size=32,
         num_workers=4,
-        dataset_type='custom_genai',  
+        dataset_type='custom_genai_v2',  
         is_distributed=False,
         seed=42
     )
