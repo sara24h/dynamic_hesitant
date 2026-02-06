@@ -18,7 +18,8 @@ warnings.filterwarnings("ignore")
 
 from dataset_utils import (
     UADFVDataset, 
-    CustomGenAIDataset, # اضافه شد
+    CustomGenAIDataset, 
+    NewGenAIDataset,  # <--- اضافه شد برای دیتاست جدید
     create_dataloaders, 
     get_sample_info, 
     worker_init_fn
@@ -288,9 +289,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
-    """
-    تابع اصلاح‌شده training با نمایش جزئیات کامل
-    """
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -463,8 +461,9 @@ def main():
     parser.add_argument('--num_memberships', type=int, default=3)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
+    # <--- اضافه شدن custom_genai_v2 به لیست انتخاب‌ها --->
     parser.add_argument('--dataset', type=str, required=True,
-                       choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai'])
+                       choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai', 'custom_genai_v2'])
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
     parser.add_argument('--data_dir', type=str, required=True)
@@ -492,11 +491,26 @@ def main():
         print(f"Models: {len(args.model_paths)}")
         print("="*70 + "\n")
 
-    MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
-    STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+    # <--- مدیریت پویای MEANS و STDS بر اساس تعداد مدل‌ها --->
+    DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
+    DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
-    MEANS = MEANS[:len(args.model_paths)]
-    STDS = STDS[:len(args.model_paths)]
+    # اگر تعداد مدل‌ها بیشتر از لیست پیش‌فرض بود، از آخرین مقدار تکرار می‌کنیم (یا می‌توانید لیست را در اینجا کامل کنید)
+    # در اینجا فرض می‌کنیم شما لیست کامل را دارید یا از همان 3 تا استفاده می‌کنید.
+    # برای اطمینان، لیست را به تعداد مدل‌ها برش می‌دهیم (اگر کمتر آوردید خطا می‌دهد، پس باید مطمئن باشید لیست کافی است)
+    num_models_to_load = len(args.model_paths)
+    if num_models_to_load > len(DEFAULT_MEANS):
+        # هشدار و تکرار آخرین مقدار در صورت لزوم (با فرض استاندارد بودن تصاویر)
+        # در حالت ایده آل شما باید MEANS و STDS دقیق هر مدل را اینجا وارد کنید
+        last_mean = DEFAULT_MEANS[-1]
+        last_std = DEFAULT_STDS[-1]
+        MEANS = DEFAULT_MEANS + [last_mean] * (num_models_to_load - len(DEFAULT_MEANS))
+        STDS = DEFAULT_STDS + [last_std] * (num_models_to_load - len(DEFAULT_STDS))
+        if is_main:
+            print(f"[Warning] Not enough normalization stats provided. Reusing last stats for extra models.")
+    else:
+        MEANS = DEFAULT_MEANS[:num_models_to_load]
+        STDS = DEFAULT_STDS[:num_models_to_load]
 
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
@@ -517,7 +531,6 @@ def main():
         total = sum(p.numel() for p in ensemble.parameters())
         print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
-    # اگر دیتاست DFD انتخاب شود، create_dataloaders از dataset_utils آن را هندل می‌کند
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
