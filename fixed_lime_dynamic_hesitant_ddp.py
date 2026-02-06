@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,35 +12,19 @@ import json
 import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
-
-# Importing visualization libraries
-try:
-    from grad_cam import GradCAM
-    from lime import lime_image
-except ImportError:
-    print("[Warning] GradCAM or LIME not fully installed, visualization might be limited.")
+from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
 
-# Import custom utilities
 from dataset_utils import (
     UADFVDataset, 
-    CustomGenAIDataset, 
+    CustomGenAIDataset, # اضافه شد
     create_dataloaders, 
     get_sample_info, 
     worker_init_fn
 )
 
-# Ensure visualization_utils is handled gracefully
-try:
-    from visualization_utils import generate_visualizations
-except ImportError:
-    print("[Warning] visualization_utils not found. Skipping import.")
-
-try:
-    from metrics_utils import plot_roc_and_f1
-except ImportError:
-    print("[Warning] metrics_utils not found. Skipping import.")
+from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -181,7 +164,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
             model = model.to(device).eval()
             param_count = sum(p.numel() for p in model.parameters())
             if is_main:
-                print(f" -> Parameters: {param_count:,}")
+                print(f" → Parameters: {param_count:,}")
             models.append(model)
         except Exception as e:
             if is_main:
@@ -195,49 +178,18 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
     return models
 
 
-# پیدا کنید این بخش را در فایل خودتان و کامل جایگزین کنید:
-
-# اضافه کردن ایمپورت‌های لازم در بالای فایل (اگر وجود ندارند):
-from torchvision import transforms
-
+# ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
 def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device,
                               name: str, mean: Tuple[float, float, float],
                               std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
-    
-    # --- FIX: تعریف ترانسفرم برای رفع مشکل سایز ---
-    # این ترانسفرم تضمین می‌کند که تمام تصاویر ورودی به مدل 256x256 باشند
-    fix_size_transform = transforms.Compose([
-        transforms.ToPILImage(),       # تبدیل تنسور به عکس
-        transforms.Resize((256, 256)), # ریسایز اجباری به 256
-        transforms.ToTensor()          # تبدیل دوباره به تنسور
-    ])
-    # ---------------------------------------------
-
     correct = 0
     total = 0
-    
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
-        # تصاویر معمولاً از دیتالودر به صورت CPU می‌آیند
-        # اگر دیتالودر شما Tensor برمی‌گرداند:
-        if isinstance(images, torch.Tensor):
-            # اعمال ترانسفرم اصلاح‌کننده سایز روی تمام تصاویر بچ
-            # (این بخش ممکن است کمی کند باشد، اما برای رفع خطا ضروری است)
-            processed_images = []
-            for img in images:
-                # تبدیل به CPU برای ترنسفرم‌های پیلو
-                img_cpu = img.cpu()
-                processed_images.append(fix_size_transform(img_cpu))
-            images = torch.stack(processed_images).to(device)
-        else:
-            # اگر دیتالودر PIL Image می‌دهد (که بعید است با خطای شما)
-            pass
-
-        labels = labels.to(device).float()
+        images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
-        
         out = model(images)
         if isinstance(out, (tuple, list)):
             out = out[0]
@@ -249,11 +201,11 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-    
     acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main:
         print(f" {name}: {acc:.2f}%")
     return acc
+
 
 @torch.no_grad()
 def evaluate_accuracy_ddp(model, loader, device):
@@ -317,8 +269,8 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"\n{'='*70}")
         print(f"{name.upper()} SET RESULTS")
         print(f"{'='*70}")
-        print(f" -> Accuracy: {acc:.3f}%")
-        print(f" -> Total Samples: {total_samples:,}")
+        print(f" → Accuracy: {acc:.3f}%")
+        print(f" → Total Samples: {total_samples:,}")
         print(f"\nAverage Model Weights:")
         for i, (w, mname) in enumerate(zip(avg_weights, model_names)):
             print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
@@ -328,7 +280,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"\nHesitant Membership Values:")
         for i, mname in enumerate(model_names):
             mu_str = ", ".join([f"{v:.3f}" for v in avg_membership[i]])
-            print(f" {i+1:2d}. {mname:<25}: mu = [{mu_str}] | Hesitancy = {avg_hesitancy[i]:.4f}")
+            print(f" {i+1:2d}. {mname:<25}: μ = [{mu_str}] | Hesitancy = {avg_hesitancy[i]:.4f}")
         print(f"{'='*70}")
         return acc, avg_weights.tolist(), activation_percentages.tolist()
     return 0.0, [0.0]*len(model_names), [0.0]*len(model_names)
@@ -336,6 +288,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
+    """
+    تابع اصلاح‌شده training با نمایش جزئیات کامل
+    """
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -440,11 +395,11 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             print(f"{'-'*70}")
             print(f"  {'Cumsum activated in:':<30}  {avg_cumsum_usage:.2f}% of samples")
             if avg_cumsum_usage > 50:
-                print(f"  {'Status:':<30}  Efficient")
+                print(f"  {'Status:':<30}  ✓ Efficient")
             elif avg_cumsum_usage > 20:
-                print(f"  {'Status:':<30}  Moderate")
+                print(f"  {'Status:':<30}  ≈ Moderate")
             else:
-                print(f"  {'Status:':<30}  Low efficiency")
+                print(f"  {'Status:':<30}  ✗ Low efficiency")
             print(f"  {'All models used in:':<30}  {100-avg_cumsum_usage:.2f}% of samples")
             
             print(f"\n{'Model Activation Frequency:':^70}")
@@ -464,7 +419,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
                 'val_acc': val_acc,
                 'history': history
             }, save_path)
-            print(f"\n Best model saved -> {val_acc:.2f}%")
+            print(f"\n✓ Best model saved → {val_acc:.2f}%")
 
         if is_main:
             print()
@@ -509,7 +464,7 @@ def main():
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
     parser.add_argument('--dataset', type=str, required=True,
-                       choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai', 'custom_genai_tree'])
+                       choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai'])
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
     parser.add_argument('--data_dir', type=str, required=True)
@@ -562,6 +517,7 @@ def main():
         total = sum(p.numel() for p in ensemble.parameters())
         print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
+    # اگر دیتاست DFD انتخاب شود، create_dataloaders از dataset_utils آن را هندل می‌کند
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
@@ -583,7 +539,7 @@ def main():
     best_idx = individual_accs.index(best_single)
 
     if is_main:
-        print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) -> {best_single:.2f}%")
+        print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
         print("="*70)
 
     best_val_acc, history = train_hesitant_fuzzy(
@@ -646,25 +602,23 @@ def main():
         }, final_model_path)
         print(f"Model saved: {final_model_path}")
 
-        if 'generate_visualizations' in globals():
-            vis_dir = os.path.join(args.save_dir, 'visualizations')
-            generate_visualizations(
-                ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
-                args.num_grad_cam_samples, args.num_lime_samples,
-                args.dataset, is_main)
+        vis_dir = os.path.join(args.save_dir, 'visualizations')
+        generate_visualizations(
+            ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
+            args.num_grad_cam_samples, args.num_lime_samples,
+            args.dataset, is_main)
 
     cleanup_distributed()
 
     if is_main:
-        if 'plot_roc_and_f1' in globals():
-            plot_roc_and_f1(
-                ensemble_module,
-                test_loader, 
-                device, 
-                args.save_dir, 
-                MODEL_NAMES,
-                is_main
-            )
+        plot_roc_and_f1(
+            ensemble_module,
+            test_loader, 
+            device, 
+            args.save_dir, 
+            MODEL_NAMES,
+            is_main
+        )
 
 if __name__ == "__main__":
     main()
