@@ -11,101 +11,40 @@ from PIL import Image
 
 class CustomGenAIDataset(Dataset):
   
-    def __init__(self, root_dir, fake_classes, real_class, transform=None, hierarchical=False):
+    def __init__(self, root_dir, fake_classes, real_class, transform=None):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
-        self.label_map = {'fake': 0, 'real': 1}
-        
-        print(f"\n{'='*60}")
-        print(f"[CustomDataset] Root: {root_dir}")
-        print(f"[CustomDataset] Structure: Split -> Class -> Label (New Style)")
-        print(f"{'='*60}")
+      
+        self.label_map = {
+            'fake': 0,
+            'real': 1
+        }
 
-        if hierarchical:
-            possible_splits = ['train', 'test']
-            existing_splits = []
-            
-            for item in os.listdir(root_dir):
-                item_path = os.path.join(root_dir, item)
-                if os.path.isdir(item_path) and item.lower() in possible_splits:
-                    existing_splits.append(item)
-            
-            if not existing_splits:
-                print(f"[!] No 'train' or 'test' folders found in {root_dir}")
-                return
-
-            for split in existing_splits:
-                split_path = os.path.join(root_dir, split)
-                print(f"\nProcessing Split: {split}")
+        print(f"[CustomDataset] Loading Fake images from: {fake_classes}")
+        for class_name in fake_classes:
+            class_path = os.path.join(root_dir, class_name)
+            if os.path.exists(class_path):
                 
-                for class_name in fake_classes + [real_class]:
-                    is_real_class = (class_name == real_class)
-                    class_path = os.path.join(split_path, class_name)
-                    
-                    if not os.path.exists(class_path):
-                        continue
-                    
-                    if is_real_class:
-                        real_label_path = os.path.join(class_path, 'real')
-                        if os.path.exists(real_label_path):
-                            files = [f for f in os.listdir(real_label_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                            for img_file in files:
-                                self.samples.append((os.path.join(real_label_path, img_file), self.label_map['real']))
-                            print(f"  [+] {class_name:20} | Real: {len(files):5} images")
-                    else:
-                        fake_label_path = os.path.join(class_path, 'fake')
-                        if os.path.exists(fake_label_path):
-                            files = [f for f in os.listdir(fake_label_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                            for img_file in files:
-                                self.samples.append((os.path.join(fake_label_path, img_file), self.label_map['fake']))
-                            print(f"  [+] {class_name:20} | Fake: {len(files):5} images")
+                files = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                for img_file in files:
+                    img_path = os.path.join(class_path, img_file)
+                    self.samples.append((img_path, self.label_map['fake']))
+            else:
+                print(f"[Warning] Path not found: {class_path}")
 
+       
+        print(f"[CustomDataset] Loading Real images from: {real_class}")
+        real_path = os.path.join(root_dir, real_class)
+        if os.path.exists(real_path):
+            files = [f for f in os.listdir(real_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            for img_file in files:
+                img_path = os.path.join(real_path, img_file)
+                self.samples.append((img_path, self.label_map['real']))
         else:
-            print("Flat mode not supported for this dataset structure in this context.")
-            pass
+            print(f"[Warning] Path not found: {real_path}")
 
-        print(f"\n[CustomDataset] Total images loaded: {len(self.samples)}")
-        if len(self.samples) == 0:
-            print("!!! WARNING: NO IMAGES LOADED. Check file paths. !!!")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        try:
-            image = Image.open(img_path).convert('RGB')
-        except Exception as e:
-            print(f"\n[ERROR] Corrupt image: {img_path} - {e}")
-            image = Image.new('RGB', (256, 256))
-            
-        if self.transform:
-            image = self.transform(image)
-        return image, label
-
-class UADFVDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.samples = []
-        self.class_to_idx = {'fake': 0, 'real': 1}
-
-        if not os.path.exists(root_dir):
-             print(f"[UADFV] Error: Root dir not found {root_dir}")
-             return
-
-        for class_name in ['fake', 'real']:
-            frames_dir = os.path.join(self.root_dir, class_name, 'frames')
-            if os.path.exists(frames_dir):
-                for subdir in os.listdir(frames_dir):
-                    subdir_path = os.path.join(frames_dir, subdir)
-                    if os.path.isdir(subdir_path):
-                        for img_file in os.listdir(subdir_path):
-                            if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                                img_path = os.path.join(subdir_path, img_file)
-                                self.samples.append((img_path, self.class_to_idx[class_name]))
-        print(f"[UADFV] Loaded {len(self.samples)} images.")
+        print(f"[CustomDataset] Total loaded images: {len(self.samples)}")
 
     def __len__(self):
         return len(self.samples)
@@ -117,35 +56,49 @@ class UADFVDataset(Dataset):
             image = self.transform(image)
         return image, label
 
+
+class UADFVDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.samples = []
+        self.class_to_idx = {'fake': 0, 'real': 1}
+        self.classes = list(self.class_to_idx.keys())
+
+        for class_name in ['fake', 'real']:
+            frames_dir = os.path.join(self.root_dir, class_name, 'frames')
+            if os.path.exists(frames_dir):
+                for subdir in os.listdir(frames_dir):
+                    subdir_path = os.path.join(frames_dir, subdir)
+                    if os.path.isdir(subdir_path):
+                        for img_file in os.listdir(subdir_path):
+                            if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                img_path = os.path.join(subdir_path, img_file)
+                                self.samples.append((img_path, self.class_to_idx[class_name]))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
 class TransformSubset(Subset):
-    """Subset with custom transform - SAFELY FIXED"""
+    """Subset with custom transform"""
     def __init__(self, dataset, indices, transform):
         super().__init__(dataset, indices)
         self.transform = transform
 
     def __getitem__(self, idx):
-        # دریافت مسیر و لیبل از دیتاست اصلی
+       
         img_path, label = self.dataset.samples[self.indices[idx]]
-        
-        # باز کردن تصویر
         img = Image.open(img_path).convert('RGB')
-        
-        # --- بخش اصلاح شده و امن ---
         if self.transform:
             img = self.transform(img)
-        
-        # چک کردن نهایی سایز: اگر تصویر هنوز سایز 256x256 ندارد، آن را ریسایز کن
-        # این کار جلوی خطای stack را می‌گیرد حتی اگر ترانسفرم اصلی مشکل داشته باشد
-        if img.shape[1] != 256 or img.shape[2] != 256:
-             # این چک فقط وقتی فعال است که img تنسور باشد (پس از ToTensor)
-             # اگر قبل از ToTensor باشد، پیل متد resize دارد.
-             # از آنجایی که ToTensor آخرین ترانسفرم ماست، img الان یک تنسور است.
-             
-             # تبدیل موقت به PIL برای ریسایز امن
-             import torchvision.transforms.functional as TF
-             img = TF.resize(img, [256, 256])
-        # -----------------------------
-
         return img, label
 
 # ================== UTILITY FUNCTIONS ==================
@@ -160,23 +113,22 @@ def get_sample_info(dataset, index):
 
 
 def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+   
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
-    
     num_samples = len(dataset)
-    
-    if num_samples == 0:
-        print("\n[CRITICAL ERROR] Cannot split dataset with 0 samples.")
-        return [], [], []
-    
     indices = list(range(num_samples))
+    
     labels = [dataset.samples[i][1] for i in indices]
 
+    # تقسیم به Train+Val و Test
     train_val_indices, test_indices = train_test_split(
         indices, test_size=test_ratio, random_state=seed, stratify=labels)
     
+    # محاسبه نسبت مجدد برای Val نسبت به باقی‌مانده
     train_val_labels = [labels[i] for i in train_val_indices]
     val_size = val_ratio / (train_ratio + val_ratio)
     
+    # تقسیم به Train و Val
     train_indices, val_indices = train_test_split(
         train_val_indices, test_size=val_size, random_state=seed, stratify=train_val_labels)
         
@@ -184,8 +136,7 @@ def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15,
 
 
 def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    if len(dataset) == 0: return [], [], []
-    
+    # (کدهای قبلی بدون تغییر - برای اختصار حفظ شده)
     all_video_ids = set()
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
@@ -196,7 +147,7 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
         all_video_ids.add(video_id)
 
     all_video_ids = sorted(list(all_video_ids))
-    if not all_video_ids: return [], [], []
+    print(f"[Split] Found {len(all_video_ids)} unique video pairs (Real+Fake).")
 
     train_val_ids, test_ids = train_test_split(all_video_ids, test_size=test_ratio, random_state=seed)
     val_size_adjusted = val_ratio / (train_ratio + val_ratio)
@@ -221,8 +172,7 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
 
 
 def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    if len(dataset) == 0: return [], [], []
-
+  
     all_video_ids = set()
     for img_path, label in dataset.samples:
         dir_name = os.path.basename(os.path.dirname(img_path))
@@ -234,8 +184,6 @@ def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_
         all_video_ids.add(vid_id)
 
     all_video_ids = sorted(list(all_video_ids))
-    if not all_video_ids: return [], [], []
-
     train_val_ids, test_ids = train_test_split(all_video_ids, test_size=test_ratio, random_state=seed)
     val_size_adjusted = val_ratio / (train_ratio + val_ratio)
     train_ids, val_ids = train_test_split(train_val_ids, test_size=val_size_adjusted, random_state=seed)
@@ -257,16 +205,18 @@ def create_video_level_dfd_split(dataset, train_ratio=0.7, val_ratio=0.15, test_
 
 
 def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
+   
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
         'deepflux': ['Fake', 'Real'],
     }
 
-    print(f"\n[Dataset Loading] Requested Type: {dataset_type}")
+    print(f"\n[Dataset Loading] Processing: {dataset_type}")
 
     if dataset_type == 'custom_genai':
-        fake_folders = ['DALL-E', 'DeepFaceLab', 'Midjourney','StyleGAN']
+     
+        fake_folders = ['DALL-E', 'DeepFaceLab', 'Midjourney']
         real_folder = 'Real'
         
         temp_transform = transforms.Compose([transforms.ToTensor()])
@@ -274,26 +224,11 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
             base_dir, 
             fake_classes=fake_folders, 
             real_class=real_folder, 
-            transform=temp_transform,
-            hierarchical=False
+            transform=temp_transform
         )
-        train_indices, val_indices, test_indices = create_standard_reproducible_split(
-            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
-        )
+        print("[Dataset Loading] Custom GenAI Dataset loaded.")
+        
     
-    elif dataset_type == 'custom_genai_tree':
-        fake_folders = ['insightface', 'photoshop', 'stablediffusion v1.5', 'stylegan']
-        real_folder = 'real'
-        
-        temp_transform = transforms.Compose([transforms.ToTensor()])
-        full_dataset = CustomGenAIDataset(
-            base_dir, 
-            fake_classes=fake_folders, 
-            real_class=real_folder, 
-            transform=temp_transform,
-            hierarchical=True 
-        )
-        
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
             full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
         )
@@ -321,6 +256,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
+        # ساختار ساده تصویری است
         train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
@@ -342,26 +278,23 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
         print(f"Creating DataLoaders (Dataset: {dataset_type})")
         print("="*70)
 
-    # ================== FIX APPLIED HERE ==================
-    # اصلاح شده: RandomCrop حذف شد تا از خطای سایز متفاوت جلوگیری شود
-    
     train_transform = transforms.Compose([
-        transforms.Resize((256, 256)),       # تغییر سایز قطعی به 256x256
-        transforms.RandomHorizontalFlip(p=0.5), 
+        transforms.Resize(256),
+        transforms.RandomCrop(256),
+        transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(10),
         transforms.ColorJitter(0.2, 0.2),
         transforms.ToTensor(),
-        
     ])
 
     val_test_transform = transforms.Compose([
-        transforms.Resize((256, 256)),       # تغییر سایز قطعی به 256x256
+        transforms.Resize(256),
+        transforms.CenterCrop(256),
         transforms.ToTensor(),
-       
     ])
-    # ========================================================
 
     if dataset_type == 'wild':
+    
         splits = ['train', 'valid', 'test']
         datasets_dict = {}
         for split in splits:
@@ -396,19 +329,13 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
     else:
+        # مدیریت همه دیتاست‌های دیگر (uadfV, dfd, custom_genai, و ...)
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
             
         full_dataset, train_indices, val_indices, test_indices = prepare_dataset(
             base_dir, dataset_type, seed=seed)
         
-        if not train_indices and not val_indices and not test_indices:
-            if is_main:
-                print("\n[ERROR] Dataset is empty! Cannot create DataLoaders.")
-                print("Please check the logs above to see why images were not found.")
-            empty_dataset = datasets.ImageFolder(base_dir, transform=train_transform)
-            return DataLoader(empty_dataset, batch_size=1), DataLoader(empty_dataset, batch_size=1), DataLoader(empty_dataset, batch_size=1)
-
         if is_main:
             print(f"\nDataset Stats:")
             print(f" Total: {len(full_dataset):,} images")
@@ -416,6 +343,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
             print(f" Valid: {len(val_indices):,} ({len(val_indices)/len(full_dataset)*100:.1f}%)")
             print(f" Test: {len(test_indices):,} ({len(test_indices)/len(full_dataset)*100:.1f}%)\n")
 
+        # اعمال Transform ها با استفاده از TransformSubset
         train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
@@ -444,13 +372,13 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
     return train_loader, val_loader, test_loader
                            
 if __name__ == '__main__':
-    path_to_dataset = '/kaggle/input/computer-vision-assignment-2/data'
+    path_to_dataset = '/path/to/your/root/dataset'
     
     train_loader, val_loader, test_loader = create_dataloaders(
         base_dir=path_to_dataset,
         batch_size=32,
         num_workers=4,
-        dataset_type='custom_genai_tree',
+        dataset_type='custom_genai',  
         is_distributed=False,
         seed=42
     )
