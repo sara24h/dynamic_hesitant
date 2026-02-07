@@ -25,6 +25,69 @@ from dataset_utils import (
     worker_init_fn
 )
 
+
+# ============================================================
+# HACK/PATCH: Force Resize to 256x256 for 'real_fake_dataset'
+# ============================================================
+import torchvision.transforms as transforms
+from PIL import Image
+
+# تابعی که کلاس TransformSubset را در حافظه اصلاح می‌کند
+def patch_dataset_utils():
+    try:
+        # دریافت کلاس اصلی از فایل dataset_utils
+        OriginalTransformSubset = dataset_utils.TransformSubset
+        
+        class SafeTransformSubset(OriginalTransformSubset):
+            def __getitem__(self, idx):
+                real_idx = self.indices[idx]
+                
+                # 1. لود کردن تصویر خام
+                if hasattr(self.dataset, 'samples'):
+                    img_path, label = self.dataset.samples[real_idx]
+                    try:
+                        image = Image.open(img_path).convert('RGB')
+                    except Exception as e:
+                        # اگر عکس خراب بود، یک عکس سیاه 256x256 بساز
+                        image = Image.new('RGB', (256, 256))
+                        label = 0
+                else:
+                    image, label = self.dataset[real_idx]
+                    if isinstance(image, torch.Tensor):
+                        image = transforms.ToPILImage()(image)
+
+                # 2. اعمال ترنسفرم اصلی (که شامل ToTensor و سایر موارد است)
+                # اما اگر ترنسفرم اصلی مشکل داشت، ما اینجا آن را مدیریت می‌کنیم
+                if self.transform:
+                    image = self.transform(image)
+                else:
+                    # اگر هیچ ترنسفرمی نبود (خیلی بعید است)
+                    image = transforms.Resize((256, 256))(image)
+                    image = transforms.ToTensor()(image)
+
+                # 3. بررسی نهایی: اگر هنوز سایز درست نبود، اینجا به زور درستش می‌کنیم
+                # اگر تصویر قبلاً تبدیل به Tensor شده است (channels, width, height)
+                if isinstance(image, torch.Tensor):
+                    c, h, w = image.shape
+                    if h != 256 or w != 256:
+                        # تبدیل دوباره به PIL برای اعمال Resize صحیح
+                        image = transforms.ToPILImage()(image)
+                        image = transforms.Resize((256, 256))(image)
+                        image = transforms.ToTensor()(image)
+                
+                return image, label
+
+        # جایگزینی کلاس در ماژول dataset_utils
+        dataset_utils.TransformSubset = SafeTransformSubset
+        print("[PATCH] Successfully applied Force-Resize(256, 256) fix to dataset_utils.")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to apply patch: {e}")
+
+# اجرای پچ
+patch_dataset_utils()
+# ============================================================
+
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
 
 # ================== UTILITY FUNCTIONS ==================
