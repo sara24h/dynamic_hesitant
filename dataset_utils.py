@@ -370,6 +370,8 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 
+# ... (کدهای بالای فایل تغییر نمی‌کنند) ...
+
 def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                        dataset_type: str = 'wild', is_distributed: bool = False,
                        seed: int = 42, is_main: bool = True):
@@ -378,9 +380,10 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
         print(f"Creating DataLoaders (Dataset: {dataset_type})")
         print("="*70)
 
+    # ================== اصلاحات اینجا انجام شد ==================
+    # تغییر 1: تبدیل (256) به (256, 256) برای اجبار به مربع کامل
     train_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.RandomCrop(256),
+        transforms.Resize((256, 256)),      # <--- تغییر دادم به (256, 256)
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(10),
         transforms.ColorJitter(0.2, 0.2),
@@ -388,10 +391,10 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
     ])
 
     val_test_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(256),
+        transforms.Resize((256, 256)),      # <--- تغییر دادم به (256, 256)
         transforms.ToTensor(),
     ])
+    # ===========================================================
 
     if dataset_type == 'wild':
         splits = ['train', 'valid', 'test']
@@ -420,8 +423,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                  num_workers=num_workers, pin_memory=True, drop_last=True,
                                  worker_init_fn=worker_init_fn)
         
-        # برای wild هم val و test را بهتر است با worker کمتر یا صفر اجرا کرد در حالت DDP
-        # اما اگر خطا داد، اینجا را هم 0 کنید.
         val_loader = DataLoader(datasets_dict['valid'], batch_size=batch_size,
                                shuffle=False, sampler=val_sampler,
                                num_workers=0 if is_distributed else num_workers, pin_memory=True, drop_last=False,
@@ -447,6 +448,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
             if hasattr(full_dataset, 'class_to_idx'):
                 print(f" Class → Index: {full_dataset.class_to_idx}\n")
 
+        # ایجاد دیتاست‌ها با ترنسفرم‌های اصلاح شده (حاوی Resize 256x256)
         train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
         test_dataset = TransformSubset(full_dataset, test_indices, val_test_transform)
@@ -460,22 +462,21 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                  num_workers=num_workers, pin_memory=True, drop_last=True,
                                  worker_init_fn=worker_init_fn)
         
-        # *** تغییر اصلی: اینجا num_workers را برای Val و Test صفر کردیم ***
         val_loader = DataLoader(val_dataset, batch_size=batch_size,
                                shuffle=False, sampler=val_sampler,
-                               num_workers=0,  # <--- حتما 0 باشد
+                               num_workers=0, 
                                pin_memory=True, drop_last=False,
                                worker_init_fn=worker_init_fn)
                                
         test_loader = DataLoader(test_dataset, batch_size=batch_size,
                                 shuffle=False, sampler=test_sampler,
-                                num_workers=0,  # <--- حتما 0 باشد
+                                num_workers=0, 
                                 pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
 
     if is_main:
         print(f"DataLoaders ready! Batch size: {batch_size}")
-        print(f" Batches → Train: {len(train_loader)}, Val: {len(test_loader)}, Test: {len(test_loader)}")
+        print(f" Batches → Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
         print("="*70 + "\n")
     return train_loader, val_loader, test_loader
                            
