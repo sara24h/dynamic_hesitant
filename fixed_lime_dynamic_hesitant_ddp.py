@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 from dataset_utils import (
     UADFVDataset, 
     CustomGenAIDataset, 
-    NewGenAIDataset,  # <--- اضافه شد برای دیتاست جدید
+    NewGenAIDataset,
     create_dataloaders, 
     get_sample_info, 
     worker_init_fn
@@ -461,9 +461,11 @@ def main():
     parser.add_argument('--num_memberships', type=int, default=3)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
-    # <--- اضافه شدن custom_genai_v2 به لیست انتخاب‌ها --->
+    
+    # <--- تغییر اعمال شده: اضافه شدن 'real_fake_dataset' به انتخاب‌ها --->
     parser.add_argument('--dataset', type=str, required=True,
-                       choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai', 'custom_genai_v2'])
+                       choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai', 'custom_genai_v2', 'real_fake_dataset'])
+    
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
     parser.add_argument('--data_dir', type=str, required=True)
@@ -495,13 +497,10 @@ def main():
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
-    # اگر تعداد مدل‌ها بیشتر از لیست پیش‌فرض بود، از آخرین مقدار تکرار می‌کنیم (یا می‌توانید لیست را در اینجا کامل کنید)
-    # در اینجا فرض می‌کنیم شما لیست کامل را دارید یا از همان 3 تا استفاده می‌کنید.
-    # برای اطمینان، لیست را به تعداد مدل‌ها برش می‌دهیم (اگر کمتر آوردید خطا می‌دهد، پس باید مطمئن باشید لیست کافی است)
+    # اگر تعداد مدل‌ها بیشتر از لیست پیش‌فرض بود، از آخرین مقدار تکرار می‌کنیم
     num_models_to_load = len(args.model_paths)
     if num_models_to_load > len(DEFAULT_MEANS):
-        # هشدار و تکرار آخرین مقدار در صورت لزوم (با فرض استاندارد بودن تصاویر)
-        # در حالت ایده آل شما باید MEANS و STDS دقیق هر مدل را اینجا وارد کنید
+        # تکرار آخرین مقدار برای تعداد مدل‌های اضافی
         last_mean = DEFAULT_MEANS[-1]
         last_std = DEFAULT_STDS[-1]
         MEANS = DEFAULT_MEANS + [last_mean] * (num_models_to_load - len(DEFAULT_MEANS))
