@@ -12,7 +12,7 @@ from PIL import Image
 # ================== DATASET CLASSES ==================
 
 class CustomGenAIDataset(Dataset):
-    """دیتاست قبلی برای ساختار قدیمی (DALL-E, StyleGAN, Real در کنار هم)"""
+    
     def __init__(self, root_dir, fake_classes, real_class, transform=None):
         self.root_dir = root_dir
         self.transform = transform
@@ -55,14 +55,7 @@ class CustomGenAIDataset(Dataset):
 
 
 class NewGenAIDataset(Dataset):
-    """
-    دیتاست جدید برای ساختار:
-    root/
-      train/ (fake, real)
-      test/
-      insightface/
-      ...
-    """
+   
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
@@ -159,7 +152,18 @@ class TransformSubset(Subset):
         self.transform = transform
 
     def __getitem__(self, idx):
-        img_path, label = self.dataset.samples[self.indices[idx]]
+        # Access the underlying dataset's samples directly using indices
+        # Assuming the underlying dataset has a 'samples' attribute (like ImageFolder or CustomDatasets above)
+        if hasattr(self.dataset, 'samples'):
+            img_path, label = self.dataset.samples[self.indices[idx]]
+        else:
+            # Fallback if it's a generic dataset without samples, though unlikely here
+            img, label = self.dataset[self.indices[idx]]
+            # Apply transform immediately if we grabbed the image already
+            if self.transform:
+                img = self.transform(img)
+            return img, label
+            
         img = Image.open(img_path).convert('RGB')
         if self.transform:
             img = self.transform(img)
@@ -267,6 +271,8 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
         'deepflux': ['Fake', 'Real'],
+        # اضافه شده: دیتاست جدید با فولدرهای face_fake و face_real
+        'real_fake_dataset': ['face_fake', 'face_real'], 
     }
 
     print(f"\n[Dataset Loading] Processing: {dataset_type}")
@@ -307,20 +313,31 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
+        
+        # چک کردن وجود فولدرها در base_dir
         if all(os.path.exists(os.path.join(base_dir, f)) for f in folders):
             dataset_dir = base_dir
         else:
+            # اگر مستقیم پیدا نشد، شاید داخل یک ساب‌دایرکتوری باشد (اختیاری برای سازگاری)
+            print(f"[Warning] Could not find folders directly in {base_dir}, checking subfolders...")
             alt_names = {
                 'real_fake': 'real_and_fake_face',
                 'hard_fake_real': 'hardfakevsrealfaces',
                 'deepflux': 'DeepFLUX'
             }
-            dataset_dir = os.path.join(base_dir, alt_names[dataset_type])
-            if not os.path.exists(dataset_dir):
-                raise FileNotFoundError(f"Could not find dataset folders in {base_dir}")
+            # اگر برای این دیتاست خاص نام جایگزینی نیست، از همان base_dir استفاده میکنیم که خطا دهد
+            if dataset_type in alt_names:
+                dataset_dir = os.path.join(base_dir, alt_names[dataset_type])
+            else:
+                dataset_dir = base_dir
+                
+            if not all(os.path.exists(os.path.join(dataset_dir, f)) for f in folders):
+                 raise FileNotFoundError(f"Could not find dataset folders {folders} in {base_dir} or {dataset_dir}")
         
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
+        
+        # نسبت تقسیم 70-15-15 در تابع زیر پیاده‌سازی شده است
         train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
@@ -392,6 +409,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
     else:
+        # این بخش برای تمام دیتاست‌های دیگر شامل real_fake_dataset اجرا می‌شود
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
             
@@ -403,7 +421,9 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
             print(f" Total: {len(full_dataset):,} images")
             print(f" Train: {len(train_indices):,} ({len(train_indices)/len(full_dataset)*100:.1f}%)")
             print(f" Valid: {len(val_indices):,} ({len(val_indices)/len(full_dataset)*100:.1f}%)")
-            print(f" Test: {len(test_indices):,} ({len(test_indices)/len(full_dataset)*100:.1f}%)\n")
+            print(f" Test: {len(test_indices):,} ({len(test_indices)/len(full_dataset)*100:.1f}%)")
+            if hasattr(full_dataset, 'class_to_idx'):
+                print(f" Class → Index: {full_dataset.class_to_idx}\n")
 
         train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
@@ -428,21 +448,29 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
 
     if is_main:
         print(f"DataLoaders ready! Batch size: {batch_size}")
-        print(f" Batches → Train: {len(train_loader)}, Val: {len(test_loader)}, Test: {len(test_loader)}")
+        print(f" Batches → Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
         print("="*70 + "\n")
     return train_loader, val_loader, test_loader
                            
 if __name__ == '__main__':
-    # مسیر دیتاست جدید را اینجا وارد کنید
-    # این مسیر باید شامل پوشه‌های train, test, insightface و ... باشد
-    path_to_new_dataset = '/path/to/your/new/dataset' 
+   
+    path_to_dataset = '/path/to/your/real_fake_dataset'
     
-    # برای استفاده از دیتاست جدید، از dataset_type='custom_genai_v2' استفاده کنید
-    train_loader, val_loader, test_loader = create_dataloaders(
-        base_dir=path_to_new_dataset,
-        batch_size=32,
-        num_workers=4,
-        dataset_type='custom_genai_v2',  
-        is_distributed=False,
-        seed=42
-    )
+    try:
+        train_loader, val_loader, test_loader = create_dataloaders(
+            base_dir=path_to_dataset,
+            batch_size=32,
+            num_workers=4,
+            dataset_type='real_fake_dataset',  # <--- این مقدار را تغییر دادیم
+            is_distributed=False,
+            seed=42
+        )
+        
+        # تست لود کردن یک بچ
+        print("Testing batch retrieval...")
+        images, labels = next(iter(train_loader))
+        print(f"Batch shape: {images.shape}, Labels shape: {labels.shape}")
+        
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        print("Please ensure the path exists and contains 'face_fake' and 'face_real' folders.")
