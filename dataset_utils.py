@@ -400,16 +400,19 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                  shuffle=(train_sampler is None), sampler=train_sampler,
                                  num_workers=num_workers, pin_memory=True, drop_last=True,
                                  worker_init_fn=worker_init_fn)
+        
+        # برای wild هم val و test را بهتر است با worker کمتر یا صفر اجرا کرد در حالت DDP
+        # اما اگر خطا داد، اینجا را هم 0 کنید.
         val_loader = DataLoader(datasets_dict['valid'], batch_size=batch_size,
                                shuffle=False, sampler=val_sampler,
-                               num_workers=num_workers, pin_memory=True, drop_last=False,
+                               num_workers=0 if is_distributed else num_workers, pin_memory=True, drop_last=False,
                                worker_init_fn=worker_init_fn)
         test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size,
                                 shuffle=False, sampler=test_sampler,
-                                num_workers=num_workers, pin_memory=True, drop_last=False,
+                                num_workers=0 if is_distributed else num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
     else:
-        # این بخش برای تمام دیتاست‌های دیگر شامل real_fake_dataset اجرا می‌شود
+        # این بخش برای دیتاست real_fake_dataset و سایر دیتاست‌های سفارشی اجرا می‌شود
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
             
@@ -437,18 +440,23 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                  shuffle=(train_sampler is None), sampler=train_sampler,
                                  num_workers=num_workers, pin_memory=True, drop_last=True,
                                  worker_init_fn=worker_init_fn)
+        
+        # *** تغییر اصلی: اینجا num_workers را برای Val و Test صفر کردیم ***
         val_loader = DataLoader(val_dataset, batch_size=batch_size,
                                shuffle=False, sampler=val_sampler,
-                               num_workers=num_workers, pin_memory=True, drop_last=False,
+                               num_workers=0,  # <--- حتما 0 باشد
+                               pin_memory=True, drop_last=False,
                                worker_init_fn=worker_init_fn)
+                               
         test_loader = DataLoader(test_dataset, batch_size=batch_size,
                                 shuffle=False, sampler=test_sampler,
-                                num_workers=num_workers, pin_memory=True, drop_last=False,
+                                num_workers=0,  # <--- حتما 0 باشد
+                                pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
 
     if is_main:
         print(f"DataLoaders ready! Batch size: {batch_size}")
-        print(f" Batches → Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
+        print(f" Batches → Train: {len(train_loader)}, Val: {len(test_loader)}, Test: {len(test_loader)}")
         print("="*70 + "\n")
     return train_loader, val_loader, test_loader
                            
