@@ -146,28 +146,47 @@ class UADFVDataset(Dataset):
 
 
 class TransformSubset(Subset):
-    """Subset with custom transform"""
+    """
+    Subset with custom transform.
+    نسخه اصلاح شده: تضمین می‌کند که ترنسفرم (شامل Resize و Crop) مستقیماً روی تصویر اعمال شود
+    تا از بروز خطای ابعاد متفاوت در Batch جلوگیری شود.
+    """
     def __init__(self, dataset, indices, transform):
         super().__init__(dataset, indices)
         self.transform = transform
 
     def __getitem__(self, idx):
-        # Access the underlying dataset's samples directly using indices
-        # Assuming the underlying dataset has a 'samples' attribute (like ImageFolder or CustomDatasets above)
+        # 1. دریافت ایندکس واقعی از دیتاست اصلی
+        real_idx = self.indices[idx]
+        
+        # 2. تلاش برای دسترسی به مسیر تصویر برای بارگذاری دستی (پیشنهادی)
         if hasattr(self.dataset, 'samples'):
-            img_path, label = self.dataset.samples[self.indices[idx]]
+            img_path, label = self.dataset.samples[real_idx]
+            try:
+                # بارگذاری تصویر و تبدیل به RGB
+                image = Image.open(img_path).convert('RGB')
+            except Exception as e:
+                print(f"Error loading image {img_path}: {e}")
+                # در صورت خطا، یک تصویر سیاه برمی‌گردانیم تا برنامه متوقف نشود
+                image = Image.new('RGB', (256, 256))
+                label = 0
         else:
-            # Fallback if it's a generic dataset without samples, though unlikely here
-            img, label = self.dataset[self.indices[idx]]
-            # Apply transform immediately if we grabbed the image already
-            if self.transform:
-                img = self.transform(img)
-            return img, label
+            # 3. Fallback: اگر دیتاست ساختار samples نداشت، از متد __getitem__ خودش استفاده می‌کنیم
+            # اما اگر دیتاست اصلی خودش ترنسفرم داشته باشد، ما آن را نادیده می‌گیریم
+            # و فقط ترنسفرم جدید (اینجا) را اعمال می‌کنیم.
+            image, label = self.dataset[real_idx]
             
-        img = Image.open(img_path).convert('RGB')
+            # اگر خروجی تنسور بود، تبدیل به PIL Image برای اعمال ترنسفرم‌های جدید
+            if isinstance(image, torch.Tensor):
+                # اگر قبلاً تنسور شده است، به PIL برمی‌گردیم (البته در حالت عادی samples مسیر می‌دهد)
+                to_pil = transforms.ToPILImage()
+                image = to_pil(image)
+
+        # 4. اعمال ترنسفرم (Resize, Crop, etc)
         if self.transform:
-            img = self.transform(img)
-        return img, label
+            image = self.transform(image)
+            
+        return image, label
 
 # ================== UTILITY FUNCTIONS ==================
 
@@ -462,7 +481,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                            
 if __name__ == '__main__':
    
-    path_to_dataset = '/path/to/your/real_fake_dataset'
+    path_to_dataset = '/kaggle/input/realfake-cropped-faces/real_fake_dataset'
     
     try:
         train_loader, val_loader, test_loader = create_dataloaders(
