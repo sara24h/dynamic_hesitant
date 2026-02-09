@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -45,7 +44,7 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
-# ================== BMA MODEL CLASS (FIXED) ==================
+# ================== BMA MODEL CLASS (ROBUST VERSION) ==================
 class BayesianModelAveraging(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]], stds: List[Tuple[float]]):
         super().__init__()
@@ -56,11 +55,25 @@ class BayesianModelAveraging(nn.Module):
         # ثبت وزن‌ها به صورت Buffer
         self.register_buffer('bma_weights', torch.ones(self.num_models) / self.num_models)
 
-        # اطمینان از فریز بودن مدل‌ها
+        # فریز کردن مدل‌ها
         for model in self.models:
             model.eval()
             for p in model.parameters():
                 p.requires_grad = False
+
+    def _get_safe_logits(self, output: torch.Tensor) -> torch.Tensor:
+        """
+        اطمینان از اینکه ورودی Logits است نه Sigmoided.
+        اگر مقادیر بین 0 و 1 باشند، آن‌ها را به Logits تبدیل می‌کند.
+        """
+        # اگر خروجی قبلاً Sigmoid شده باشد (بین 0 و 1)، آن را با Log به Logits تبدیل می‌کنیم
+        # اگر خروجی Logits باشد، مقادیر می‌توانند خارج بازه 0-1 باشند
+        if (output >= 0).all() and (output <= 1).all():
+            # فرض بر این است که Prob است -> تبدیل به Logit
+            return torch.log(output / (1 - output + 1e-8) + 1e-8)
+        else:
+            # فرض بر این است که Logits است
+            return output
 
     def compute_posterior_weights(self, val_loader: DataLoader, device: torch.device, is_main: bool):
         criterion = nn.BCEWithLogitsLoss(reduction='sum')
@@ -68,8 +81,8 @@ class BayesianModelAveraging(nn.Module):
 
         if is_main:
             print("="*70)
-            print("BMA: Computing Posterior Weights (Validation NLL)")
-            print("Using Clamping to prevent numerical instability...")
+            print("BMA: Computing Robust Posterior Weights")
+            print("Detecting input type (Logits vs Prob) and applying Clamping...")
             print("="*70)
 
         for i, model in enumerate(self.models):
@@ -87,45 +100,55 @@ class BayesianModelAveraging(nn.Module):
                     if isinstance(outputs, (tuple, list)):
                         outputs = outputs[0]
                     
-                    # --- FIX: Clamp Logits to prevent Log(0) -> Inf Loss -> NaN Weights ---
-                    # محدود کردن مقادیر Logit به بازه [-10, 10] برای پایداری عددی
-                    outputs = torch.clamp(outputs, min=-10, max=10)
-                    # -------------------------------------------------------------------------
+                    # 1. استخراج یا تبدیل به Logits
+                    logits = self._get_safe_logits(outputs)
+                    
+                    # 2. Clamping شدید برای جلوگیری از Infinity در Logarithm
+                    # محدود کردن به [-10, 10] باعث می‌شود Sigmoid در [0.000045, 0.999955] باشد
+                    # و Loss هیچوقت منفجر نشود.
+                    logits = torch.clamp(logits, min=-10, max=10)
                         
-                    loss = criterion(outputs.squeeze(1), labels)
+                    loss = criterion(logits.squeeze(1), labels)
                     running_loss += loss.item()
 
             total_nll[i] = running_loss
 
-        # همگام‌سازی دستی Lossها
+        # همگام‌سازی
         if dist.is_initialized():
             dist.all_reduce(total_nll, op=dist.ReduceOp.SUM)
         
-        # بررسی و تمیز کردن مقادیر نامعتبر (NaN/Inf)
+        # تمیز کردن مقادیر نامعتبر
         if torch.isnan(total_nll).any() or torch.isinf(total_nll).any():
             if is_main:
-                print("[WARNING] Detected NaN/Inf in NLL. Replacing with large value.")
+                print("[CRITICAL WARNING] NaN/Inf detected in NLL. Replacing with max value.")
+                print("This usually means one model is predicting exactly opposite to labels with high confidence.")
+            # جایگزینی با مقدار بزرگ به جای NaN برای اینکه وزن آن مدل صفر شود
             total_nll[torch.isnan(total_nll)] = 1e9
             total_nll[torch.isinf(total_nll)] = 1e9
 
         if is_main:
             # محاسبه Likelihood و Weights
-            # استفاده از max_nll برای جلوگیری از overflow در exp
+            # تکنیک Max-Subtraction برای پایداری Exp
             max_nll = total_nll.max()
-            likelihoods = torch.exp(-(total_nll - max_nll))
             
-            # اضافه کردن یک مقدار بسیار کوچک (eps) برای اطمینان از تقسیم بر صفر نشدن
-            sum_likelihoods = likelihoods.sum() + 1e-8
-            posterior_weights = likelihoods / sum_likelihoods
+            # اگر همه مقادیر 1e9 باشند (همه بد)، وزن‌ها مساوی می‌شوند
+            if max_nll > 1e8:
+                posterior_weights = torch.ones_like(total_nll) / self.num_models
+                print("All models show extreme errors (NaN/Inf). Falling back to uniform weights.")
+            else:
+                likelihoods = torch.exp(-(total_nll - max_nll))
+                # اضافه کردن epsilon برای جلوگیری از تقسیم بر صفر
+                sum_likelihoods = likelihoods.sum() + 1e-8
+                posterior_weights = likelihoods / sum_likelihoods
             
-            print(f"\nCalculated BMA Weights (Posterior Probabilities):")
+            print(f"\nFinal BMA Weights (Posterior):")
             for i, w in enumerate(posterior_weights):
-                print(f"  Model {i+1}: {w.item():.4f} ({w.item()*100:.2f}%)")
+                print(f"  Model {i+1}: {w.item():.6f} ({w.item()*100:.4f}%)")
             print("="*70 + "\n")
             
             self.bma_weights = posterior_weights.to(device)
         
-        # پخش کردن وزن‌ها به سایر GPUها
+        # پخش کردن وزن‌ها
         if dist.is_initialized():
             dist.broadcast(self.bma_weights, src=0)
 
@@ -139,10 +162,15 @@ class BayesianModelAveraging(nn.Module):
                 out = model(x_norm)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-                # در زمان Inference (test) نیازی به Clamping نیست مگر اینکه مدل خراب باشد
-                # اما برای امنیت می‌توانیم کلمپ کنیم، اگرچه روی دقت تاثیر کمی دارد
-                # out = torch.clamp(out, min=-10, max=10) 
-                all_outputs[:, i, 0] = out.squeeze(1)
+                
+                # استفاده از تابع کمکی برای اطمینان از نوع داده
+                logits = self._get_safe_logits(out)
+                
+                # در زمان Inference معمولا نیازی به Clamp شدید نیست مگر مدل خراب باشد
+                # اما اگر با NaN مواجه شدید، خط زیر را فعال کنید:
+                # logits = torch.clamp(logits, min=-10, max=10)
+                
+                all_outputs[:, i, 0] = logits.squeeze(1)
         
         w_expanded = self.bma_weights.view(1, -1, 1)
         final_output = (all_outputs * w_expanded).sum(dim=1)
@@ -295,7 +323,6 @@ def main():
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--seed', type=int, default=42)
     
-    # آرگومان‌های غیرفعال
     parser.add_argument('--epochs', type=int, default=30, help='Ignored for BMA')
     parser.add_argument('--lr', type=float, default=0.0001, help='Ignored for BMA')
     
@@ -310,7 +337,7 @@ def main():
 
     if is_main:
         print("="*70)
-        print(f"BAYESIAN MODEL AVERAGING (BMA) - STABLE VERSION")
+        print(f"BAYESIAN MODEL AVERAGING (BMA) - ROBUST VERSION")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
         print(f"Dataset: {args.dataset}")
@@ -318,7 +345,6 @@ def main():
         print(f"Models: {len(args.model_paths)}")
         print("="*70 + "\n")
 
-    # مدیریت MEANS و STDS
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
@@ -334,11 +360,9 @@ def main():
         MEANS = DEFAULT_MEANS[:num_models_to_load]
         STDS = DEFAULT_STDS[:num_models_to_load]
 
-    # لود کردن مدل‌ها
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    # لود کردن دیتاست‌ها
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, num_workers=args.num_workers, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
@@ -348,7 +372,6 @@ def main():
         print("INDIVIDUAL MODEL PERFORMANCE (Before BMA)")
         print("="*70)
 
-    # ارزیابی تک‌تک مدل‌ها
     individual_accs = []
     for i, model in enumerate(base_models):
         acc = evaluate_single_model_ddp(
@@ -375,11 +398,9 @@ def main():
         trainable_params = sum(p.numel() for p in bma_ensemble.parameters() if p.requires_grad)
         print(f"Total params: {total_params:,} | Trainable: {trainable_params:,}\n")
 
-    # محاسبه وزن‌ها
     bma_module = bma_ensemble 
     bma_module.compute_posterior_weights(val_loader, device, is_main)
 
-    # ارزیابی نهایی
     if is_main:
         print("\n" + "="*70)
         print("FINAL BMA EVALUATION")
@@ -397,7 +418,6 @@ def main():
         print(f"Improvement:       {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
 
-        # ذخیره نتایج
         final_results = {
             'method': 'Bayesian Model Averaging (BMA)',
             'best_single_model': {
@@ -428,7 +448,6 @@ def main():
         }, final_model_path)
         print(f"Model saved: {final_model_path}")
 
-        # ویژوالایز کردن
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         try:
             generate_visualizations(
