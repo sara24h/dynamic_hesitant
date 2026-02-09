@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,7 +12,6 @@ import argparse
 import json
 import random
 import torch.distributed as dist
-# دیگر نیازی به DDP نیست چون مدل آموزش نمی‌بینیم
 
 warnings.filterwarnings("ignore")
 
@@ -45,7 +45,7 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
-# ================== BMA MODEL CLASS ==================
+# ================== BMA MODEL CLASS (FIXED) ==================
 class BayesianModelAveraging(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]], stds: List[Tuple[float]]):
         super().__init__()
@@ -53,7 +53,7 @@ class BayesianModelAveraging(nn.Module):
         self.normalization = MultiModelNormalization(means, stds)
         self.num_models = len(models)
         
-        # ثبت وزن‌ها به صورت Buffer (نه پارامتر trainable)
+        # ثبت وزن‌ها به صورت Buffer
         self.register_buffer('bma_weights', torch.ones(self.num_models) / self.num_models)
 
         # اطمینان از فریز بودن مدل‌ها
@@ -69,6 +69,7 @@ class BayesianModelAveraging(nn.Module):
         if is_main:
             print("="*70)
             print("BMA: Computing Posterior Weights (Validation NLL)")
+            print("Using Clamping to prevent numerical instability...")
             print("="*70)
 
         for i, model in enumerate(self.models):
@@ -85,6 +86,11 @@ class BayesianModelAveraging(nn.Module):
                     outputs = model(norm_images)
                     if isinstance(outputs, (tuple, list)):
                         outputs = outputs[0]
+                    
+                    # --- FIX: Clamp Logits to prevent Log(0) -> Inf Loss -> NaN Weights ---
+                    # محدود کردن مقادیر Logit به بازه [-10, 10] برای پایداری عددی
+                    outputs = torch.clamp(outputs, min=-10, max=10)
+                    # -------------------------------------------------------------------------
                         
                     loss = criterion(outputs.squeeze(1), labels)
                     running_loss += loss.item()
@@ -95,11 +101,22 @@ class BayesianModelAveraging(nn.Module):
         if dist.is_initialized():
             dist.all_reduce(total_nll, op=dist.ReduceOp.SUM)
         
+        # بررسی و تمیز کردن مقادیر نامعتبر (NaN/Inf)
+        if torch.isnan(total_nll).any() or torch.isinf(total_nll).any():
+            if is_main:
+                print("[WARNING] Detected NaN/Inf in NLL. Replacing with large value.")
+            total_nll[torch.isnan(total_nll)] = 1e9
+            total_nll[torch.isinf(total_nll)] = 1e9
+
         if is_main:
             # محاسبه Likelihood و Weights
+            # استفاده از max_nll برای جلوگیری از overflow در exp
             max_nll = total_nll.max()
             likelihoods = torch.exp(-(total_nll - max_nll))
-            posterior_weights = likelihoods / likelihoods.sum()
+            
+            # اضافه کردن یک مقدار بسیار کوچک (eps) برای اطمینان از تقسیم بر صفر نشدن
+            sum_likelihoods = likelihoods.sum() + 1e-8
+            posterior_weights = likelihoods / sum_likelihoods
             
             print(f"\nCalculated BMA Weights (Posterior Probabilities):")
             for i, w in enumerate(posterior_weights):
@@ -122,6 +139,9 @@ class BayesianModelAveraging(nn.Module):
                 out = model(x_norm)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
+                # در زمان Inference (test) نیازی به Clamping نیست مگر اینکه مدل خراب باشد
+                # اما برای امنیت می‌توانیم کلمپ کنیم، اگرچه روی دقت تاثیر کمی دارد
+                # out = torch.clamp(out, min=-10, max=10) 
                 all_outputs[:, i, 0] = out.squeeze(1)
         
         w_expanded = self.bma_weights.view(1, -1, 1)
@@ -275,7 +295,7 @@ def main():
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--seed', type=int, default=42)
     
-    # آرگومان‌های غیرفعال برای سازگاری
+    # آرگومان‌های غیرفعال
     parser.add_argument('--epochs', type=int, default=30, help='Ignored for BMA')
     parser.add_argument('--lr', type=float, default=0.0001, help='Ignored for BMA')
     
@@ -290,7 +310,7 @@ def main():
 
     if is_main:
         print("="*70)
-        print(f"BAYESIAN MODEL AVERAGING (BMA)")
+        print(f"BAYESIAN MODEL AVERAGING (BMA) - STABLE VERSION")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
         print(f"Dataset: {args.dataset}")
@@ -346,8 +366,6 @@ def main():
 
     # ================== BMA LOGIC ==================
     
-    # 1. ایجاد مدل BMA
-    # مهم: ما مدل را مستقیم به device منتقل می‌کنیم. از DDP استفاده نمی‌کنیم.
     bma_ensemble = BayesianModelAveraging(
         base_models, MEANS, STDS
     ).to(device)
@@ -357,11 +375,11 @@ def main():
         trainable_params = sum(p.numel() for p in bma_ensemble.parameters() if p.requires_grad)
         print(f"Total params: {total_params:,} | Trainable: {trainable_params:,}\n")
 
-    # 2. محاسبه وزن‌ها
-    bma_module = bma_ensemble # چون DDP نداریم، ماژول اصلی همان bma_ensemble است
+    # محاسبه وزن‌ها
+    bma_module = bma_ensemble 
     bma_module.compute_posterior_weights(val_loader, device, is_main)
 
-    # 3. ارزیابی نهایی
+    # ارزیابی نهایی
     if is_main:
         print("\n" + "="*70)
         print("FINAL BMA EVALUATION")
