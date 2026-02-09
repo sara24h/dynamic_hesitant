@@ -11,18 +11,15 @@ import argparse
 import json
 import random
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+# دیگر نیازی به DDP نیست چون مدل آموزش نمی‌بینیم
 
-# هشدارها را غیرفعال می‌کنیم
 warnings.filterwarnings("ignore")
 
-# ایمپورت کردن توابع کمکی از فایل‌های موجود
 from dataset_utils import (
     create_dataloaders, 
     get_sample_info, 
     worker_init_fn
 )
-# فرض بر این است که این ماژول‌ها در مسیر پروژه شما موجود هستند
 from metrics_utils import plot_roc_and_f1
 from visualization_utils import generate_visualizations
 
@@ -38,7 +35,6 @@ def set_seed(seed: int = 42):
 
 
 class MultiModelNormalization(nn.Module):
-    """کلاس نرمال‌سازی برای هر مدل با میانگین و انحراف معیار مخصوص به خود"""
     def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
         super().__init__()
         for i, (m, s) in enumerate(zip(means, stds)):
@@ -51,32 +47,22 @@ class MultiModelNormalization(nn.Module):
 
 # ================== BMA MODEL CLASS ==================
 class BayesianModelAveraging(nn.Module):
-    """
-    پیاده‌سازی Bayesian Model Averaging.
-    وزن‌ها بر اساس Negative Log-Likelihood روی دیتای Validation محاسبه می‌شوند.
-    """
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]], stds: List[Tuple[float]]):
         super().__init__()
         self.models = nn.ModuleList(models)
         self.normalization = MultiModelNormalization(means, stds)
         self.num_models = len(models)
         
-        # ثبت وزن‌ها با مقدار اولیه یکنواخت
+        # ثبت وزن‌ها به صورت Buffer (نه پارامتر trainable)
         self.register_buffer('bma_weights', torch.ones(self.num_models) / self.num_models)
 
-        # فریز کردن پارامترهای مدل‌ها (اگر قبلاً نشده باشد)
+        # اطمینان از فریز بودن مدل‌ها
         for model in self.models:
             model.eval()
             for p in model.parameters():
                 p.requires_grad = False
 
     def compute_posterior_weights(self, val_loader: DataLoader, device: torch.device, is_main: bool):
-        """
-        محاسبه وزن‌های BMA:
-        1. محاسبه مجموع Negative Log-Likelihood (NLL) برای هر مدل روی Validation Set.
-        2. تبدیل NLL به Likelihood: L = exp(-NLL).
-        3. نرمال‌سازی Likelihood‌ها برای به دست آوردن احتمال پسین (Posterior).
-        """
         criterion = nn.BCEWithLogitsLoss(reduction='sum')
         total_nll = torch.zeros(self.num_models, device=device)
 
@@ -85,18 +71,15 @@ class BayesianModelAveraging(nn.Module):
             print("BMA: Computing Posterior Weights (Validation NLL)")
             print("="*70)
 
-        # محاسبه Loss برای هر مدل به صورت جداگانه
         for i, model in enumerate(self.models):
             model.eval()
             running_loss = 0.0
             
-            # استفاده از no_grad چون مدل‌ها فریز هستند
             with torch.no_grad():
                 for images, labels in val_loader:
                     images = images.to(device)
                     labels = labels.to(device).float()
                     
-                    # نرمال‌سازی مخصوص مدل i
                     norm_images = self.normalization(images, i)
                     
                     outputs = model(norm_images)
@@ -108,18 +91,14 @@ class BayesianModelAveraging(nn.Module):
 
             total_nll[i] = running_loss
 
-        # همگام‌سازی Lossها در محیط Distributed (چون هر GPU ممکن است بخشی از دیتا را دیده باشد)
+        # همگام‌سازی دستی Lossها
         if dist.is_initialized():
             dist.all_reduce(total_nll, op=dist.ReduceOp.SUM)
         
-        # محاسبه وزن‌ها (فقط در Main Process برای جلوگیری از تکرار محاسبات عددی، سپس Broadcast)
         if is_main:
-            # تبدیل NLL به Likelihood
-            # برای پایداری عددی (Numerical Stability)، ماکسیمم را تفریق می‌کنیم
+            # محاسبه Likelihood و Weights
             max_nll = total_nll.max()
             likelihoods = torch.exp(-(total_nll - max_nll))
-            
-            # احتمال پسین (Posterior Weights)
             posterior_weights = likelihoods / likelihoods.sum()
             
             print(f"\nCalculated BMA Weights (Posterior Probabilities):")
@@ -127,16 +106,14 @@ class BayesianModelAveraging(nn.Module):
                 print(f"  Model {i+1}: {w.item():.4f} ({w.item()*100:.2f}%)")
             print("="*70 + "\n")
             
-            # ذخیره وزن‌ها
             self.bma_weights = posterior_weights.to(device)
         
-        # پخش کردن وزن‌های محاسبه شده به سایر GPUها
+        # پخش کردن وزن‌ها به سایر GPUها
         if dist.is_initialized():
             dist.broadcast(self.bma_weights, src=0)
 
     def forward(self, x: torch.Tensor):
         batch_size = x.size(0)
-        # ماتریس خروجی‌ها: (Batch, Num_Models, 1)
         all_outputs = torch.zeros(batch_size, self.num_models, 1, device=x.device)
         
         for i, model in enumerate(self.models):
@@ -147,11 +124,7 @@ class BayesianModelAveraging(nn.Module):
                     out = out[0]
                 all_outputs[:, i, 0] = out.squeeze(1)
         
-        # میانگین‌گیری وزندار
-        # w_expanded: (1, Num_Models, 1)
         w_expanded = self.bma_weights.view(1, -1, 1)
-        
-        # خروجی نهایی: (Batch, 1)
         final_output = (all_outputs * w_expanded).sum(dim=1)
         return final_output
 
@@ -200,7 +173,6 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
 def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device,
                               name: str, mean: Tuple[float, float, float],
                               std: Tuple[float, float, float], is_main: bool) -> float:
-    """ارزیابی تکی مدل‌ها برای مقایسه اولیه"""
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
@@ -229,7 +201,6 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
 @torch.no_grad()
 def evaluate_bma_final(model, loader, device, name, model_names, is_main=True):
-    """ارزیابی نهایی مدل BMA"""
     model.eval()
     total_correct = 0
     total_samples = 0
@@ -246,7 +217,6 @@ def evaluate_bma_final(model, loader, device, name, model_names, is_main=True):
         total_correct += pred.eq(labels.long()).sum().item()
         total_samples += labels.size(0)
         
-    # همگام‌سازی آمار در DDP
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
     if dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
@@ -255,8 +225,6 @@ def evaluate_bma_final(model, loader, device, name, model_names, is_main=True):
         total_correct = stats[0].item()
         total_samples = stats[1].item()
         acc = 100. * total_correct / total_samples
-        
-        # دریافت وزن‌های نهایی
         final_weights = model.bma_weights.cpu().numpy()
 
         print(f"\n{'='*70}")
@@ -307,7 +275,7 @@ def main():
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--seed', type=int, default=42)
     
-    # آرگومان‌های غیر فعال برای سازگاری (BMA نیاز به آموزش ندارد)
+    # آرگومان‌های غیرفعال برای سازگاری
     parser.add_argument('--epochs', type=int, default=30, help='Ignored for BMA')
     parser.add_argument('--lr', type=float, default=0.0001, help='Ignored for BMA')
     
@@ -360,7 +328,7 @@ def main():
         print("INDIVIDUAL MODEL PERFORMANCE (Before BMA)")
         print("="*70)
 
-    # ارزیابی تک‌تک مدل‌ها روی تست
+    # ارزیابی تک‌تک مدل‌ها
     individual_accs = []
     for i, model in enumerate(base_models):
         acc = evaluate_single_model_ddp(
@@ -379,24 +347,21 @@ def main():
     # ================== BMA LOGIC ==================
     
     # 1. ایجاد مدل BMA
+    # مهم: ما مدل را مستقیم به device منتقل می‌کنیم. از DDP استفاده نمی‌کنیم.
     bma_ensemble = BayesianModelAveraging(
         base_models, MEANS, STDS
     ).to(device)
-
-    if world_size > 1:
-        bma_ensemble = DDP(bma_ensemble, device_ids=[local_rank], output_device=local_rank)
 
     if is_main:
         total_params = sum(p.numel() for p in bma_ensemble.parameters())
         trainable_params = sum(p.numel() for p in bma_ensemble.parameters() if p.requires_grad)
         print(f"Total params: {total_params:,} | Trainable: {trainable_params:,}\n")
 
-    # 2. محاسبه وزن‌ها (جایگزین Training)
-    # در این مرحله وزن‌ها بر اساس Validation Set محاسبه می‌شوند
-    bma_module = bma_ensemble.module if hasattr(bma_ensemble, 'module') else bma_ensemble
+    # 2. محاسبه وزن‌ها
+    bma_module = bma_ensemble # چون DDP نداریم، ماژول اصلی همان bma_ensemble است
     bma_module.compute_posterior_weights(val_loader, device, is_main)
 
-    # 3. ارزیابی نهایی BMA روی Test Set
+    # 3. ارزیابی نهایی
     if is_main:
         print("\n" + "="*70)
         print("FINAL BMA EVALUATION")
@@ -445,7 +410,7 @@ def main():
         }, final_model_path)
         print(f"Model saved: {final_model_path}")
 
-        # ویژوالایز کردن (اختیاری)
+        # ویژوالایز کردن
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         try:
             generate_visualizations(
