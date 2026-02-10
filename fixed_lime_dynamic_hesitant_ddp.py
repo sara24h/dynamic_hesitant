@@ -52,37 +52,60 @@ class MultiModelNormalization(nn.Module):
 
 
 class HesitantFuzzyMembership(nn.Module):
-    def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, dropout: float = 0.3):
+    def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, dropout: float = 0.4):
         super().__init__()
         self.num_models = num_models
         self.num_memberships = num_memberships
 
+        # --- تغییرات اعمال شده ---
+        # 1. تعداد کانال‌ها دو برابر شد (32->64, 64->128 و ...)
+        # 2. یک لایه کانولوشنی اضافه شد (تعداد لایه‌ها از 3 به 4 رسید)
+        # 3. Dropout کمی بالا رفت (از 0.3 به 0.4) برای جلوگیری از آفیتینگ روی داده کم
         self.feature_net = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
+            # Block 1
+            nn.Conv2d(3, 64, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            
+            # Block 2
             nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            
+            # Block 3
+            nn.Conv2d(128, 256, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            
+            # Block 4 (لایه جدید)
+            nn.Conv2d(256, 512, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(512), nn.ReLU(inplace=True),
+            
             nn.AdaptiveAvgPool2d(1)
         )
 
+        # --- تغییرات لایه‌های Fully Connected ---
+        # ورودی اولیه باید با خروجی CNN هماهنگ شود (اینجا 512 است)
+        # لایه مخفی بزرگتر شد تا بتواند وزن‌های فازی پیچیده‌تر را تولید کند
         self.membership_generator = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(512, 256), 
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(128, num_models * num_memberships)
+            nn.Dropout(dropout), 
+            nn.Linear(256, num_models * num_memberships)
         )
+        
         self.aggregation_weights = nn.Parameter(torch.ones(num_memberships) / num_memberships)
 
     def forward(self, x: torch.Tensor):
         features = self.feature_net(x).flatten(1)
         memberships = self.membership_generator(features)
         memberships = memberships.view(-1, self.num_models, self.num_memberships)
-        memberships = torch.sigmoid(memberships)
+        memberships = torch.sigmoid(memberships) # تابع عضویت سیگموید
+        
+        # نرمال‌سازی وزن‌های تجمیعی
         agg_weights = F.softmax(self.aggregation_weights, dim=0)
+        
+        # محاسبه وزن نهایی هر مدل
         final_weights = (memberships * agg_weights.view(1, 1, -1)).sum(dim=2)
         final_weights = F.softmax(final_weights, dim=1)
+        
         return final_weights, memberships
 
 
