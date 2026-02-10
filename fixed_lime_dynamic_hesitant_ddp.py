@@ -500,7 +500,7 @@ def main():
     parser.add_argument('--num_lime_samples', type=int, default=5)
     
     parser.add_argument('--dataset', type=str, required=True,
-                       choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai', 'custom_genai_v2', 'real_fake_dataset'])
+                       choices=['wild', 'real_fake', 'deepfake_lab', 'uadfV', 'custom_genai', 'custom_genai_v2', 'real_fake_dataset'])
     
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
