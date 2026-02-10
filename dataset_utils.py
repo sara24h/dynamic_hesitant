@@ -55,21 +55,24 @@ class CustomGenAIDataset(Dataset):
 
 
 class NewGenAIDataset(Dataset):
+    """
+    ساختار جدید دیتاست:
+    root/
+      ├── train/
+      │     ├── fake/
+      │     └── real/
+      └── test/
+            ├── insightface/      (همه این‌ها Fake هستند)
+            ├── photoshop/        (همه این‌ها Fake هستند)
+            ├── stablediffusion v1.5/ (همه این‌ها Fake هستند)
+            └── stylegan/         (همه این‌ها Fake هستند)
+    """
    
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
         self.label_map = {'fake': 0, 'real': 1}
-        
-        # لیست پوشه‌هایی که مشخصاً شامل تصاویر Fake هستند
-        single_class_fake_folders = [
-            'test', 
-            'insightface', 
-            'photoshop', 
-            'stablediffusion v1.5', 
-            'stylegan'
-        ]
         
         # 1. بارگذاری از پوشه train (شامل fake و real)
         train_dir = os.path.join(root_dir, 'train')
@@ -88,19 +91,32 @@ class NewGenAIDataset(Dataset):
         else:
             print(f"[Warning] TRAIN directory not found: {train_dir}")
 
-        # 2. بارگذاری از پوشه‌های مستقل Fake
-        print(f"[New Dataset] Scanning SINGLE-CLASS FAKE folders...")
-        for folder_name in single_class_fake_folders:
-            folder_path = os.path.join(root_dir, folder_name)
-            if os.path.exists(folder_path):
-                files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                for img_file in files:
-                    img_path = os.path.join(folder_path, img_file)
-                    # همه این پوشه‌ها Fake هستند
-                    self.samples.append((img_path, self.label_map['fake']))
-                print(f"  - Loaded {len(files)} images from {folder_name} (Fake)")
-            else:
-                print(f"[Warning] Path not found: {folder_path}")
+        # 2. بارگذاری از پوشه test (زیرپوشه‌های مشخص که همه Fake هستند)
+        test_dir = os.path.join(root_dir, 'test')
+        if os.path.exists(test_dir):
+            print(f"[New Dataset] Scanning TEST folder for specific Fake classes: {test_dir}")
+            
+            # لیست زیرپوشه‌هایی که در پوشه test قرار دارند و باید بارگذاری شوند
+            test_fake_subclasses = [
+                'insightface', 
+                'photoshop', 
+                'stablediffusion v1.5', 
+                'stylegan'
+            ]
+            
+            for folder_name in test_fake_subclasses:
+                folder_path = os.path.join(test_dir, folder_name)
+                if os.path.exists(folder_path):
+                    files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                    for img_file in files:
+                        img_path = os.path.join(folder_path, img_file)
+                        # همه تصاویر در این شاخه‌ها برچسب Fake (0) دارند
+                        self.samples.append((img_path, self.label_map['fake']))
+                    print(f"  - Loaded {len(files)} images from test/{folder_name} (Fake)")
+                else:
+                    print(f"[Warning] Path not found: {folder_path}")
+        else:
+            print(f"[Warning] TEST directory not found: {test_dir}")
 
         print(f"[New Dataset] Total loaded images: {len(self.samples)}")
 
@@ -295,7 +311,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         )
         
     elif dataset_type == 'custom_genai_v2':
-        # >>> دیتاست جدید (ساختار جدید با پوشه train و پوشه‌های تک‌کلاسه) <<<
+        # >>> دیتاست جدید (ساختار جدید با پوشه train و پوشه‌های تک‌کلاسه در test) <<<
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = NewGenAIDataset(base_dir, transform=temp_transform)
         
@@ -454,14 +470,17 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                            
 if __name__ == '__main__':
    
-    path_to_dataset = '/path/to/your/real_fake_dataset'
+    # مسیر دیتاست خود را اینجا وارد کنید
+    # این مسیر باید شامل پوشه های train و test باشد
+    path_to_dataset = '/path/to/your/dataset_root'
     
     try:
+        # برای استفاده از دیتاست جدید با ساختار درخواستی، از custom_genai_v2 استفاده کنید
         train_loader, val_loader, test_loader = create_dataloaders(
             base_dir=path_to_dataset,
             batch_size=32,
             num_workers=0,
-            dataset_type='real_fake_dataset',  # <--- این مقدار را تغییر دادیم
+            dataset_type='custom_genai_v2',  # <--- استفاده از حالت V2 برای ساختار جدید
             is_distributed=False,
             seed=42
         )
@@ -470,7 +489,7 @@ if __name__ == '__main__':
         print("Testing batch retrieval...")
         images, labels = next(iter(train_loader))
         print(f"Batch shape: {images.shape}, Labels shape: {labels.shape}")
+        print(f"Unique labels in batch: {torch.unique(labels)}")
         
     except FileNotFoundError as e:
         print(f"Error: {e}")
-        print("Please ensure the path exists and contains 'face_fake' and 'face_real' folders.")
