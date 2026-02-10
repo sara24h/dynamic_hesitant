@@ -514,9 +514,13 @@ def main():
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
+        # محاسبه پویای تعداد عضویت‌ها بر اساس تعداد مدل‌های موجود
+    # این مقدار باید برابر تعداد مدل‌ها باشد تا ابعاد تنسورها همخوانی داشته باشند
+    dynamic_num_memberships = len(base_models)
+
     ensemble = FuzzyHesitantEnsemble(
         base_models, MEANS, STDS,
-        num_memberships=args.num_memberships,
+        num_memberships=dynamic_num_memberships, # <--- استفاده از مقدار پویا
         freeze_models=True,
         cum_weight_threshold=args.cum_weight_threshold,
         hesitancy_threshold=args.hesitancy_threshold
