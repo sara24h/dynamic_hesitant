@@ -1,3 +1,4 @@
+
 import torch
 from torch.utils.data import DataLoader, Subset, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -12,6 +13,7 @@ from PIL import Image
 # ================== DATASET CLASSES ==================
 
 class CustomGenAIDataset(Dataset):
+    """دیتاست قدیمی (جهت سازگاری با نسخه‌های قبلی نگهداری شده است)"""
     
     def __init__(self, root_dir, fake_classes, real_class, transform=None):
         self.root_dir = root_dir
@@ -56,16 +58,20 @@ class CustomGenAIDataset(Dataset):
 
 class NewGenAIDataset(Dataset):
     """
-    ساختار جدید دیتاست:
-    root/
-      ├── train/
-      │     ├── fake/
-      │     └── real/
-      └── test/
-            ├── insightface/      (همه این‌ها Fake هستند)
-            ├── photoshop/        (همه این‌ها Fake هستند)
-            ├── stablediffusion v1.5/ (همه این‌ها Fake هستند)
-            └── stylegan/         (همه این‌ها Fake هستند)
+    ساختار جدید دیتاست newgwnai:
+    root_dir/
+      ├── insightface/
+      │   ├── real/
+      │   └── fake/
+      ├── photoshop/
+      │   ├── real/
+      │   └── fake/
+      ├── stablediffusion v1.5/
+      │   ├── real/
+      │   └── fake/
+      └── stylegan/
+          ├── real/
+          └── fake/
     """
    
     def __init__(self, root_dir, transform=None):
@@ -74,51 +80,29 @@ class NewGenAIDataset(Dataset):
         self.samples = []
         self.label_map = {'fake': 0, 'real': 1}
         
-        # 1. بارگذاری از پوشه train (شامل fake و real)
-        train_dir = os.path.join(root_dir, 'train')
-        if os.path.exists(train_dir):
-            print(f"[New Dataset] Scanning TRAIN folder: {train_dir}")
-            for subclass in ['fake', 'real']:
-                subclass_path = os.path.join(train_dir, subclass)
-                if os.path.exists(subclass_path):
-                    files = [f for f in os.listdir(subclass_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                    for img_file in files:
-                        img_path = os.path.join(subclass_path, img_file)
-                        self.samples.append((img_path, self.label_map[subclass]))
-                    print(f"  - Loaded {len(files)} images from train/{subclass}")
-                else:
-                    print(f"[Warning] Path not found: {subclass_path}")
-        else:
-            print(f"[Warning] TRAIN directory not found: {train_dir}")
+        # لیست پوشه‌های اصلی (دسته‌بندی‌ها)
+        categories = ['insightface', 'photoshop', 'stablediffusion v1.5', 'stylegan']
+        # لیست برچسب‌ها در هر دسته‌بندی
+        labels = ['real', 'fake']
+        
+        print(f"[NewGenAIDataset] Scanning root directory: {root_dir}")
 
-        # 2. بارگذاری از پوشه test (زیرپوشه‌های مشخص که همه Fake هستند)
-        test_dir = os.path.join(root_dir, 'test')
-        if os.path.exists(test_dir):
-            print(f"[New Dataset] Scanning TEST folder for specific Fake classes: {test_dir}")
-            
-            # لیست زیرپوشه‌هایی که در پوشه test قرار دارند و باید بارگذاری شوند
-            test_fake_subclasses = [
-                'insightface', 
-                'photoshop', 
-                'stablediffusion v1.5', 
-                'stylegan'
-            ]
-            
-            for folder_name in test_fake_subclasses:
-                folder_path = os.path.join(test_dir, folder_name)
-                if os.path.exists(folder_path):
-                    files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        for category in categories:
+            for label in labels:
+                # مسیر کامل مثال: newgwnai/insightface/real
+                dir_path = os.path.join(root_dir, category, label)
+                
+                if os.path.exists(dir_path):
+                    files = [f for f in os.listdir(dir_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
                     for img_file in files:
-                        img_path = os.path.join(folder_path, img_file)
-                        # همه تصاویر در این شاخه‌ها برچسب Fake (0) دارند
-                        self.samples.append((img_path, self.label_map['fake']))
-                    print(f"  - Loaded {len(files)} images from test/{folder_name} (Fake)")
+                        img_path = os.path.join(dir_path, img_file)
+                        self.samples.append((img_path, self.label_map[label]))
+                    
+                    print(f"  - Loaded {len(files)} images from {category}/{label}")
                 else:
-                    print(f"[Warning] Path not found: {folder_path}")
-        else:
-            print(f"[Warning] TEST directory not found: {test_dir}")
+                    print(f"  [Warning] Path not found: {dir_path}")
 
-        print(f"[New Dataset] Total loaded images: {len(self.samples)}")
+        print(f"[NewGenAIDataset] Total loaded images: {len(self.samples)}")
 
     def __len__(self):
         return len(self.samples)
@@ -197,6 +181,9 @@ def get_sample_info(dataset, index):
 
 
 def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
+    """
+    تقسیم‌بندی استاندارد دیتاست به نسبت 70-15-15
+    """
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     num_samples = len(dataset)
     indices = list(range(num_samples))
@@ -311,11 +298,12 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         )
         
     elif dataset_type == 'custom_genai_v2':
-        # >>> دیتاست جدید (ساختار جدید با پوشه train و پوشه‌های تک‌کلاسه در test) <<<
+        # >>> دیتاست جدید newgwnai (ساختار insightface/photoshop/... با زیرپوشه real/fake) <<<
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = NewGenAIDataset(base_dir, transform=temp_transform)
         
-        print("[Dataset Loading] Custom GenAI V2 (New) Dataset loaded.")
+        print("[Dataset Loading] NewGwnAI Dataset (custom_genai_v2) loaded.")
+        # تقسیم‌بندی 70-15-15 در اینجا انجام می‌شود
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
             full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
         )
@@ -425,7 +413,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
     else:
-        # این بخش برای تمام دیتاست‌های دیگر شامل real_fake_dataset اجرا می‌شود
+        # این بخش برای تمام دیتاست‌های دیگر شامل newgwnai (custom_genai_v2) اجرا می‌شود
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
             
@@ -471,16 +459,17 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
 if __name__ == '__main__':
    
     # مسیر دیتاست خود را اینجا وارد کنید
-    # این مسیر باید شامل پوشه های train و test باشد
-    path_to_dataset = '/path/to/your/dataset_root'
+    # مثال: 'datasets/newgwnai'
+    # این مسیر باید شامل پوشه های insightface, photoshop و... باشد
+    path_to_dataset = 'newgwnai'  
     
     try:
-        # برای استفاده از دیتاست جدید با ساختار درخواستی، از custom_genai_v2 استفاده کنید
+        # برای استفاده از دیتاست جدید newgwnai، از custom_genai_v2 استفاده کنید
         train_loader, val_loader, test_loader = create_dataloaders(
             base_dir=path_to_dataset,
             batch_size=32,
             num_workers=0,
-            dataset_type='custom_genai_v2',  # <--- استفاده از حالت V2 برای ساختار جدید
+            dataset_type='custom_genai_v2',  # <--- استفاده از حالت V2 برای ساختار newgwnai
             is_distributed=False,
             seed=42
         )
