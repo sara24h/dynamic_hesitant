@@ -1,4 +1,3 @@
-
 import torch
 from torch.utils.data import DataLoader, Subset, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -58,9 +57,10 @@ class CustomGenAIDataset(Dataset):
 
 class NewGenAIDataset(Dataset):
     """
-    ساختار انعطاف‌پذیر برای دیتاست newgwnai:
-    این کلاس تمام زیرپوشه‌ها را اسکن می‌کند تا پوشه‌های 'real' و 'fake' را پیدا کند.
-    این مشکل وجود پوشه‌های اضافی مانند 'test' یا 'train' در مسیر اصلی را حل می‌کند.
+    ساختار جدید و تطبیق‌پذیر برای دیتاست newgwnai (اصلاح شده).
+    این کلاس تمام زیرپوشه‌ها را به صورت بازگشتی (Recursive) اسکن می‌کند
+    تا پوشه‌های 'real' و 'fake' را در هر عمقی پیدا کند.
+    این مشکل وجود پوشه‌های اضافی مانند 'test' یا 'train' را حل می‌کند.
     """
    
     def __init__(self, root_dir, transform=None):
@@ -70,6 +70,10 @@ class NewGenAIDataset(Dataset):
         self.label_map = {'fake': 0, 'real': 1}
         
         print(f"[NewGenAIDataset] Scanning recursively in: {root_dir}")
+
+        if not os.path.exists(root_dir):
+            print(f"[Error] Root directory does not exist: {root_dir}")
+            return
 
         # استفاده از os.walk برای پیمایش تمام زیرپوشه‌ها
         for dirpath, dirnames, filenames in os.walk(self.root_dir):
@@ -95,7 +99,7 @@ class NewGenAIDataset(Dataset):
         print(f"[NewGenAIDataset] Total loaded images: {len(self.samples)}")
         
         if len(self.samples) == 0:
-            print("[Error] No images found! Please check the root directory path.")
+            print("[Error] No images found! Please check the root directory path and ensure folders are named 'real' or 'fake'.")
 
     def __len__(self):
         return len(self.samples)
@@ -106,6 +110,7 @@ class NewGenAIDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image, label
+
 
 class UADFVDataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -290,7 +295,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         )
         
     elif dataset_type == 'custom_genai_v2':
-        # >>> دیتاست جدید newgwnai (ساختار insightface/photoshop/... با زیرپوشه real/fake) <<<
+        # >>> دیتاست جدید newgwnai (ساختار بازگشتی insightface/photoshop/... با زیرپوشه real/fake) <<<
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = NewGenAIDataset(base_dir, transform=temp_transform)
         
