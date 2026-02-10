@@ -29,7 +29,7 @@ class CustomGenAIDataset(Dataset):
                     img_path = os.path.join(class_path, img_file)
                     self.samples.append((img_path, self.label_map['fake']))
             else:
-                print(f"[Warning] Path not found: {class_name}")
+                print(f"[Warning] Path not found: {class_path}")
 
         print(f"[Old CustomDataset] Loading Real images from: {real_class}")
         real_path = os.path.join(root_dir, real_class)
@@ -271,6 +271,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
         'deepflux': ['Fake', 'Real'],
+        # اضافه شده: دیتاست جدید با فولدرهای face_fake و face_real
         'real_fake_dataset': ['face_fake', 'face_real'], 
     }
 
@@ -294,7 +295,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         )
         
     elif dataset_type == 'custom_genai_v2':
-        # دیتاست جدید (ساختار جدید با پوشه train و پوشه‌های تک‌کلاسه)
+        # >>> دیتاست جدید (ساختار جدید با پوشه train و پوشه‌های تک‌کلاسه) <<<
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = NewGenAIDataset(base_dir, transform=temp_transform)
         
@@ -309,25 +310,6 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = UADFVDataset(base_dir, transform=temp_transform)
         train_indices, val_indices, test_indices = create_video_level_uadfV_split(full_dataset, seed=seed)
-        
-    # ================== ADDED SECTION FOR LABELED COLLECTION ==================
-    elif dataset_type == 'labeled_collection':
-        # پوشه‌های فیک و رئال برای دیتاست جدید
-        fake_folders = ['DALL-E', 'DeepFaceLab', 'Midjourney', 'StyleGAN']
-        real_folder = 'Real'
-        
-        temp_transform = transforms.Compose([transforms.ToTensor()])
-        full_dataset = CustomGenAIDataset(
-            base_dir, 
-            fake_classes=fake_folders, 
-            real_class=real_folder, 
-            transform=temp_transform
-        )
-        print("[Dataset Loading] Labeled Collection Dataset loaded.")
-        train_indices, val_indices, test_indices = create_standard_reproducible_split(
-            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
-        )
-    # =========================================================================
         
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
@@ -427,7 +409,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
     else:
-        # این بخش برای تمام دیتاست‌های دیگر شامل labeled_collection اجرا می‌شود
+        # این بخش برای تمام دیتاست‌های دیگر شامل real_fake_dataset اجرا می‌شود
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
             
@@ -479,7 +461,7 @@ if __name__ == '__main__':
             base_dir=path_to_dataset,
             batch_size=32,
             num_workers=0,
-            dataset_type='labeled_collection',  # <--- تغییر برای تست دیتاست جدید
+            dataset_type='real_fake_dataset',  # <--- این مقدار را تغییر دادیم
             is_distributed=False,
             seed=42
         )
@@ -491,4 +473,4 @@ if __name__ == '__main__':
         
     except FileNotFoundError as e:
         print(f"Error: {e}")
-        print("Please ensure the path exists and contains the correct folders.")
+        print("Please ensure the path exists and contains 'face_fake' and 'face_real' folders.")
