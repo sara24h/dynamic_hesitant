@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +13,7 @@ import json
 import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
+# فرض بر این است که این فایل‌ها در مسیر شما موجود هستند
 from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
@@ -231,12 +233,24 @@ def evaluate_accuracy_ddp(model, loader, device):
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
+    
+    # --- FIX: خواندن پویای تعداد عضویت‌ها از خود مدل برای جلوگیری از خطای ابعاد ---
+    if hasattr(model, 'module'):
+        net = model.module
+    else:
+        net = model
+        
+    n_models = len(model_names)
+    n_memberships = net.hesitant_fuzzy.num_memberships
+    
     total_correct = 0
     total_samples = 0
-    sum_weights = torch.zeros(len(model_names), device=device)
-    sum_activation = torch.zeros(len(model_names), device=device)
-    sum_membership_vals = torch.zeros(len(model_names), 3, device=device)
-    sum_hesitancy = torch.zeros(len(model_names), device=device)
+    sum_weights = torch.zeros(n_models, device=device)
+    sum_activation = torch.zeros(n_models, device=device)
+    
+    # استفاده از n_memberships به جای عدد ثابت 3
+    sum_membership_vals = torch.zeros(n_models, n_memberships, device=device)
+    sum_hesitancy = torch.zeros(n_models, device=device)
 
     if is_main:
         print(f"\nEvaluating {name} set...")
@@ -462,7 +476,6 @@ def main():
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
     
-    # <--- تغییر اعمال شده: اضافه شدن 'real_fake_dataset' به انتخاب‌ها --->
     parser.add_argument('--dataset', type=str, required=True,
                        choices=['wild', 'real_fake', 'hard_fake_real', 'uadfV', 'custom_genai', 'custom_genai_v2', 'real_fake_dataset'])
     
@@ -493,14 +506,12 @@ def main():
         print(f"Models: {len(args.model_paths)}")
         print("="*70 + "\n")
 
-    # <--- مدیریت پویای MEANS و STDS بر اساس تعداد مدل‌ها --->
+    # مدیریت نرمالیزیشن
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
-    # اگر تعداد مدل‌ها بیشتر از لیست پیش‌فرض بود، از آخرین مقدار تکرار می‌کنیم
     num_models_to_load = len(args.model_paths)
     if num_models_to_load > len(DEFAULT_MEANS):
-        # تکرار آخرین مقدار برای تعداد مدل‌های اضافی
         last_mean = DEFAULT_MEANS[-1]
         last_std = DEFAULT_STDS[-1]
         MEANS = DEFAULT_MEANS + [last_mean] * (num_models_to_load - len(DEFAULT_MEANS))
@@ -514,13 +525,11 @@ def main():
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-        # محاسبه پویای تعداد عضویت‌ها بر اساس تعداد مدل‌های موجود
-    # این مقدار باید برابر تعداد مدل‌ها باشد تا ابعاد تنسورها همخوانی داشته باشند
-    dynamic_num_memberships = len(base_models)
-
+    # --- FIX: استفاده مستقیم از آرگومان ورودی به جای forcing به تعداد مدل ---
+    # این خط باعث می‌شود اگر کاربر 2 وارد کرد، واقعاً 2 استفاده شود.
     ensemble = FuzzyHesitantEnsemble(
         base_models, MEANS, STDS,
-        num_memberships=dynamic_num_memberships, # <--- استفاده از مقدار پویا
+        num_memberships=args.num_memberships, 
         freeze_models=True,
         cum_weight_threshold=args.cum_weight_threshold,
         hesitancy_threshold=args.hesitancy_threshold
