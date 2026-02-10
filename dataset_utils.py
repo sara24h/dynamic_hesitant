@@ -58,20 +58,9 @@ class CustomGenAIDataset(Dataset):
 
 class NewGenAIDataset(Dataset):
     """
-    ساختار جدید دیتاست newgwnai:
-    root_dir/
-      ├── insightface/
-      │   ├── real/
-      │   └── fake/
-      ├── photoshop/
-      │   ├── real/
-      │   └── fake/
-      ├── stablediffusion v1.5/
-      │   ├── real/
-      │   └── fake/
-      └── stylegan/
-          ├── real/
-          └── fake/
+    ساختار انعطاف‌پذیر برای دیتاست newgwnai:
+    این کلاس تمام زیرپوشه‌ها را اسکن می‌کند تا پوشه‌های 'real' و 'fake' را پیدا کند.
+    این مشکل وجود پوشه‌های اضافی مانند 'test' یا 'train' در مسیر اصلی را حل می‌کند.
     """
    
     def __init__(self, root_dir, transform=None):
@@ -80,29 +69,33 @@ class NewGenAIDataset(Dataset):
         self.samples = []
         self.label_map = {'fake': 0, 'real': 1}
         
-        # لیست پوشه‌های اصلی (دسته‌بندی‌ها)
-        categories = ['insightface', 'photoshop', 'stablediffusion v1.5', 'stylegan']
-        # لیست برچسب‌ها در هر دسته‌بندی
-        labels = ['real', 'fake']
-        
-        print(f"[NewGenAIDataset] Scanning root directory: {root_dir}")
+        print(f"[NewGenAIDataset] Scanning recursively in: {root_dir}")
 
-        for category in categories:
-            for label in labels:
-                # مسیر کامل مثال: newgwnai/insightface/real
-                dir_path = os.path.join(root_dir, category, label)
+        # استفاده از os.walk برای پیمایش تمام زیرپوشه‌ها
+        for dirpath, dirnames, filenames in os.walk(self.root_dir):
+            # نام پوشه جاری را بررسی می‌کنیم
+            current_folder_name = os.path.basename(dirpath)
+            
+            # اگر به پوشه real یا fake رسیدیم، عکس‌ها را لود کن
+            if current_folder_name in ['real', 'fake']:
+                label = self.label_map[current_folder_name]
                 
-                if os.path.exists(dir_path):
-                    files = [f for f in os.listdir(dir_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                    for img_file in files:
-                        img_path = os.path.join(dir_path, img_file)
-                        self.samples.append((img_path, self.label_map[label]))
+                # فیلتر کردن فایل‌های تصویری
+                valid_files = [f for f in filenames if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                
+                if valid_files:
+                    # نمایش مسیر نسبی پیدا شده برای اطلاع کاربر
+                    relative_path = os.path.relpath(dirpath, self.root_dir)
+                    print(f"  - Found {len(valid_files)} images in: {relative_path}/")
                     
-                    print(f"  - Loaded {len(files)} images from {category}/{label}")
-                else:
-                    print(f"  [Warning] Path not found: {dir_path}")
+                    for img_file in valid_files:
+                        img_path = os.path.join(dirpath, img_file)
+                        self.samples.append((img_path, label))
 
         print(f"[NewGenAIDataset] Total loaded images: {len(self.samples)}")
+        
+        if len(self.samples) == 0:
+            print("[Error] No images found! Please check the root directory path.")
 
     def __len__(self):
         return len(self.samples)
@@ -113,7 +106,6 @@ class NewGenAIDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image, label
-
 
 class UADFVDataset(Dataset):
     def __init__(self, root_dir, transform=None):
