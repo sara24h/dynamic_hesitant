@@ -56,12 +56,7 @@ class CustomGenAIDataset(Dataset):
 
 
 class NewGenAIDataset(Dataset):
-    """
-    ساختار جدید و تطبیق‌پذیر برای دیتاست newgwnai (اصلاح شده).
-    این کلاس تمام زیرپوشه‌ها را به صورت بازگشتی (Recursive) اسکن می‌کند
-    تا پوشه‌های 'real' و 'fake' را در هر عمقی پیدا کند.
-    این مشکل وجود پوشه‌های اضافی مانند 'test' یا 'train' را حل می‌کند.
-    """
+    
    
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
@@ -376,6 +371,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
     ])
 
     if dataset_type == 'wild':
+        # ... (کدهای مربوط به wild بدون تغییر می‌مانند) ...
         splits = ['train', 'valid', 'test']
         datasets_dict = {}
         for split in splits:
@@ -410,7 +406,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
     else:
-        # این بخش برای تمام دیتاست‌های دیگر شامل newgwnai (custom_genai_v2) اجرا می‌شود
+        # این بخش برای دیتاست شما (custom_genai_v2) اجرا می‌شود
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
             
@@ -434,17 +430,22 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 2,
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
 
+        # ============================================================
+        # تغییر مهم: num_workers را به 0 تغییر دهید تا خطای DataLoader برطرف شود
+        # ============================================================
+        safe_num_workers = 0 
+        
         train_loader = DataLoader(train_dataset, batch_size=batch_size,
                                  shuffle=(train_sampler is None), sampler=train_sampler,
-                                 num_workers=num_workers, pin_memory=True, drop_last=True,
+                                 num_workers=safe_num_workers, pin_memory=True, drop_last=True,
                                  worker_init_fn=worker_init_fn)
         val_loader = DataLoader(val_dataset, batch_size=batch_size,
                                shuffle=False, sampler=val_sampler,
-                               num_workers=num_workers, pin_memory=True, drop_last=False,
+                               num_workers=safe_num_workers, pin_memory=True, drop_last=False,
                                worker_init_fn=worker_init_fn)
         test_loader = DataLoader(test_dataset, batch_size=batch_size,
                                 shuffle=False, sampler=test_sampler,
-                                num_workers=num_workers, pin_memory=True, drop_last=False,
+                                num_workers=safe_num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
 
     if is_main:
