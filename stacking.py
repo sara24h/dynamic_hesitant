@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 
 from dataset_utils import (
     UADFVDataset, 
-    CustomGenAIDataset, # اضافه شد
+    CustomGenAIDataset, 
     create_dataloaders, 
     get_sample_info, 
     worker_init_fn
@@ -364,8 +364,8 @@ def cleanup_distributed():
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Stacking Ensemble Training with Logistic Regression")
-    parser.add_argument('--epochs', type=int, default=10) # Reduced from 30 to 10
-    parser.add_argument('--lr', type=float, default=0.01) # Increased LR slightly for faster convergence
+    parser.add_argument('--epochs', type=int, default=10) 
+    parser.add_argument('--lr', type=float, default=0.01) 
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
@@ -375,152 +375,168 @@ def main():
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
-    parser.add_argument('--seed', type=int, default=42)
+    
+    # تغییر اینجا: پذیرش لیستی از seed ها
+    parser.add_argument('--seed', type=int, nargs='+', required=True, help='List of seeds to run (e.g., --seed 42 123 456)')
+    
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
         raise ValueError("Number of model_names must match model_paths")
 
-    set_seed(args.seed)
-    device, local_rank, rank, world_size = setup_distributed()
-    is_main = rank == 0
+    # حلقه روی seed های مختلف
+    for current_seed in args.seed:
+        print(f"\n{'#'*80}")
+        print(f"# STARTING RUN FOR SEED: {current_seed}")
+        print(f"{'#'*80}\n")
 
-    if is_main:
-        print("="*70)
-        print(f"STACKING ENSEMBLE TRAINING (Logistic Regression)")
-        print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
-        print("="*70)
-        print(f"Dataset: {args.dataset}")
-        print(f"Data directory: {args.data_dir}")
-        print(f"Batch size: {args.batch_size}")
-        print(f"Models: {len(args.model_paths)}")
-        print("="*70 + "\n")
+        set_seed(current_seed)
+        device, local_rank, rank, world_size = setup_distributed()
+        is_main = rank == 0
 
-    MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
-    STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-    MEANS = MEANS[:len(args.model_paths)]
-    STDS = STDS[:len(args.model_paths)]
-
-    base_models = load_pruned_models(args.model_paths, device, is_main)
-    MODEL_NAMES = args.model_names[:len(base_models)]
-
-    ensemble = StackingEnsemble(
-        base_models, MEANS, STDS,
-        freeze_models=True
-    ).to(device)
-
-    if world_size > 1:
-        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
-
-    if is_main:
-        trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in ensemble.parameters())
-        print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
-
-    train_loader, val_loader, test_loader = create_dataloaders(
-        args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
-
-    if is_main:
-        print("\n" + "="*70)
-        print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
-        print("="*70)
-
-    individual_accs = []
-    for i, model in enumerate(base_models):
-        acc = evaluate_single_model_ddp(
-            model, test_loader, device,
-            f"Model {i+1} ({MODEL_NAMES[i]})",
-            MEANS[i], STDS[i], is_main)
-        individual_accs.append(acc)
-
-    best_single = max(individual_accs)
-    best_idx = individual_accs.index(best_single)
-
-    if is_main:
-        print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
-        print("="*70)
-
-    best_val_acc, history = train_stacking(
-        ensemble, train_loader, val_loader,
-        args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
-
-    # Adjusted checkpoint name
-    ckpt_path = os.path.join(args.save_dir, 'best_stacking_lr.pt')
-    if os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        meta_learner = ensemble.module.meta_learner if hasattr(ensemble, 'module') else ensemble.meta_learner
-        meta_learner.load_state_dict(ckpt['meta_state_dict'])
+        # ایجاد پوشه مخصوص هر seed
+        current_save_dir = os.path.join(args.save_dir, f'seed_{current_seed}')
+        
         if is_main:
-            print("Best model loaded.\n")
+            print("="*70)
+            print(f"STACKING ENSEMBLE TRAINING (Logistic Regression)")
+            print(f"Distributed on {world_size} GPU(s) | Seed: {current_seed}")
+            print("="*70)
+            print(f"Dataset: {args.dataset}")
+            print(f"Data directory: {args.data_dir}")
+            print(f"Batch size: {args.batch_size}")
+            print(f"Models: {len(args.model_paths)}")
+            print(f"Output Dir: {current_save_dir}")
+            print("="*70 + "\n")
 
-    if is_main:
-        print("\n" + "="*70)
-        print("FINAL ENSEMBLE EVALUATION")
-        print("="*70)
+        MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
+        STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+        MEANS = MEANS[:len(args.model_paths)]
+        STDS = STDS[:len(args.model_paths)]
 
-    ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
-    # Use the FIXED evaluate function that returns weights
-    ensemble_test_acc, learned_weights, learned_bias = evaluate_ensemble_final_ddp(
-        ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
+        base_models = load_pruned_models(args.model_paths, device, is_main)
+        MODEL_NAMES = args.model_names[:len(base_models)]
 
-    if is_main:
-        print("\n" + "="*70)
-        print("FINAL COMPARISON")
-        print("="*70)
-        print(f"Best Single Model: {best_single:.2f}%")
-        print(f"Stacking Accuracy (LR): {ensemble_test_acc:.2f}%")
-        print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
-        print("="*70)
+        ensemble = StackingEnsemble(
+            base_models, MEANS, STDS,
+            freeze_models=True
+        ).to(device)
 
-        final_results = {
-            'method': 'Stacking_LR',
-            'best_single_model': {
-                'name': MODEL_NAMES[best_idx],
-                'accuracy': float(best_single)
-            },
-            'ensemble': {
-                'test_accuracy': float(ensemble_test_acc),
-                'learned_weights': {name: float(w) for name, w in zip(MODEL_NAMES, learned_weights)},
-                'learned_bias': float(learned_bias)
-            },
-            'improvement': float(ensemble_test_acc - best_single),
-            'training_history': history
-        }
+        if world_size > 1:
+            ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
-        results_path = os.path.join(args.save_dir, 'final_results_stacking_lr.json')
-        with open(results_path, 'w') as f:
-            json.dump(final_results, f, indent=4)
-        print(f"\nResults saved: {results_path}")
+        if is_main:
+            trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in ensemble.parameters())
+            print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
-        final_model_path = os.path.join(args.save_dir, 'final_stacking_lr_model.pt')
-        torch.save({
-            'ensemble_state_dict': ensemble_module.state_dict(),
-            'meta_learner_state_dict': ensemble_module.meta_learner.state_dict(),
-            'test_accuracy': ensemble_test_acc,
-            'model_names': MODEL_NAMES,
-            'means': MEANS,
-            'stds': STDS
-        }, final_model_path)
-        print(f"Model saved: {final_model_path}")
+        # ارسال seed جاری به دیتالودر
+        train_loader, val_loader, test_loader = create_dataloaders(
+            args.data_dir, args.batch_size, dataset_type=args.dataset,
+            is_distributed=(world_size > 1), seed=current_seed, is_main=is_main)
 
-        vis_dir = os.path.join(args.save_dir, 'visualizations')
-        generate_visualizations(
-            ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
-            args.num_grad_cam_samples, args.num_lime_samples,
-            args.dataset, is_main)
+        if is_main:
+            print("\n" + "="*70)
+            print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
+            print("="*70)
 
-    cleanup_distributed()
+        individual_accs = []
+        for i, model in enumerate(base_models):
+            acc = evaluate_single_model_ddp(
+                model, test_loader, device,
+                f"Model {i+1} ({MODEL_NAMES[i]})",
+                MEANS[i], STDS[i], is_main)
+            individual_accs.append(acc)
 
-    if is_main:
-        plot_roc_and_f1(
-            ensemble_module,
-            test_loader, 
-            device, 
-            args.save_dir, 
-            MODEL_NAMES,
-            is_main
-        )
+        best_single = max(individual_accs)
+        best_idx = individual_accs.index(best_single)
+
+        if is_main:
+            print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+            print("="*70)
+
+        best_val_acc, history = train_stacking(
+            ensemble, train_loader, val_loader,
+            args.epochs, args.lr, device, current_save_dir, is_main, MODEL_NAMES)
+
+        ckpt_path = os.path.join(current_save_dir, 'best_stacking_lr.pt')
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            meta_learner = ensemble.module.meta_learner if hasattr(ensemble, 'module') else ensemble.meta_learner
+            meta_learner.load_state_dict(ckpt['meta_state_dict'])
+            if is_main:
+                print("Best model loaded.\n")
+
+        if is_main:
+            print("\n" + "="*70)
+            print("FINAL ENSEMBLE EVALUATION")
+            print("="*70)
+
+        ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
+        
+        ensemble_test_acc, learned_weights, learned_bias = evaluate_ensemble_final_ddp(
+            ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
+
+        if is_main:
+            print("\n" + "="*70)
+            print("FINAL COMPARISON")
+            print("="*70)
+            print(f"Best Single Model: {best_single:.2f}%")
+            print(f"Stacking Accuracy (LR): {ensemble_test_acc:.2f}%")
+            print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
+            print("="*70)
+
+            final_results = {
+                'seed': current_seed,
+                'method': 'Stacking_LR',
+                'best_single_model': {
+                    'name': MODEL_NAMES[best_idx],
+                    'accuracy': float(best_single)
+                },
+                'ensemble': {
+                    'test_accuracy': float(ensemble_test_acc),
+                    'learned_weights': {name: float(w) for name, w in zip(MODEL_NAMES, learned_weights)},
+                    'learned_bias': float(learned_bias)
+                },
+                'improvement': float(ensemble_test_acc - best_single),
+                'training_history': history
+            }
+
+            results_path = os.path.join(current_save_dir, 'final_results_stacking_lr.json')
+            with open(results_path, 'w') as f:
+                json.dump(final_results, f, indent=4)
+            print(f"\nResults saved: {results_path}")
+
+            final_model_path = os.path.join(current_save_dir, 'final_stacking_lr_model.pt')
+            torch.save({
+                'ensemble_state_dict': ensemble_module.state_dict(),
+                'meta_learner_state_dict': ensemble_module.meta_learner.state_dict(),
+                'test_accuracy': ensemble_test_acc,
+                'model_names': MODEL_NAMES,
+                'means': MEANS,
+                'stds': STDS,
+                'seed': current_seed
+            }, final_model_path)
+            print(f"Model saved: {final_model_path}")
+
+            vis_dir = os.path.join(current_save_dir, 'visualizations')
+            generate_visualizations(
+                ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
+                args.num_grad_cam_samples, args.num_lime_samples,
+                args.dataset, is_main)
+
+        cleanup_distributed()
+        
+        # این بخش باید داخل حلقه باشد تا برای هر seed نمودار رسم شود
+        if is_main:
+            plot_roc_and_f1(
+                ensemble_module,
+                test_loader, 
+                device, 
+                current_save_dir, 
+                MODEL_NAMES,
+                is_main
+            )
 
 if __name__ == "__main__":
     main()
