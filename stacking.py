@@ -361,6 +361,116 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+# ================== MCNEMAR REPORT FUNCTION ==================
+@torch.no_grad()
+def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is_ensemble=True, single_model_idx=None, means=None, stds=None):
+    """
+    Save results in a specific text format for McNemar test.
+    Works for both Ensemble (Stacking) and Single models.
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_paths = []
+    
+    has_paths = hasattr(loader.dataset, 'samples') or hasattr(loader.dataset, 'paths')
+    
+    print(f"\nGenerating McNemar report for {model_name}...")
+    
+    # Normalizer for single model case
+    normalizer = None
+    if not is_ensemble and single_model_idx is not None and means is not None:
+        normalizer = MultiModelNormalization([means[single_model_idx]], [stds[single_model_idx]]).to(device)
+
+    for batch_idx, (images, labels) in enumerate(loader):
+        images = images.to(device)
+        
+        if is_ensemble:
+            outputs, _ = model(images)
+        else:
+            if normalizer:
+                images = normalizer(images, 0)
+            outputs = model(images)
+            
+        if isinstance(outputs, (tuple, list)):
+            outputs = outputs[0]
+            
+        preds = (outputs.squeeze(1) > 0).long()
+        
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        
+        if has_paths:
+            try:
+                start_idx = batch_idx * loader.batch_size
+                end_idx = start_idx + images.size(0)
+                if hasattr(loader.dataset, 'samples'):
+                    batch_paths = [loader.dataset.samples[i][0] for i in range(start_idx, min(end_idx, len(loader.dataset)))]
+                    all_paths.extend(batch_paths)
+                elif hasattr(loader.dataset, 'paths'):
+                     batch_paths = [loader.dataset.paths[i] for i in range(start_idx, min(end_idx, len(loader.dataset)))]
+                     all_paths.extend(batch_paths)
+            except:
+                pass
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    
+    correct = np.sum(all_preds == all_labels)
+    incorrect = len(all_labels) - correct
+    accuracy = correct / len(all_labels) * 100
+    
+    TP = np.sum((all_preds == 1) & (all_labels == 1))
+    TN = np.sum((all_preds == 0) & (all_labels == 0))
+    FP = np.sum((all_preds == 1) & (all_labels == 0))
+    FN = np.sum((all_preds == 0) & (all_labels == 1))
+    
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+    with open(save_path, 'w') as f:
+        f.write("-" * 100 + "\n")
+        f.write(f"SUMMARY STATISTICS ({model_name}):\n")
+        f.write("-" * 100 + "\n")
+        f.write(f"Accuracy: {accuracy:.2f}%\n")
+        f.write(f"Precision: {precision:.4f}\n")
+        f.write(f"Recall: {recall:.4f}\n")
+        f.write(f"Specificity: {specificity:.4f}\n")
+        f.write("\n")
+        f.write("Confusion Matrix:\n")
+        f.write(f"                 Predicted Real  Predicted Fake\n")
+        f.write(f"    Actual Real            {TN:<12}    {FP:<12}\n")
+        f.write(f"    Actual Fake            {FN:<12}    {TP:<12}\n")
+        f.write("\n")
+        f.write(f"Correct Predictions: {correct} ({accuracy:.2f}%)\n")
+        f.write(f"Incorrect Predictions: {incorrect} ({100-accuracy:.2f}%)\n")
+        f.write("\n")
+        f.write("=" * 100 + "\n")
+        f.write("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):\n")
+        f.write("=" * 100 + "\n")
+        header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}\n"
+        f.write(header)
+        f.write("-" * 100 + "\n")
+        
+        for i in range(len(all_labels)):
+            pred = all_preds[i]
+            label = all_labels[i]
+            is_correct = "Yes" if pred == label else "No"
+            
+            if all_paths:
+                path = all_paths[i]
+                if len(path) > 58:
+                    path = "..." + path[-55:]
+            else:
+                path = f"Sample_{i}"
+                
+            line = f"{i+1:<10} {path:<60} {label:<12} {pred:<15} {is_correct:<10}\n"
+            f.write(line)
+
+    print(f"McNemar test info saved to: {save_path}")
+
+
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Stacking Ensemble Training with Logistic Regression")
@@ -375,16 +485,13 @@ def main():
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
-    
-    # تغییر اینجا: پذیرش لیستی از seed ها
-    parser.add_argument('--seed', type=int, nargs='+', required=True, help='List of seeds to run (e.g., --seed 42 123 456)')
+    parser.add_argument('--seed', type=int, nargs='+', required=True, help='List of seeds to run')
     
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
         raise ValueError("Number of model_names must match model_paths")
 
-    # حلقه روی seed های مختلف
     for current_seed in args.seed:
         print(f"\n{'#'*80}")
         print(f"# STARTING RUN FOR SEED: {current_seed}")
@@ -394,7 +501,6 @@ def main():
         device, local_rank, rank, world_size = setup_distributed()
         is_main = rank == 0
 
-        # ایجاد پوشه مخصوص هر seed
         current_save_dir = os.path.join(args.save_dir, f'seed_{current_seed}')
         
         if is_main:
@@ -430,7 +536,6 @@ def main():
             total = sum(p.numel() for p in ensemble.parameters())
             print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
-        # ارسال seed جاری به دیتالودر
         train_loader, val_loader, test_loader = create_dataloaders(
             args.data_dir, args.batch_size, dataset_type=args.dataset,
             is_distributed=(world_size > 1), seed=current_seed, is_main=is_main)
@@ -519,6 +624,21 @@ def main():
             }, final_model_path)
             print(f"Model saved: {final_model_path}")
 
+            # ==========================================
+            # Save McNemar Reports
+            # ==========================================
+            
+            # 1. Ensemble (Stacking) Report
+            mcnemar_ensemble_path = os.path.join(current_save_dir, 'mcnemar_stacking_results.txt')
+            save_mcnemar_report(ensemble_module, test_loader, device, mcnemar_ensemble_path, 
+                                model_name="Stacking Ensemble", is_ensemble=True)
+
+            # 2. Best Single Model Report
+            mcnemar_single_path = os.path.join(current_save_dir, 'mcnemar_best_single_results.txt')
+            save_mcnemar_report(base_models[best_idx], test_loader, device, mcnemar_single_path, 
+                                model_name=MODEL_NAMES[best_idx], is_ensemble=False, 
+                                single_model_idx=best_idx, means=MEANS, stds=STDS)
+
             vis_dir = os.path.join(current_save_dir, 'visualizations')
             generate_visualizations(
                 ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
@@ -527,7 +647,6 @@ def main():
 
         cleanup_distributed()
         
-        # این بخش باید داخل حلقه باشد تا برای هر seed نمودار رسم شود
         if is_main:
             plot_roc_and_f1(
                 ensemble_module,
