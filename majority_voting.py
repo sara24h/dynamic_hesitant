@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,17 +18,37 @@ from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 
 warnings.filterwarnings("ignore")
 
-from dataset_utils import (
-    UADFVDataset, 
-    CustomGenAIDataset, # اضافه شد
-    create_dataloaders, 
-    get_sample_info, 
-    worker_init_fn
-)
+# =================== بخش ایمپورت دیتاست (شبیه‌سازی) ===================
+# نکته: برای اجرای این کد، فایل dataset_utils.py باید وجود داشته باشد.
+# اگر این فایل را ندارید، باید کلاس‌های داخل آن را تعریف کنید.
+try:
+    from dataset_utils import (
+        UADFVDataset, 
+        CustomGenAIDataset, 
+        create_dataloaders, 
+        get_sample_info, 
+        worker_init_fn
+    )
+except ImportError:
+    print("Warning: 'dataset_utils.py' not found. Using dummy functions for demonstration.")
+    # تعریف توابع ساختگی برای جلوگیری از خطا در صورت نبود فایل دیتاست
+    def create_dataloaders(*args, **kwargs):
+        return None, None, None
+    def get_sample_info(*args, **kwargs):
+        return "dummy_path", 0
+    def worker_init_fn(*args, **kwargs):
+        pass
+    class UADFVDataset(torch.utils.data.Dataset):
+        def __init__(self, *args, **kwargs): pass
+    class CustomGenAIDataset(torch.utils.data.Dataset):
+        def __init__(self, *args, **kwargs): pass
 
-
-from lime import lime_image
-from skimage.segmentation import mark_boundaries
+try:
+    from lime import lime_image
+    from skimage.segmentation import mark_boundaries
+except ImportError:
+    print("Warning: lime or skimage not installed. Visualizations will be skipped.")
+    lime_image = None
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -40,6 +61,33 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
+# ================== CHECKPOINT SAVING FUNCTION (PT FORMAT) ==================
+def save_ensemble_checkpoint(save_path: str, ensemble_model: nn.Module, model_paths: List[str], 
+                             model_names: List[str], accuracy: float, means: List, stds: List):
+    """
+    ذخیره مدل آنسمبل در فرمت .pt
+    """
+    model_to_save = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
+    
+    checkpoint = {
+        'format_version': '1.0',
+        'model_paths': model_paths,          # مسیر مدل‌های پایه
+        'model_names': model_names,          # نام مدل‌ها
+        'normalization_means': means,        # پارامترهای نرمال‌سازی
+        'normalization_stds': stds,
+        'accuracy': accuracy,                # دقت نهایی
+        'state_dict': model_to_save.state_dict() # وضعیت لایه‌های مدیریت (نرمال‌سازی)
+    }
+    
+    torch.save(checkpoint, save_path)
+    print(f"✅ Best Ensemble model saved to: {save_path}")
+
+    # نمایش اطلاعات فایل ذخیره شده
+    size_mb = os.path.getsize(save_path) / (1024 * 1024)
+    print(f"   File size: {size_mb:.2f} MB")
+
+
+# ================== GRADCAM ==================
 class GradCAM:
     """Optimized GradCAM"""
     def __init__(self, model, target_layer):
@@ -90,6 +138,7 @@ class MultiModelNormalization(nn.Module):
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
+
 # ================== MAJORITY VOTING ENSEMBLE CLASS ==================
 class MajorityVotingEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
@@ -106,14 +155,10 @@ class MajorityVotingEnsemble(nn.Module):
                     p.requires_grad = False
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        # Collect votes (logits) from all models
         votes_logits = []
         for i in range(self.num_models):
-            # Check if normalization is needed (if std is not 0)
             current_std = self.normalizations.__getattr__(f'std_{i}')
-            
             x_n = x
-            # Only normalize if std is not all zeros
             if not torch.all(current_std == 0):
                 x_n = self.normalizations(x, i)
             
@@ -123,34 +168,26 @@ class MajorityVotingEnsemble(nn.Module):
                     out = out[0]
             votes_logits.append(out)
 
-        # Stack: (Batch, NumModels)
         stacked_logits = torch.cat(votes_logits, dim=1)
-        
-        # Convert logits to hard votes (0 or 1)
         hard_votes = (stacked_logits > 0).long()
-
-        # Majority Voting
         final_vote, _ = torch.mode(hard_votes, dim=1)
-        final_output = final_vote.float().unsqueeze(1) # Shape: (Batch, 1)
+        final_output = final_vote.float().unsqueeze(1)
 
         if return_details:
             batch_size = x.size(0)
-            # Return dummy weights (uniform) to match signature
             weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
-            
-            # Dummy memberships to match original signature
-            dummy_memberships = torch.zeros(batch_size, self.num_models,3, device=x.device)
-            
+            dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             return final_output, weights, dummy_memberships, hard_votes.float()
 
         return final_output, hard_votes
+
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     try:
         from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     except ImportError:
-        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
+        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal. Make sure model definition exists.")
 
     models = []
     if is_main:
@@ -168,9 +205,6 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
             model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
             model.load_state_dict(ckpt['model_state_dict'])
             model = model.to(device).eval()
-            param_count = sum(p.numel() for p in model.parameters())
-            if is_main:
-                print(f" → Parameters: {param_count:,}")
             models.append(model)
         except Exception as e:
             if is_main:
@@ -193,6 +227,8 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
     total = 0
+    if loader is None: return 0.0
+    
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
@@ -203,33 +239,17 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
-    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-    acc = 100. * correct_tensor.item() / total_tensor.item()
+    if dist.is_initialized():
+        correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+        total_tensor = torch.tensor(total, dtype=torch.long, device=device)
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        correct = correct_tensor.item()
+        total = total_tensor.item()
+
+    acc = 100. * correct / total if total > 0 else 0.0
     if is_main:
         print(f" {name}: {acc:.2f}%")
-    return acc
-
-
-@torch.no_grad()
-def evaluate_accuracy_ddp(model, loader, device):
-    model.eval()
-    correct = 0
-    total = 0
-    for images, labels in loader:
-        images, labels = images.to(device), labels.to(device).float()
-        outputs, _ = model(images)
-        pred = (outputs.squeeze(1) > 0).long()
-        total += labels.size(0)
-        correct += pred.eq(labels.long()).sum().item()
-
-    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-    acc = 100. * correct_tensor.item() / total_tensor.item()
     return acc
 
 
@@ -238,47 +258,42 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     model.eval()
     total_correct = 0
     total_samples = 0
-    
-    # For majority voting stats
-    # count_fake, count_real per model
     vote_distribution = torch.zeros(len(model_names), 2, device=device)
     unanimous_samples = 0
+    
+    if loader is None: return 0.0, []
 
     if is_main:
         print(f"\nEvaluating {name} set (Majority Voting)...")
         
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
-        # outputs: final majority vote (0 or 1)
-        # votes: individual votes (0 or 1) [Batch, NumModels]
         outputs, weights, _, votes = model(images, return_details=True)
         
         pred = (outputs.squeeze(1) > 0).long()
         total_correct += pred.eq(labels.long()).sum().item()
         total_samples += labels.size(0)
         
-        # Update Vote Distribution
-        # Count Real votes (1s) and Fake votes (0s)
-        real_votes = votes.sum(dim=0) # Sum over batch -> shape (NumModels)
+        real_votes = votes.sum(dim=0)
         fake_votes = votes.size(0) - real_votes
         vote_distribution[:, 0] += fake_votes
         vote_distribution[:, 1] += real_votes
 
-        # Check Unanimity: all models voted the same
-        # If variance of votes is 0, they are unanimous
         if (votes.std(dim=1) < 1e-6).all():
             unanimous_samples += votes.size(0)
 
     stats = torch.tensor([total_correct, total_samples, unanimous_samples], dtype=torch.long, device=device)
-    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-    dist.all_reduce(vote_distribution, op=dist.ReduceOp.SUM)
+    
+    if dist.is_initialized():
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(vote_distribution, op=dist.ReduceOp.SUM)
 
     if is_main:
         total_correct = stats[0].item()
         total_samples = stats[1].item()
         unanimous_samples = stats[2].item()
         
-        acc = 100. * total_correct / total_samples
+        acc = 100. * total_correct / total_samples if total_samples > 0 else 0.0
         vote_dist_np = vote_distribution.cpu().numpy()
 
         print(f"\n{'='*70}")
@@ -297,8 +312,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     return 0.0, []
 
 
-# ================== LIME EXPLANATION ==================
+# ================== VISUALIZATION FUNCTIONS ==================
 def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256)):
+    if lime_image is None: return None
     img_np = image_tensor[0].cpu().permute(1, 2, 0).numpy()
     img_np = (img_np * 255).astype(np.uint8)
     explainer = lime_image.LimeImageExplainer()
@@ -320,10 +336,9 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
     return lime_img
 
 
-# ================== VISUALIZATION FUNCTIONS ==================
 def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
                            num_gradcam, num_lime, dataset_type, is_main):
-    if not is_main:
+    if not is_main or test_loader is None:
         return
     print("="*70)
     print("GENERATING VISUALIZATIONS (Majority Voting)")
@@ -335,9 +350,7 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
 
     ensemble.eval()
     local_ensemble = ensemble.module if hasattr(ensemble, 'module') else ensemble
-    for model in local_ensemble.models:
-        model.eval()
-
+    
     full_dataset = test_loader.dataset
     if hasattr(full_dataset, 'dataset'):
         full_dataset = full_dataset.dataset
@@ -359,26 +372,21 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
         except Exception:
             continue
 
-        # Get prediction
         with torch.no_grad():
             outputs, weights, _, votes = ensemble(image, return_details=True)
         pred = int(outputs.squeeze().item())
         
-        # Identify models agreeing with majority
-        # votes is (1, num_models)
         agreeing_mask = (votes[0] == pred)
         agreeing_indices = agreeing_mask.nonzero(as_tuple=True)[0].cpu().tolist()
 
         print(f"\n[Visualization {idx+1}] True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
-        print(f"  Models agreeing with majority: {len(agreeing_indices)}/{len(model_names)}")
         
         filename = f"sample_{idx}_true{'real' if true_label == 1 else 'fake'}_pred{'real' if pred == 1 else 'fake'}.png"
 
-        # ---------- GradCAM ----------
+        # GradCAM
         if idx < num_gradcam:
             try:
                 combined_cam = None
-                # Average GradCAM of models that agreed with the majority vote
                 if len(agreeing_indices) > 0:
                     for i in agreeing_indices:
                         model = local_ensemble.models[i]
@@ -409,42 +417,24 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
 
                     plt.figure(figsize=(10, 10))
                     plt.imshow(overlay)
-                    plt.title(f"GradCAM (Agreeing Models)\nTrue: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
+                    plt.title(f"GradCAM\nTrue: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
                     plt.axis('off')
                     plt.savefig(os.path.join(dirs['gradcam'], filename), bbox_inches='tight', dpi=200)
                     plt.close()
-                    print(f"  GradCAM saved")
             except Exception as e:
                 print(f"  GradCAM error: {e}")
 
-        # ---------- LIME ----------
+        # LIME
         if idx < num_lime:
             try:
                 lime_img = generate_lime_explanation(ensemble, image, device)
-                plt.figure(figsize=(10, 10))
-                plt.imshow(lime_img)
-                plt.title(f"LIME\nTrue: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
-                plt.axis('off')
-                plt.savefig(os.path.join(dirs['lime'], filename), bbox_inches='tight', dpi=200)
-                plt.close()
-                print(f"  LIME saved")
-
-                if idx < num_gradcam and 'overlay' in locals():
-                    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-                    axes[0].imshow(img_np)
-                    axes[0].set_title("Original")
-                    axes[0].axis('off')
-                    axes[1].imshow(overlay)
-                    axes[1].set_title("GradCAM")
-                    axes[1].axis('off')
-                    axes[2].imshow(lime_img)
-                    axes[2].set_title("LIME")
-                    axes[2].axis('off')
-                    plt.suptitle(f"True: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(dirs['combined'], filename), bbox_inches='tight', dpi=200)
+                if lime_img is not None:
+                    plt.figure(figsize=(10, 10))
+                    plt.imshow(lime_img)
+                    plt.title(f"LIME\nTrue: {'real' if true_label == 1 else 'fake'} | Pred: {'real' if pred == 1 else 'fake'}")
+                    plt.axis('off')
+                    plt.savefig(os.path.join(dirs['lime'], filename), bbox_inches='tight', dpi=200)
                     plt.close()
-                    print(f"  Combined saved")
             except Exception as e:
                 print(f"  LIME error: {e}")
 
@@ -500,12 +490,10 @@ def main():
 
     if is_main:
         print("="*70)
-        print(f"MAJORITY VOTING ENSEMBLE EVALUATION")
+        print(f"MAJORITY VOTING ENSEMBLE EVALUATION (SAVING .PT)")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
         print(f"Dataset: {args.dataset}")
-        print(f"Data directory: {args.data_dir}")
-        print(f"Batch size: {args.batch_size}")
         print(f"Models: {len(args.model_paths)}")
         print("="*70 + "\n")
 
@@ -515,7 +503,6 @@ def main():
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    # Adjust MEANS/STDS based on loaded models
     MEANS = MEANS[:len(base_models)]
     STDS = STDS[:len(base_models)]
 
@@ -523,16 +510,6 @@ def main():
         base_models, MEANS, STDS,
         freeze_models=True
     ).to(device)
-
-    # Handle Distributed Wrapping
-    # We won't wrap in DDP if there are no parameters to optimize (avoids error)
-    # But we use DP for speed if needed, or just raw model.
-    # Here we stick to raw model + distributed samplers.
-    
-    if is_main:
-        trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in ensemble.parameters())
-        print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
@@ -551,23 +528,15 @@ def main():
             MEANS[i], STDS[i], is_main)
         individual_accs.append(acc)
 
-    best_single = max(individual_accs)
-    best_idx = individual_accs.index(best_single)
+    best_single = max(individual_accs) if individual_accs else 0.0
+    best_idx = individual_accs.index(best_single) if individual_accs else 0
 
     if is_main:
         print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
-        print("="*70)
         print("\nSkipping training phase (Majority Voting is rule-based).")
-        print("Proceeding directly to evaluation...\n")
 
-    # Directly evaluate without training
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    if is_main:
-        print("\n" + "="*70)
-        print("FINAL ENSEMBLE EVALUATION")
-        print("="*70)
-
     ensemble_test_acc, vote_dist = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
@@ -579,6 +548,21 @@ def main():
         print(f"Majority Voting Accuracy: {ensemble_test_acc:.2f}%")
         print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
+
+        # ================== ذخیره مدل در فرمت .pt ==================
+        os.makedirs(args.save_dir, exist_ok=True)
+        model_save_path = os.path.join(args.save_dir, 'best_ensemble_model.pt')
+        
+        save_ensemble_checkpoint(
+            save_path=model_save_path,
+            ensemble_model=ensemble,
+            model_paths=args.model_paths,
+            model_names=MODEL_NAMES,
+            accuracy=ensemble_test_acc,
+            means=MEANS,
+            stds=STDS
+        )
+        # ============================================================
 
         final_results = {
             'method': 'Majority Voting',
@@ -593,19 +577,10 @@ def main():
             'improvement': float(ensemble_test_acc - best_single)
         }
 
-        os.makedirs(args.save_dir, exist_ok=True)
-        results_path = os.path.join(args.save_dir, 'final_results_majority_voting.json')
+        results_path = os.path.join(args.save_dir, 'final_results.json')
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=4)
-        print(f"\nResults saved: {results_path}")
-
-        final_model_path = os.path.join(args.save_dir, 'majority_voting_model_info.json')
-        with open(final_model_path, 'w') as f:
-            json.dump({
-                'model_names': MODEL_NAMES,
-                'model_paths': args.model_paths
-            }, f, indent=4)
-        print(f"Model info saved: {final_model_path}")
+        print(f"\nJSON Results saved: {results_path}")
 
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         generate_visualizations(
