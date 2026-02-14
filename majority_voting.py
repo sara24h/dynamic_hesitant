@@ -18,9 +18,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 
 warnings.filterwarnings("ignore")
 
-# =================== بخش ایمپورت دیتاست (شبیه‌سازی) ===================
-# نکته: برای اجرای این کد، فایل dataset_utils.py باید وجود داشته باشد.
-# اگر این فایل را ندارید، باید کلاس‌های داخل آن را تعریف کنید.
 try:
     from dataset_utils import (
         UADFVDataset, 
@@ -473,7 +470,7 @@ def main():
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
     parser.add_argument('--dataset', type=str, required=True,
-                       choices=['wild', 'real_fake', 'hard_fake_real', 'real_fake_dataset', 'uadfV', 'custom_genai'])
+                       choices=['wild', 'deepfake_lab', 'hard_fake_real', 'real_fake_dataset', 'uadfV', 'custom_genai'])
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
