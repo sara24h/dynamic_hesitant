@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,6 +55,112 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
+
+
+# ================== MCNEMAR REPORT FUNCTION ==================
+@torch.no_grad()
+def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble"):
+    """
+    Evaluate model and save results in a specific text format for McNemar test.
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_paths = []
+    
+    # Attempt to get file paths if available in dataset
+    has_paths = hasattr(loader.dataset, 'samples') or hasattr(loader.dataset, 'paths') or hasattr(loader.dataset, 'data')
+    
+    print(f"\nGenerating McNemar report for {model_name}...")
+    
+    for batch_idx, (images, labels) in enumerate(loader):
+        images = images.to(device)
+        # فراخوانی مدل. برای MajorityVoting خروجی دوم weights است، اما خروجی اول prediction است.
+        outputs, _ = model(images)
+        preds = (outputs.squeeze(1) > 0).long()
+        
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        
+        # Try to extract paths if available
+        if has_paths:
+            try:
+                # Common attribute names in dataset classes
+                if hasattr(loader.dataset, 'samples'):
+                    # ImageFolder style
+                    start_idx = batch_idx * loader.batch_size
+                    end_idx = start_idx + images.size(0)
+                    batch_paths = [loader.dataset.samples[i][0] for i in range(start_idx, min(end_idx, len(loader.dataset)))]
+                    all_paths.extend(batch_paths)
+                elif hasattr(loader.dataset, 'paths'):
+                     start_idx = batch_idx * loader.batch_size
+                     end_idx = start_idx + images.size(0)
+                     batch_paths = [loader.dataset.paths[i] for i in range(start_idx, min(end_idx, len(loader.dataset)))]
+                     all_paths.extend(batch_paths)
+            except:
+                # Fallback if indexing fails
+                pass
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    
+    # Calculate Statistics
+    correct = np.sum(all_preds == all_labels)
+    incorrect = len(all_labels) - correct
+    accuracy = correct / len(all_labels) * 100
+    
+    # Confusion Matrix components
+    TP = np.sum((all_preds == 1) & (all_labels == 1))
+    TN = np.sum((all_preds == 0) & (all_labels == 0))
+    FP = np.sum((all_preds == 1) & (all_labels == 0))
+    FN = np.sum((all_preds == 0) & (all_labels == 1))
+    
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+    # Write to file
+    with open(save_path, 'w') as f:
+        f.write("-" * 100 + "\n")
+        f.write("SUMMARY STATISTICS:\n")
+        f.write("-" * 100 + "\n")
+        f.write(f"Accuracy: {accuracy:.2f}%\n")
+        f.write(f"Precision: {precision:.4f}\n")
+        f.write(f"Recall: {recall:.4f}\n")
+        f.write(f"Specificity: {specificity:.4f}\n")
+        f.write("\n")
+        f.write("Confusion Matrix:\n")
+        f.write(f"                 Predicted Real  Predicted Fake\n")
+        f.write(f"    Actual Real            {TN:<12}    {FP:<12}\n")
+        f.write(f"    Actual Fake            {FN:<12}    {TP:<12}\n")
+        f.write("\n")
+        f.write(f"Correct Predictions: {correct} ({accuracy:.2f}%)\n")
+        f.write(f"Incorrect Predictions: {incorrect} ({100-accuracy:.2f}%)\n")
+        f.write("\n")
+        f.write("=" * 100 + "\n")
+        f.write("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):\n")
+        f.write("=" * 100 + "\n")
+        header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}\n"
+        f.write(header)
+        f.write("-" * 100 + "\n")
+        
+        for i in range(len(all_labels)):
+            pred = all_preds[i]
+            label = all_labels[i]
+            is_correct = "Yes" if pred == label else "No"
+            
+            # Handle path extraction
+            if all_paths:
+                path = all_paths[i]
+                if len(path) > 58:
+                    path = "..." + path[-55:]
+            else:
+                path = f"Sample_{i}"
+                
+            line = f"{i+1:<10} {path:<60} {label:<12} {pred:<15} {is_correct:<10}\n"
+            f.write(line)
+
+    print(f"McNemar test info saved to: {save_path}")
 
 
 # ================== CHECKPOINT SAVING FUNCTION (PT FORMAT) ==================
@@ -578,6 +683,12 @@ def main():
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=4)
         print(f"\nJSON Results saved: {results_path}")
+
+        # ==========================================
+        # NEW: Save McNemar Report for Ensemble
+        # ==========================================
+        mcnemar_report_path = os.path.join(args.save_dir, 'mcnemar_ensemble_results.txt')
+        save_mcnemar_report(ensemble_module, test_loader, device, mcnemar_report_path, model_name="Majority Voting Ensemble")
 
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         generate_visualizations(
