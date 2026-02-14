@@ -17,6 +17,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 
 warnings.filterwarnings("ignore")
 
+# =================== بخش ایمپورت دیتاست (شبیه‌سازی) ===================
 try:
     from dataset_utils import (
         UADFVDataset, 
@@ -27,7 +28,6 @@ try:
     )
 except ImportError:
     print("Warning: 'dataset_utils.py' not found. Using dummy functions for demonstration.")
-    # تعریف توابع ساختگی برای جلوگیری از خطا در صورت نبود فایل دیتاست
     def create_dataloaders(*args, **kwargs):
         return None, None, None
     def get_sample_info(*args, **kwargs):
@@ -57,160 +57,29 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
-# ================== MCNEMAR REPORT FUNCTION ==================
-# ================== MCNEMAR REPORT FUNCTION (FIXED FOR DDP TIMEOUT) ==================
-@torch.no_grad()
-def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble", is_main=True):
-    """
-    Evaluate model and save results in text format for McNemar test.
-    DDP-safe version: Gathers data BEFORE checking is_main.
-    """
-    model.eval()
-    
-    local_preds_list = []
-    local_labels_list = []
-
-    # مرحله ۱: همه GPUها باید حلقه را اجرا کنند
-    if is_main:
-        print(f"\nGenerating McNemar report for {model_name}...")
-
-    for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
-        
-        current_model = model.module if hasattr(model, 'module') else model
-        outputs, _ = current_model(images)
-        preds = (outputs.squeeze(1) > 0).long()
-        
-        local_preds_list.append(preds)
-        local_labels_list.append(labels)
-
-    # تبدیل لیست به تنسور
-    if len(local_preds_list) > 0:
-        local_preds_tensor = torch.cat(local_preds_list, dim=0)
-        local_labels_tensor = torch.cat(local_labels_list, dim=0)
-    else:
-        local_preds_tensor = torch.empty(0, dtype=torch.long, device=device)
-        local_labels_tensor = torch.empty(0, dtype=torch.long, device=device)
-
-    # مرحله ۲: جمع‌آوری توزیع‌شده (باید توسط همه GPUها اجرا شود)
-    if dist.is_initialized():
-        world_size = dist.get_world_size()
-        
-        # الف) پیدا کردن تعداد نمونه‌ها برای Padding
-        local_count = torch.tensor([local_preds_tensor.shape[0]], dtype=torch.long, device=device)
-        dist.all_reduce(local_count, op=dist.ReduceOp.MAX)
-        max_count = local_count.item()
-        
-        # ب) Padding تنسورها برای یکسان کردن اندازه
-        padded_preds = torch.zeros(max_count, dtype=torch.long, device=device)
-        padded_labels = torch.zeros(max_count, dtype=torch.long, device=device)
-        
-        if local_preds_tensor.shape[0] > 0:
-            padded_preds[:local_preds_tensor.shape[0]] = local_preds_tensor
-            padded_labels[:local_labels_tensor.shape[0]] = local_labels_tensor
-            
-        # ج) جمع‌آوری همه تنسورها
-        gathered_preds = [torch.zeros_like(padded_preds) for _ in range(world_size)]
-        gathered_labels = [torch.zeros_like(padded_labels) for _ in range(world_size)]
-        
-        dist.all_gather(gathered_preds, padded_preds)
-        dist.all_gather(gathered_labels, padded_labels)
-        
-        # ترکیب نتایج (فقط برای Rank 0 لازم است اما محاسبه مشترک است)
-        all_preds = torch.cat([g.cpu() for g in gathered_preds]).numpy()
-        all_labels = torch.cat([g.cpu() for g in gathered_labels]).numpy()
-    else:
-        all_preds = local_preds_tensor.cpu().numpy()
-        all_labels = local_labels_tensor.cpu().numpy()
-
-    # مرحله ۳: فقط GPU اصلی فایل را می‌نویسد
-    if is_main:
-        # حذف داده‌های اضافی (Padding) بر اساس طول واقعی دیتاست
-        dataset_len = len(loader.dataset)
-        all_preds = all_preds[:dataset_len]
-        all_labels = all_labels[:dataset_len]
-        
-        total_samples = len(all_labels)
-        if total_samples == 0:
-            print("Warning: No samples for McNemar report!")
-            return
-        
-        correct = np.sum(all_preds == all_labels)
-        incorrect = total_samples - correct
-        accuracy = correct / total_samples * 100
-        
-        TP = np.sum((all_preds == 1) & (all_labels == 1))
-        TN = np.sum((all_preds == 0) & (all_labels == 0))
-        FP = np.sum((all_preds == 1) & (all_labels == 0))
-        FN = np.sum((all_preds == 0) & (all_labels == 1))
-        
-        precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-        recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-        specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
-        
-        with open(save_path, 'w', encoding='utf-8') as f:
-            f.write("-" * 100 + "\n")
-            f.write("SUMMARY STATISTICS:\n")
-            f.write("-" * 100 + "\n")
-            f.write(f"Accuracy:          {accuracy:.2f}%\n")
-            f.write(f"Precision:         {precision:.4f}\n")
-            f.write(f"Recall:            {recall:.4f}\n")
-            f.write(f"Specificity:       {specificity:.4f}\n")
-            f.write("\n")
-            f.write("Confusion Matrix:\n")
-            f.write(f"                  Predicted Real    Predicted Fake\n")
-            f.write(f"    Actual Real   {TN:<14} {FP:<14}\n")
-            f.write(f"    Actual Fake   {FN:<14} {TP:<14}\n")
-            f.write("\n")
-            f.write(f"Correct:   {correct:,} ({accuracy:.2f}%)\n")
-            f.write(f"Incorrect: {incorrect:,} ({100-accuracy:.2f}%)\n")
-            f.write("\n" + "=" * 100 + "\n")
-            f.write("SAMPLE-BY-SAMPLE PREDICTIONS (McNemar Test):\n")
-            f.write("=" * 100 + "\n")
-            header = f"{'ID':<8} {'True':<8} {'Pred':<8} {'Correct':<10} {'Sample'}\n"
-            f.write(header)
-            f.write("-" * 100 + "\n")
-            
-            for i in range(total_samples):
-                pred = int(all_preds[i])
-                label = int(all_labels[i])
-                correct_str = "Yes" if pred == label else "No"
-                sample_id = f"Sample_{i+1:06d}"
-                line = f"{i+1:<8} {label:<8} {pred:<8} {correct_str:<10} {sample_id}\n"
-                f.write(line)
-        
-        print(f"McNemar report saved → {save_path}")
-
 # ================== CHECKPOINT SAVING FUNCTION (PT FORMAT) ==================
 def save_ensemble_checkpoint(save_path: str, ensemble_model: nn.Module, model_paths: List[str], 
                              model_names: List[str], accuracy: float, means: List, stds: List):
-    """
-    ذخیره مدل آنسمبل در فرمت .pt
-    """
     model_to_save = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
     
     checkpoint = {
         'format_version': '1.0',
-        'model_paths': model_paths,          # مسیر مدل‌های پایه
-        'model_names': model_names,          # نام مدل‌ها
-        'normalization_means': means,        # پارامترهای نرمال‌سازی
+        'model_paths': model_paths,
+        'model_names': model_names,
+        'normalization_means': means,
         'normalization_stds': stds,
-        'accuracy': accuracy,                # دقت نهایی
-        'state_dict': model_to_save.state_dict() # وضعیت لایه‌های مدیریت (نرمال‌سازی)
+        'accuracy': accuracy,
+        'state_dict': model_to_save.state_dict()
     }
     
     torch.save(checkpoint, save_path)
     print(f"✅ Best Ensemble model saved to: {save_path}")
-
-    # نمایش اطلاعات فایل ذخیره شده
     size_mb = os.path.getsize(save_path) / (1024 * 1024)
     print(f"   File size: {size_mb:.2f} MB")
 
 
 # ================== GRADCAM ==================
 class GradCAM:
-    """Optimized GradCAM"""
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
@@ -221,10 +90,8 @@ class GradCAM:
     def _register_hooks(self):
         def forward_hook(module, input, output):
             self.activations = output.detach()
-
         def backward_hook(module, grad_in, grad_out):
             self.gradients = grad_out[0].detach()
-
         self.target_layer.register_forward_hook(forward_hook)
         self.target_layer.register_full_backward_hook(backward_hook)
 
@@ -233,7 +100,6 @@ class GradCAM:
         score.backward()
         if self.gradients is None:
             raise RuntimeError("Gradients not captured")
-
         gradients = self.gradients[0]
         activations = self.activations[0]
         weights = gradients.mean(dim=[1, 2], keepdim=True)
@@ -377,10 +243,9 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
-    total_correct = 0
-    total_samples = 0
+    # Local stats: TP, TN, FP, FN, Total
+    local_stats = torch.zeros(5, device=device)
     vote_distribution = torch.zeros(len(model_names), 2, device=device)
-    unanimous_samples = 0
     
     if loader is None: return 0.0, []
 
@@ -392,45 +257,65 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         outputs, weights, _, votes = model(images, return_details=True)
         
         pred = (outputs.squeeze(1) > 0).long()
-        total_correct += pred.eq(labels.long()).sum().item()
-        total_samples += labels.size(0)
+        
+        # Calculate TP, TN, FP, FN
+        # Labels: 1=Real, 0=Fake
+        # Preds: 1=Real, 0=Fake
+        is_tp = ((pred == 1) & (labels.long() == 1)).sum()
+        is_tn = ((pred == 0) & (labels.long() == 0)).sum()
+        is_fp = ((pred == 1) & (labels.long() == 0)).sum()
+        is_fn = ((pred == 0) & (labels.long() == 1)).sum()
+        
+        local_stats[0] += is_tp
+        local_stats[1] += is_tn
+        local_stats[2] += is_fp
+        local_stats[3] += is_fn
+        local_stats[4] += labels.size(0)
         
         real_votes = votes.sum(dim=0)
         fake_votes = votes.size(0) - real_votes
         vote_distribution[:, 0] += fake_votes
         vote_distribution[:, 1] += real_votes
 
-        if (votes.std(dim=1) < 1e-6).all():
-            unanimous_samples += votes.size(0)
-
-    stats = torch.tensor([total_correct, total_samples, unanimous_samples], dtype=torch.long, device=device)
-    
+    # Aggregate stats
     if dist.is_initialized():
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_stats, op=dist.ReduceOp.SUM)
         dist.all_reduce(vote_distribution, op=dist.ReduceOp.SUM)
 
     if is_main:
-        total_correct = stats[0].item()
-        total_samples = stats[1].item()
-        unanimous_samples = stats[2].item()
+        tp = local_stats[0].item()
+        tn = local_stats[1].item()
+        fp = local_stats[2].item()
+        fn = local_stats[3].item()
+        total = local_stats[4].item()
         
-        acc = 100. * total_correct / total_samples if total_samples > 0 else 0.0
+        acc = 100. * (tp + tn) / total if total > 0 else 0.0
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        
         vote_dist_np = vote_distribution.cpu().numpy()
 
         print(f"\n{'='*70}")
         print(f"{name.upper()} SET RESULTS (Majority Voting)")
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
-        print(f" → Total Samples: {total_samples:,}")
-        print(f" → Unanimous Decisions: {unanimous_samples:,} ({100*unanimous_samples/total_samples:.2f}%)")
+        print(f" → Precision: {precision:.4f}")
+        print(f" → Recall: {recall:.4f}")
+        print(f" → Specificity: {specificity:.4f}")
+        
+        print(f"\nConfusion Matrix:")
+        print(f"                 Predicted Real  Predicted Fake")
+        print(f"    Actual Real      {int(tp):<15} {int(fn):<15}")
+        print(f"    Actual Fake      {int(fp):<15} {int(tn):<15}")
         
         print(f"\nVote Distribution (Fake / Real):")
         for i, mname in enumerate(model_names):
             print(f"  {i+1:2d}. {mname:<25}: {int(vote_dist_np[i,0]):<6} / {int(vote_dist_np[i,1]):<6}")
         
         print(f"{'='*70}")
-        return acc, vote_dist_np.tolist()
-    return 0.0, []
+        return acc, vote_dist_np.tolist(), local_stats.cpu().tolist()
+    return 0.0, [], []
 
 
 # ================== VISUALIZATION FUNCTIONS ==================
@@ -504,7 +389,6 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
         
         filename = f"sample_{idx}_true{'real' if true_label == 1 else 'fake'}_pred{'real' if pred == 1 else 'fake'}.png"
 
-        # GradCAM
         if idx < num_gradcam:
             try:
                 combined_cam = None
@@ -545,7 +429,6 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
             except Exception as e:
                 print(f"  GradCAM error: {e}")
 
-        # LIME
         if idx < num_lime:
             try:
                 lime_img = generate_lime_explanation(ensemble, image, device)
@@ -562,6 +445,116 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
     print("="*70)
     print("Visualizations completed!")
     print(f"Saved to: {vis_dir}")
+    print("="*70)
+
+
+# ================== SAVE PREDICTION LOG FUNCTION ==================
+def save_prediction_log(ensemble, test_loader, device, save_path, is_main):
+    """
+    ذخیره لیست پیش‌بینی‌ها و آمار کامل در یک فایل متنی.
+    این تابع فقط روی پردازنده اصلی اجرا می‌شود.
+    """
+    if not is_main or test_loader is None:
+        return
+
+    print("\n" + "="*70)
+    print("GENERATING PREDICTION LOG FILE")
+    print("="*70)
+
+    model = ensemble.module if hasattr(ensemble, 'module') else ensemble
+    model.eval()
+
+    # استخراج دیتاست کامل (بدون Subset یا DistributedSampler)
+    full_dataset = test_loader.dataset
+    if hasattr(full_dataset, 'dataset'):
+        full_dataset = full_dataset.dataset
+
+    # اجرای اینفرنس روی کل دیتاست به صورت ترتیبی برای لاگ کردن
+    # از batch_size=1 استفاده می‌کنیم تا مسیر فایل‌ها دقیق باشد
+    log_loader = DataLoader(full_dataset, batch_size=1, shuffle=False, num_workers=0)
+
+    lines = []
+    
+    # متغیرهای آمار
+    TP, TN, FP, FN = 0, 0, 0, 0
+    total_samples = 0
+    correct_count = 0
+
+    # هدر جدول نمونه‌ها
+    lines.append("="*100)
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+    lines.append("="*100)
+    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
+    lines.append(header)
+    lines.append("-"*100)
+
+    for idx in tqdm(range(len(full_dataset)), desc="Logging predictions"):
+        try:
+            image, label = full_dataset[idx]
+            path, _ = get_sample_info(full_dataset, idx)
+        except Exception as e:
+            print(f"Error getting sample {idx}: {e}")
+            continue
+
+        image = image.unsqueeze(0).to(device)
+        label_int = int(label)
+        
+        with torch.no_grad():
+            output, _ = model(image)
+        
+        pred_int = int(output.squeeze().item() > 0)
+        
+        is_correct = (pred_int == label_int)
+        if is_correct:
+            correct_count += 1
+
+        # محاسبه ماتریس آشفتگی
+        if label_int == 1:  # Real
+            if pred_int == 1: TP += 1
+            else: FN += 1
+        else:  # Fake
+            if pred_int == 1: FP += 1
+            else: TN += 1
+        
+        total_samples += 1
+
+        # افزودن به لیست خروجی
+        filename = os.path.basename(path)
+        if len(filename) > 55:
+            filename = filename[:25] + "..." + filename[-27:]
+            
+        line = f"{idx+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
+        lines.append(line)
+
+    # محاسبه آمار نهایی
+    total = TP + TN + FP + FN
+    acc = (TP + TN) / total if total > 0 else 0
+    prec = TP / (TP + FP) if (TP + FP) > 0 else 0
+    rec = TP / (TP + FN) if (TP + FN) > 0 else 0
+    spec = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+    # ساخت رشته خروجی نهایی
+    output_str = []
+    output_str.append("-" * 100)
+    output_str.append("SUMMARY STATISTICS:")
+    output_str.append("-" * 100)
+    output_str.append(f"Accuracy: {acc*100:.2f}%")
+    output_str.append(f"Precision: {prec:.4f}")
+    output_str.append(f"Recall: {rec:.4f}")
+    output_str.append(f"Specificity: {spec:.4f}")
+    output_str.append("\nConfusion Matrix:")
+    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
+    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
+    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
+    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
+    output_str.append("\n" + "\n".join(lines))
+
+    # ذخیره فایل
+    with open(save_path, 'w') as f:
+        f.write("\n".join(output_str))
+    
+    print(f"✅ Prediction log saved to: {save_path}")
     print("="*70)
 
 
@@ -594,7 +587,7 @@ def main():
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
     parser.add_argument('--dataset', type=str, required=True,
-                       choices=['wild', 'deepfake_lab', 'hard_fake_real', 'real_fake_dataset', 'uadfV', 'custom_genai'])
+                       choices=['wild', 'real_fake', 'hard_fake_real', 'real_fake_dataset', 'uadfV', 'custom_genai'])
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
@@ -658,22 +651,15 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    ensemble_test_acc, vote_dist = evaluate_ensemble_final_ddp(
+    # ارزیابی اصلی (سریع و توزیع شده)
+    ensemble_test_acc, vote_dist, stats = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
     if is_main:
-        print("\n" + "="*70)
-        print("FINAL COMPARISON")
-        print("="*70)
-        print(f"Best Single Model: {best_single:.2f}%")
-        print(f"Majority Voting Accuracy: {ensemble_test_acc:.2f}%")
-        print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
-        print("="*70)
-
-        # ================== ذخیره مدل در فرمت .pt ==================
         os.makedirs(args.save_dir, exist_ok=True)
-        model_save_path = os.path.join(args.save_dir, 'best_ensemble_model.pt')
         
+        # ================== ذخیره مدل در فرمت .pt ==================
+        model_save_path = os.path.join(args.save_dir, 'best_ensemble_model.pt')
         save_ensemble_checkpoint(
             save_path=model_save_path,
             ensemble_model=ensemble,
@@ -682,6 +668,16 @@ def main():
             accuracy=ensemble_test_acc,
             means=MEANS,
             stds=STDS
+        )
+        
+        # ================== ذخیره فایل متنی پیش‌بینی‌ها ==================
+        log_path = os.path.join(args.save_dir, 'prediction_log.txt')
+        save_prediction_log(
+            ensemble=ensemble,
+            test_loader=test_loader,
+            device=device,
+            save_path=log_path,
+            is_main=is_main
         )
         # ============================================================
 
@@ -702,12 +698,6 @@ def main():
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=4)
         print(f"\nJSON Results saved: {results_path}")
-
-        # ==========================================
-        # NEW: Save McNemar Report for Ensemble
-        # ==========================================
-        mcnemar_report_path = os.path.join(args.save_dir, 'mcnemar_ensemble_results.txt')
-        save_mcnemar_report(ensemble_module, test_loader, device, mcnemar_report_path, model_name="Majority Voting Ensemble")
 
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         generate_visualizations(
