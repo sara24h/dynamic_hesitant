@@ -467,106 +467,57 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 # ================== MCNEMAR REPORT FUNCTION ==================
-# ================== MCNEMAR REPORT FUNCTION (FIXED FOR DDP) ==================
 @torch.no_grad()
 def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble", is_main=True):
-    """
-    Evaluate model and save results in a specific text format for McNemar test.
-    Fixed to work correctly with DistributedDataParallel (DDP).
-    """
     model.eval()
+    
+    # جمع‌آوری local پیش‌بینی‌ها و لیبل‌ها به صورت لیست
     local_preds = []
     local_labels = []
-    local_paths = []
-    
-    # Attempt to get file paths if available in dataset
-    has_paths = hasattr(loader.dataset, 'samples') or hasattr(loader.dataset, 'paths') or hasattr(loader.dataset, 'data')
     
     if is_main:
         print(f"\nGenerating McNemar report for {model_name}...")
-
-    # 1. Collect local data
-    for batch_idx, (images, labels) in enumerate(loader):
+    
+    for images, labels in loader:
         images = images.to(device)
-        # Handle DDP wrapper
         current_model = model.module if hasattr(model, 'module') else model
         outputs, _ = current_model(images)
         preds = (outputs.squeeze(1) > 0).long()
         
-        local_preds.extend(preds.cpu().numpy())
-        local_labels.extend(labels.cpu().numpy())
+        local_preds.extend(preds.cpu().numpy().tolist())  # به list ساده
+        local_labels.extend(labels.cpu().numpy().tolist())
+    
+    # جمع‌آوری از همه rankها با all_gather_object (بهترین برای variable size)
+    if dist.is_initialized():
+        world_size = dist.get_world_size()
+        # لیست‌های خالی برای دریافت داده همه rankها
+        gathered_preds = [None] * world_size
+        gathered_labels = [None] * world_size
         
-        if has_paths:
-            try:
-                if hasattr(loader.dataset, 'samples'):
-                    start_idx = batch_idx * loader.batch_size
-                    end_idx = start_idx + images.size(0)
-                    batch_paths = [loader.dataset.samples[i][0] for i in range(start_idx, min(end_idx, len(loader.dataset)))]
-                    local_paths.extend(batch_paths)
-                elif hasattr(loader.dataset, 'paths'):
-                     start_idx = batch_idx * loader.batch_size
-                     end_idx = start_idx + images.size(0)
-                     batch_paths = [loader.dataset.paths[i] for i in range(start_idx, min(end_idx, len(loader.dataset)))]
-                     local_paths.extend(batch_paths)
-            except:
-                pass
-
-    # 2. Gather data from all GPUs to the main process
-    # Convert lists to tensors for gathering
-    local_preds_tensor = torch.tensor(local_preds, dtype=torch.int, device=device)
-    local_labels_tensor = torch.tensor(local_labels, dtype=torch.int, device=device)
+        dist.all_gather_object(gathered_preds, local_preds)
+        dist.all_gather_object(gathered_labels, local_labels)
+        
+        # فقط rank 0 همه رو concat کنه
+        if is_main:
+            all_preds = []
+            all_labels = []
+            for p_list, l_list in zip(gathered_preds, gathered_labels):
+                all_preds.extend(p_list)
+                all_labels.extend(l_list)
+    else:
+        # single GPU
+        all_preds = local_preds
+        all_labels = local_labels
     
-    # Gather sizes first to handle variable batch sizes across GPUs
-    local_size = torch.tensor([local_preds_tensor.size(0)], dtype=torch.long, device=device)
-    gathered_sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered_sizes, local_size)
-    max_size = max([s.item() for s in gathered_sizes])
-    
-    # Pad tensors to max size to allow all_gather
-    padded_preds = torch.zeros(max_size, dtype=torch.int, device=device)
-    padded_preds[:local_size] = local_preds_tensor
-    padded_labels = torch.zeros(max_size, dtype=torch.int, device=device)
-    padded_labels[:local_size] = local_labels_tensor
-    
-    gathered_preds = [torch.zeros_like(padded_preds) for _ in range(dist.get_world_size())]
-    gathered_labels = [torch.zeros_like(padded_labels) for _ in range(dist.get_world_size())]
-    
-    dist.all_gather(gathered_preds, padded_preds)
-    dist.all_gather(gathered_labels, padded_labels)
-    
-    # 3. Process and Save only on Main Process
+    # فقط روی main process ذخیره کن
     if is_main:
-        all_preds = []
-        all_labels = []
-        # Reconstruct full lists removing padding
-        for i, size_tensor in enumerate(gathered_sizes):
-            size = size_tensor.item()
-            all_preds.extend(gathered_preds[i][:size].cpu().numpy())
-            all_labels.extend(gathered_labels[i][:size].cpu().numpy())
-            
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
         
-        # Gather paths (paths are strings, handled separately on CPU)
-        # Since dataset order is deterministic with proper seed, we can just grab local paths 
-        # if we were the main process, but for DDP we need to gather strings which is complex.
-        # SIMPLIFICATION: We rely on the fact that order is preserved.
-        # If paths are needed for all samples, complex string gathering is needed.
-        # For now, we will generate paths if not available or just use indices.
-        
-        # To fix the "paths" issue perfectly in DDP, we assume the main process generates the report
-        # but needs the paths from all processes. 
-        # A quick fix is to assume the order matches the dataset or just use Sample_ID.
-        # Let's assume paths are complex to gather and stick to indices for correctness of stats.
-        
         total_samples = len(all_labels)
-        
-        # Calculate Statistics
         correct = np.sum(all_preds == all_labels)
-        incorrect = total_samples - correct
         accuracy = correct / total_samples * 100 if total_samples > 0 else 0
         
-        # Confusion Matrix components
         TP = np.sum((all_preds == 1) & (all_labels == 1))
         TN = np.sum((all_preds == 0) & (all_labels == 0))
         FP = np.sum((all_preds == 1) & (all_labels == 0))
@@ -575,7 +526,7 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble",
         precision = TP / (TP + FP) if (TP + FP) > 0 else 0
         recall = TP / (TP + FN) if (TP + FN) > 0 else 0
         specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
-    
+        
         with open(save_path, 'w') as f:
             f.write("-" * 100 + "\n")
             f.write("SUMMARY STATISTICS:\n")
@@ -584,35 +535,27 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble",
             f.write(f"Precision: {precision:.4f}\n")
             f.write(f"Recall: {recall:.4f}\n")
             f.write(f"Specificity: {specificity:.4f}\n")
+            f.write("\nConfusion Matrix:\n")
+            f.write(f" Predicted Real    Predicted Fake\n")
+            f.write(f" Actual Real {TN:<12} {FP:<12}\n")
+            f.write(f" Actual Fake {FN:<12} {TP:<12}\n")
             f.write("\n")
-            f.write("Confusion Matrix:\n")
-            f.write(f"                 Predicted Real  Predicted Fake\n")
-            f.write(f"    Actual Real            {TN:<12}    {FP:<12}\n")
-            f.write(f"    Actual Fake            {FN:<12}    {TP:<12}\n")
-            f.write("\n")
-            f.write(f"Correct Predictions: {correct} ({accuracy:.2f}%)\n")
-            f.write(f"Incorrect Predictions: {incorrect} ({100-accuracy:.2f}%)\n")
-            f.write("\n")
+            f.write(f"Correct: {correct} ({accuracy:.2f}%)\n")
+            f.write(f"Incorrect: {total_samples - correct} ({100-accuracy:.2f}%)\n")
+            f.write("\n" + "=" * 100 + "\n")
+            f.write("SAMPLE-BY-SAMPLE (برای McNemar):\n")
             f.write("=" * 100 + "\n")
-            f.write("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):\n")
-            f.write("=" * 100 + "\n")
-            header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}\n"
+            header = f"{'Sample_ID':<10} {'True_Label':<12} {'Predicted':<12} {'Correct':<10}\n"
             f.write(header)
             f.write("-" * 100 + "\n")
-            
             for i in range(total_samples):
-                pred = all_preds[i]
-                label = all_labels[i]
-                is_correct = "Yes" if pred == label else "No"
-                
-                # Since gathering paths in DDP is complex, we use Sample_ID or empty string
-                # But logically order should be preserved.
-                path = f"Sample_{i}" # Fallback
-                
-                line = f"{i+1:<10} {path:<60} {label:<12} {pred:<15} {is_correct:<10}\n"
+                pred = int(all_preds[i])
+                label = int(all_labels[i])
+                correct_str = "Yes" if pred == label else "No"
+                line = f"{i+1:<10} {label:<12} {pred:<12} {correct_str:<10}\n"
                 f.write(line)
-    
-        print(f"McNemar test info saved to: {save_path}")
+        
+        print(f"McNemar report ذخیره شد: {save_path}")
 
 
 # ================== MAIN FUNCTION ==================
