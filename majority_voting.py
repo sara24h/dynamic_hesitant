@@ -211,7 +211,7 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble",
                 line = f"{i+1:<8} {label:<8} {pred:<8} {correct_str:<10} {sample_id}\n"
                 f.write(line)
         
-        print(f"McNemar report saved → {save_path}")}")
+        print(f"McNemar report saved → {save_path}")
 
 
 # ================== CHECKPOINT SAVING FUNCTION (PT FORMAT) ==================
