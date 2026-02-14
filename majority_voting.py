@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, SequentialSampler
 import os
 from tqdm import tqdm
 import numpy as np
@@ -448,11 +448,11 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
     print("="*70)
 
 
-# ================== SAVE PREDICTION LOG FUNCTION ==================
+# ================== SAVE PREDICTION LOG FUNCTION (FIXED) ==================
 def save_prediction_log(ensemble, test_loader, device, save_path, is_main):
     """
     ذخیره لیست پیش‌بینی‌ها و آمار کامل در یک فایل متنی.
-    این تابع فقط روی پردازنده اصلی اجرا می‌شود.
+    فقط روی مجموعه تست اجرا می‌شود.
     """
     if not is_main or test_loader is None:
         return
@@ -461,17 +461,25 @@ def save_prediction_log(ensemble, test_loader, device, save_path, is_main):
     print("GENERATING PREDICTION LOG FILE")
     print("="*70)
 
+    # استخراج مدل (حتی اگر داخل DDP باشد)
     model = ensemble.module if hasattr(ensemble, 'module') else ensemble
     model.eval()
 
-    # استخراج دیتاست کامل (بدون Subset یا DistributedSampler)
-    full_dataset = test_loader.dataset
-    if hasattr(full_dataset, 'dataset'):
-        full_dataset = full_dataset.dataset
+    # استخراج دیتاست پایه از داخل DataLoader
+    # ممکن است test_loader شامل DistributedSampler یا Subset باشد
+    base_dataset = test_loader.dataset
+    if hasattr(base_dataset, 'dataset'):
+        base_dataset = base_dataset.dataset
 
-    # اجرای اینفرنس روی کل دیتاست به صورت ترتیبی برای لاگ کردن
-    # از batch_size=1 استفاده می‌کنیم تا مسیر فایل‌ها دقیق باشد
-    log_loader = DataLoader(full_dataset, batch_size=1, shuffle=False, num_workers=0)
+    # ایجاد یک DataLoader جدید که کل دیتاست تست را ترتیبی پیمایش کند
+    # این کار برای اطمینان از ترتیب صحیح در خروجی است
+    log_loader = DataLoader(
+        base_dataset, 
+        batch_size=1, 
+        shuffle=False, 
+        num_workers=0, 
+        sampler=SequentialSampler(base_dataset)
+    )
 
     lines = []
     
@@ -479,6 +487,7 @@ def save_prediction_log(ensemble, test_loader, device, save_path, is_main):
     TP, TN, FP, FN = 0, 0, 0, 0
     total_samples = 0
     correct_count = 0
+    sample_id = 0
 
     # هدر جدول نمونه‌ها
     lines.append("="*100)
@@ -488,20 +497,15 @@ def save_prediction_log(ensemble, test_loader, device, save_path, is_main):
     lines.append(header)
     lines.append("-"*100)
 
-    for idx in tqdm(range(len(full_dataset)), desc="Logging predictions"):
-        try:
-            image, label = full_dataset[idx]
-            path, _ = get_sample_info(full_dataset, idx)
-        except Exception as e:
-            print(f"Error getting sample {idx}: {e}")
-            continue
-
-        image = image.unsqueeze(0).to(device)
-        label_int = int(label)
+    for image, label in tqdm(log_loader, desc="Logging predictions", total=len(base_dataset)):
+        image = image.to(device)
+        # label معمولاً شکل [1] دارد
+        label_int = int(label.item())
         
         with torch.no_grad():
             output, _ = model(image)
         
+        # خروجی مدل: logits هستند. اگر > 0 باشد کلاس 1 (Real) است
         pred_int = int(output.squeeze().item() > 0)
         
         is_correct = (pred_int == label_int)
@@ -517,13 +521,21 @@ def save_prediction_log(ensemble, test_loader, device, save_path, is_main):
             else: TN += 1
         
         total_samples += 1
+        sample_id += 1
 
-        # افزودن به لیست خروجی
-        filename = os.path.basename(path)
+        # دریافت مسیر فایل (اگر ممکن باشد)
+        try:
+            # اندیس واقعی در دیتاست پایه (چون ترتیبی پیمایش می‌کنیم همان sample_id-1 است)
+            path, _ = get_sample_info(base_dataset, sample_id - 1)
+            filename = os.path.basename(path)
+        except Exception:
+            filename = f"Sample_{sample_id-1}"
+        
+        # کوتاه کردن نام فایل اگر خیلی طولانی باشد
         if len(filename) > 55:
             filename = filename[:25] + "..." + filename[-27:]
             
-        line = f"{idx+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
+        line = f"{sample_id:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
         lines.append(line)
 
     # محاسبه آمار نهایی
@@ -533,7 +545,7 @@ def save_prediction_log(ensemble, test_loader, device, save_path, is_main):
     rec = TP / (TP + FN) if (TP + FN) > 0 else 0
     spec = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    # ساخت رشته خروجی نهایی
+    # ساخت رشته خروجی نهایی (اول آمار، بعد لیست)
     output_str = []
     output_str.append("-" * 100)
     output_str.append("SUMMARY STATISTICS:")
@@ -548,7 +560,9 @@ def save_prediction_log(ensemble, test_loader, device, save_path, is_main):
     output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
     output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
     output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
-    output_str.append("\n" + "\n".join(lines))
+    
+    # اضافه کردن لیست نمونه‌ها
+    output_str.extend(lines)
 
     # ذخیره فایل
     with open(save_path, 'w') as f:
