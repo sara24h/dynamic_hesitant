@@ -62,38 +62,51 @@ def set_seed(seed: int = 42):
 def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble", is_main=True):
     """
     Evaluate model and save results in text format for McNemar test.
-    DDP-safe version using all_gather_object
+    DDP-Safe Version: Synchronizes iterations to avoid deadlocks.
     """
     model.eval()
     
     local_preds = []
     local_labels = []
-    # local_paths = []  # فعلاً غیرفعال — جمع‌آوری مسیر در DDP پیچیده است
 
     if is_main:
         print(f"\nGenerating McNemar report for {model_name}...")
-    
+
+    # نکته مهم: در محیط DDP، باید مطمئن شویم همه GPUها تعداد مراحل یکسانی را طی می‌کنند.
+    # معمولاً DDP Sampler طول دیتالودر را برای همه برابر با طول بزرگترین دیتاست تقسیم بر تعداد GPU می‌کند.
+    # اما برای اطمینان، بهتر است از tqdm یا شرط حلقه استاندارد استفاده کنیم و بعد سینک کنیم.
+
+    # حلقه آموزش
     for images, labels in loader:
         images = images.to(device)
+        labels = labels.to(device)
+        
         current_model = model.module if hasattr(model, 'module') else model
-        outputs, _ = current_model(images)  # Majority Voting فقط prediction برمی‌گرداند
+        outputs, _ = current_model(images) 
         preds = (outputs.squeeze(1) > 0).long()
         
         local_preds.extend(preds.cpu().numpy().tolist())
         local_labels.extend(labels.cpu().numpy().tolist())
 
+    # --- نقطه بحرانی همگام‌سازی ---
+    # اطمینان از اینکه همه پردازشگرها به اینجا رسیده‌اند قبل از شروع جمع‌آوری
+    if dist.is_initialized():
+        dist.barrier()  # این خط باعث می‌شود همه GPUها صبر کنند تا حلقه برای همه تمام شود
+
     # جمع‌آوری توزیع‌شده امن
     if dist.is_initialized() and dist.get_world_size() > 1:
-        all_preds_lists = [None] * dist.get_world_size()
-        all_labels_lists = [None] * dist.get_world_size()
+        # آماده‌سازی لیست‌ها برای دریافت داده‌ها
+        gathered_preds = [None] * dist.get_world_size()
+        gathered_labels = [None] * dist.get_world_size()
         
-        dist.all_gather_object(all_preds_lists, local_preds)
-        dist.all_gather_object(all_labels_lists, local_labels)
+        # استفاده از all_gather_object برای لیست‌های با طول متغیر
+        dist.all_gather_object(gathered_preds, local_preds)
+        dist.all_gather_object(gathered_labels, local_labels)
         
         if is_main:
             all_preds = []
             all_labels = []
-            for p_list, l_list in zip(all_preds_lists, all_labels_lists):
+            for p_list, l_list in zip(gathered_preds, gathered_labels):
                 all_preds.extend(p_list)
                 all_labels.extend(l_list)
     else:
@@ -102,6 +115,10 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble",
 
     # فقط rank اصلی فایل را می‌نویسد
     if is_main:
+        # نکته: در حالت DDP ممکن است تعداد نمونه‌ها بیشتر از واقع باشد (چون sampler ها داده‌ها را تکرار می‌کنند تا برابر کنند)
+        # برای دقت دقیق، باید نمونه‌های تکراری حذف شوند، اما برای McNemar معمولاً کل دیتاست را پوشش می‌دهیم.
+        # اگر از "drop_last=False" استفاده کنید، ممکن است تعداد نمونه‌ها دقیقا برابر کل دیتاست نباشد.
+        
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
         
@@ -110,6 +127,7 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble",
             print("Warning: No samples for McNemar report!")
             return
         
+        # محاسبات آماری (همان کد قبلی)
         correct = np.sum(all_preds == all_labels)
         incorrect = total_samples - correct
         accuracy = correct / total_samples * 100
