@@ -31,9 +31,7 @@ from visualization_utils import GradCAM, generate_lime_explanation, generate_vis
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
-    """
-    تنظیم Seed برای تکرارپذیری نتایج (Reproducibility)
-    """
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -587,7 +585,7 @@ def main():
     parser.add_argument('--num_lime_samples', type=int, default=5)
     
     parser.add_argument('--dataset', type=str, required=True,
-                       choices=['wild', 'real_fake', 'deepfake_lab', 'uadfV', 'custom_genai', 'custom_genai_v2', 'real_fake_dataset'])
+                       choices=['wild', 'hard_fake_real', 'deepfake_lab', 'uadfV', 'custom_genai', 'custom_genai_v2', 'real_fake_dataset'])
     
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
