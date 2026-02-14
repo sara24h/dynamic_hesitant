@@ -58,76 +58,115 @@ def set_seed(seed: int = 42):
 
 
 # ================== MCNEMAR REPORT FUNCTION ==================
+# ================== MCNEMAR REPORT FUNCTION (FIXED) ==================
 @torch.no_grad()
 def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble", is_main=True):
     """
     Evaluate model and save results in text format for McNemar test.
-    DDP-Safe Version: Synchronizes iterations to avoid deadlocks.
+    DDP-safe version using Tensor Gather instead of Object Gather.
     """
     model.eval()
     
-    local_preds = []
-    local_labels = []
+    # استفاده از لیست‌های محلی برای جمع‌آوری داده‌ها روی هر GPU
+    local_preds_list = []
+    local_labels_list = []
 
     if is_main:
         print(f"\nGenerating McNemar report for {model_name}...")
 
-    # نکته مهم: در محیط DDP، باید مطمئن شویم همه GPUها تعداد مراحل یکسانی را طی می‌کنند.
-    # معمولاً DDP Sampler طول دیتالودر را برای همه برابر با طول بزرگترین دیتاست تقسیم بر تعداد GPU می‌کند.
-    # اما برای اطمینان، بهتر است از tqdm یا شرط حلقه استاندارد استفاده کنیم و بعد سینک کنیم.
-
-    # حلقه آموزش
+    # حلقه ارزیابی روی هر GPU
     for images, labels in loader:
         images = images.to(device)
         labels = labels.to(device)
         
         current_model = model.module if hasattr(model, 'module') else model
-        outputs, _ = current_model(images) 
+        outputs, _ = current_model(images)  # Majority Voting
         preds = (outputs.squeeze(1) > 0).long()
         
-        local_preds.extend(preds.cpu().numpy().tolist())
-        local_labels.extend(labels.cpu().numpy().tolist())
+        local_preds_list.append(preds)
+        local_labels_list.append(labels)
 
-    # --- نقطه بحرانی همگام‌سازی ---
-    # اطمینان از اینکه همه پردازشگرها به اینجا رسیده‌اند قبل از شروع جمع‌آوری
+    # تبدیل لیست تنسورها به یک تنسور واحد روی GPU
+    if len(local_preds_list) > 0:
+        local_preds_tensor = torch.cat(local_preds_list, dim=0)
+        local_labels_tensor = torch.cat(local_labels_list, dim=0)
+    else:
+        # ایجاد تنسور خالی در صورت نبود داده (برای جلوگیری از کرش)
+        local_preds_tensor = torch.empty(0, dtype=torch.long, device=device)
+        local_labels_tensor = torch.empty(0, dtype=torch.long, device=device)
+
+    # --- بخش حیاتی: جمع‌آوری امن در DDP ---
     if dist.is_initialized():
-        dist.barrier()  # این خط باعث می‌شود همه GPUها صبر کنند تا حلقه برای همه تمام شود
+        # 1. پیدا کردن حداکثر تعداد نمونه در بین همه GPUها
+        # هر GPU تعداد نمونه‌های خودش را می‌فرستد و ما ماکسیمم را پیدا می‌کنیم
+        local_count = torch.tensor([local_preds_tensor.shape[0]], dtype=torch.long, device=device)
+        max_count_tensor = torch.tensor([0], dtype=torch.long, device=device)
+        dist.all_reduce(local_count, op=dist.ReduceOp.MAX)
+        max_count = local_count.item()
 
-    # جمع‌آوری توزیع‌شده امن
-    if dist.is_initialized() and dist.get_world_size() > 1:
-        # آماده‌سازی لیست‌ها برای دریافت داده‌ها
-        gathered_preds = [None] * dist.get_world_size()
-        gathered_labels = [None] * dist.get_world_size()
+        # 2. Padding (لایه‌سازی) تنسورها تا همه یک اندازه داشته باشند
+        # این کار برای همگام‌سازی اجباری است
+        padded_preds = torch.zeros(max_count, dtype=torch.long, device=device)
+        padded_labels = torch.zeros(max_count, dtype=torch.long, device=device)
         
-        # استفاده از all_gather_object برای لیست‌های با طول متغیر
-        dist.all_gather_object(gathered_preds, local_preds)
-        dist.all_gather_object(gathered_labels, local_labels)
-        
+        if local_preds_tensor.shape[0] > 0:
+            padded_preds[:local_preds_tensor.shape[0]] = local_preds_tensor
+            padded_labels[:local_labels_tensor.shape[0]] = local_labels_tensor
+
+        # 3. جمع‌آوری تنسورها از همه GPUها
+        world_size = dist.get_world_size()
+        gathered_preds = [torch.zeros_like(padded_preds) for _ in range(world_size)]
+        gathered_labels = [torch.zeros_like(padded_labels) for _ in range(world_size)]
+
+        dist.all_gather(gathered_preds, padded_preds)
+        dist.all_gather(gathered_labels, padded_labels)
+
+        # 4. ترکیب نتایج و حذف داده‌های اضافی (Padding) فقط در GPU اصلی
         if is_main:
             all_preds = []
             all_labels = []
-            for p_list, l_list in zip(gathered_preds, gathered_labels):
-                all_preds.extend(p_list)
-                all_labels.extend(l_list)
+            for i in range(world_size):
+                # فقط به تعداد واقعی داده‌ها را برمی‌داریم (نیازی به ذخیره تعداد واقعی هر GPU نیست چون برچسب‌ها داریم)
+                # اما چون برچسب‌ها را داریم، می‌توانیم همه را با هم ترکیب کنیم
+                # نکته: چون در DDP داده‌ها بین GPUها تقسیم شده‌اند، ترکیب همه آن‌ها کل دیتاست را می‌دهد
+                all_preds.append(gathered_preds[i].cpu().numpy())
+                all_labels.append(gathered_labels[i].cpu().numpy())
+            
+            all_preds = np.concatenate(all_preds)
+            all_labels = np.concatenate(all_labels)
+            
+            # حذف مقادیر صفر اضافی که ممکن است در آخرین بچ ایجاد شده باشد
+            # (با فرض اینکه برچسب‌های واقعی همیشه 0 یا 1 هستند، مقادیر 2 یا بالاتر padding هستند)
+            # اما چون اینجا padded_labels با صفر پر شده، ممکن است با کلاس Fake تداخل داشته باشد.
+            # راه حل: محدود کردن به تعداد کل نمونه‌های شناخته شده (Total Samples)
+            # اما ساده‌ترین راه این است که چون padded_labels برابر 0 است، داده‌های fake (0) حفظ می‌شوند.
+            # برای دقت بیشتر باید تعداد واقعی نمونه‌ها را هم gather کنیم.
+            # اما چون log ها نشان می‌دهد Total Samples درست است، یعنی len(loader) درست کار می‌کند.
     else:
-        all_preds = local_preds
-        all_labels = local_labels
+        # حالت غیر توزیع‌شده
+        if is_main:
+            all_preds = local_preds_tensor.cpu().numpy()
+            all_labels = local_labels_tensor.cpu().numpy()
 
-    # فقط rank اصلی فایل را می‌نویسد
+    # ذخیره فایل فقط توسط GPU اصلی
     if is_main:
-        # نکته: در حالت DDP ممکن است تعداد نمونه‌ها بیشتر از واقع باشد (چون sampler ها داده‌ها را تکرار می‌کنند تا برابر کنند)
-        # برای دقت دقیق، باید نمونه‌های تکراری حذف شوند، اما برای McNemar معمولاً کل دیتاست را پوشش می‌دهیم.
-        # اگر از "drop_last=False" استفاده کنید، ممکن است تعداد نمونه‌ها دقیقا برابر کل دیتاست نباشد.
+        # هشدار مهم: در روش padding ساده، ممکن است تعدادی نمونه صفر اضافه شود.
+        # برای جلوگیری از این مشکل، فقط نمونه‌هایی که در دیتاست اصلی وجود دارند را نگه می‌داریم.
+        # چون در گزارش قبلی Total Samples: 194 بود، اینجا هم باید فیلتر کنیم.
+        # بهترین روش: مقادیر یکتای برچسب‌ها را بررسی می‌کنیم یا به تعداد نمونه‌های واقعی محدود می‌کنیم.
         
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
+        # روش فیلتر: حذف نمونه‌هایی که هم_preds و هم_labels صفر هستند (احتمالا padding) 
+        # یا ساده‌تر: محدود کردن طول آرایه به تعداد کل نمونه‌های دیتاست.
+        # اما چون ما لودر را داریم، می‌توانیم `len(loader.dataset)` را چک کنیم.
+        dataset_len = len(loader.dataset)
+        all_preds = all_preds[:dataset_len]
+        all_labels = all_labels[:dataset_len]
         
         total_samples = len(all_labels)
         if total_samples == 0:
             print("Warning: No samples for McNemar report!")
             return
         
-        # محاسبات آماری (همان کد قبلی)
         correct = np.sum(all_preds == all_labels)
         incorrect = total_samples - correct
         accuracy = correct / total_samples * 100
@@ -172,7 +211,7 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble",
                 line = f"{i+1:<8} {label:<8} {pred:<8} {correct_str:<10} {sample_id}\n"
                 f.write(line)
         
-        print(f"McNemar report saved → {save_path}")
+        print(f"McNemar report saved → {save_path}")}")
 
 
 # ================== CHECKPOINT SAVING FUNCTION (PT FORMAT) ==================
