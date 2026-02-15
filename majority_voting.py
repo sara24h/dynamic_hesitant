@@ -281,47 +281,119 @@ def get_test_indices(test_loader):
     elif hasattr(test_loader.dataset, 'indices'): return test_loader.dataset.indices
     else: return list(range(len(test_loader.dataset)))
 
+# ================== SAVE PREDICTION LOG (FULL VERSION) ==================
 def save_prediction_log(ensemble, test_loader, device, save_path, is_main):
+    """
+    ذخیره لیست پیش‌بینی‌ها و چاپ آمار کامل در کنسول.
+    """
     if not is_main or test_loader is None: return
-    print("\n" + "="*70); print("GENERATING PREDICTION LOG FILE"); print("="*70)
+
+    print("\n" + "="*70)
+    print("GENERATING PREDICTION LOG FILE (TEST SET ONLY)")
+    print("="*70)
+
     model = ensemble.module if hasattr(ensemble, 'module') else ensemble
     model.eval()
+
+    # استخراج دیتاست پایه
     base_dataset = test_loader.dataset
-    if hasattr(base_dataset, 'dataset'): base_dataset = base_dataset.dataset
+    if hasattr(base_dataset, 'dataset'):
+        base_dataset = base_dataset.dataset
+
+    # پیدا کردن اندیس‌های تست
     test_indices = get_test_indices(test_loader)
+    print(f"Found {len(test_indices)} test samples to log.")
+
     lines = []
     TP, TN, FP, FN = 0, 0, 0, 0
     total_samples = 0
     correct_count = 0
-    lines.append("="*100); lines.append("PREDICTIONS LOG"); lines.append("="*100)
+
+    lines.append("="*100)
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+    lines.append("="*100)
+    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
+    lines.append(header)
+    lines.append("-"*100)
+
     for i, global_idx in enumerate(tqdm(test_indices, desc="Logging predictions")):
         try:
             image, label = base_dataset[global_idx]
             path, _ = get_sample_info(base_dataset, global_idx)
-        except: continue
+        except Exception as e:
+            print(f"Error loading sample {global_idx}: {e}")
+            continue
+
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
+        
         with torch.no_grad():
             output, _ = model(image)
+        
         pred_int = int(output.squeeze().item() > 0)
+        
         is_correct = (pred_int == label_int)
         if is_correct: correct_count += 1
-        if label_int == 1:
+
+        # محاسبه ماتریس آشفتگی
+        if label_int == 1: # Real
             if pred_int == 1: TP += 1
             else: FN += 1
-        else:
+        else: # Fake
             if pred_int == 1: FP += 1
             else: TN += 1
+        
         total_samples += 1
+        sample_id = i + 1
+
         filename = os.path.basename(path)
-        line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
+        if len(filename) > 55:
+            filename = filename[:25] + "..." + filename[-27:]
+            
+        line = f"{sample_id:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
         lines.append(line)
-    
+
+    # محاسبه آمار نهایی
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
-    output_str = [f"Accuracy: {acc*100:.2f}%"]
+    prec = TP / (TP + FP) if (TP + FP) > 0 else 0
+    rec = TP / (TP + FN) if (TP + FN) > 0 else 0
+    spec = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+    # ============================================
+    # چاپ خروجی در کنسول (مشابه درخواست شما)
+    # ============================================
+    print(f"\nPrecision: {prec:.4f}")
+    print(f"Recall: {rec:.4f}")
+    print(f"Specificity: {spec:.4f}")
+    print(f"\nConfusion Matrix:")
+    print(f"                 Predicted Real  Predicted Fake")
+    print(f"    Actual Real      {TP:<15} {FN:<15}")
+    print(f"    Actual Fake      {FP:<15} {TN:<15}")
+    print(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    print(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
+    print("="*70)
+
+    # ساخت محتوای فایل متنی
+    output_str = []
+    output_str.append("-" * 100)
+    output_str.append("SUMMARY STATISTICS:")
+    output_str.append("-" * 100)
+    output_str.append(f"Accuracy: {acc*100:.2f}%")
+    output_str.append(f"Precision: {prec:.4f}")
+    output_str.append(f"Recall: {rec:.4f}")
+    output_str.append(f"Specificity: {spec:.4f}")
+    output_str.append("\nConfusion Matrix:")
+    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
+    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
+    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
+    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
     output_str.extend(lines)
-    with open(save_path, 'w') as f: f.write("\n".join(output_str))
+
+    with open(save_path, 'w') as f:
+        f.write("\n".join(output_str))
+    
     print(f"✅ Prediction log saved to: {save_path}")
 
 # ================== DISTRIBUTED SETUP ==================
