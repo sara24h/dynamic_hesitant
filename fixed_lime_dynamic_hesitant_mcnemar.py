@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 import os
 from tqdm import tqdm
 import numpy as np
@@ -13,14 +13,15 @@ import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# فرض بر این است که این فایل‌ها در مسیر شما موجود هستند
 from metrics_utils import plot_roc_and_f1
-warnings.filterwarnings("ignore")
-
 from dataset_utils import (
     UADFVDataset, CustomGenAIDataset, NewGenAIDataset,
-    create_dataloaders, get_sample_info, worker_init_fn
+    create_dataloaders, get_sample_info
 )
-from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
+from visualization_utils import generate_visualizations
+
+warnings.filterwarnings("ignore")
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -33,14 +34,14 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 # ================== UNIFIED FINAL EVALUATION ==================
-def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, is_main):
+def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
     """
-    این تابع همه کارهای ارزیابی نهایی را در یک مرحله انجام می‌دهد تا اعداد قطعا یکسان باشند.
+    این تابع همه کارهای ارزیابی نهایی را در یک مرحله انجام می‌دهد:
     1. پیش‌بینی روی کل دیتاست (تست اصلی).
-    2. چاپ نتایج در کنسول.
+    2. چاپ نتایج دقیق در کنسول.
     3. ذخیره لاگ مک‌نمار.
     """
-    if not is_main: return 0.0
+    if not is_main: return 0.0, None, None
 
     model.eval()
     
@@ -55,12 +56,8 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     elif hasattr(test_loader_full.dataset, 'indices'):
         test_indices = test_loader_full.dataset.indices
     else:
-        # اگر اندیس نبود، فرض بر این است که کل دیتاست تست است
         test_indices = list(range(len(base_dataset)))
 
-    all_preds = []
-    all_labels = []
-    
     lines = []
     lines.append("="*100)
     lines.append("SAMPLE-BY-SAMPLE PREDICTIONS")
@@ -70,6 +67,8 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     lines.append("-"*100)
 
     TP, TN, FP, FN = 0, 0, 0, 0
+    all_probs = []
+    all_labels = []
     
     print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
     
@@ -92,8 +91,8 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             prob = torch.sigmoid(output.squeeze()).item()
             pred_int = int(prob > 0.5)
             
-            # جمع‌آوری برای متریک‌ها
-            all_preds.append(prob)
+            # جمع‌آوری برای ROC
+            all_probs.append(prob)
             all_labels.append(label_int)
             
             # محاسبه ماتریس آشفتگی
@@ -116,7 +115,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     correct_count = TP + TN
     acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
     
-    # --- چاپ نتایج در کنسول ---
+    # --- چاپ نتایج در کنسول (این اعداد قطعا صحیح هستند) ---
     print(f"\n{'='*70}")
     print(f"FINAL TEST SET RESULTS (Unified)")
     print(f"{'='*70}")
@@ -144,12 +143,18 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
         f.write("\n".join(output_str))
     print(f"✅ Prediction log saved to: {log_path}")
 
-    # --- ذخیره نتایج برای ROC ---
-    # بازگرداندن آرایه‌های numpy برای استفاده در تابع ROC
-    return np.array(all_labels), np.array(all_preds), acc
+    # --- ویژوالایزیشن ---
+    vis_dir = os.path.join(save_dir, 'visualizations')
+    generate_visualizations(
+        model, test_loader_full, device, vis_dir, model_names,
+        args.num_grad_cam_samples, args.num_lime_samples,
+        args.dataset, is_main)
+
+    # بازگرداندن داده‌ها برای ROC
+    return acc, np.array(all_labels), np.array(all_probs)
+
 
 # ================== MODEL CLASSES ==================
-# (کلاس‌های مدل دقیقاً مانند قبل بدون تغییر)
 class MultiModelNormalization(nn.Module):
     def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
         super().__init__()
@@ -245,50 +250,54 @@ class FuzzyHesitantEnsemble(nn.Module):
             return final_output, final_weights, all_memberships, outputs
         return final_output, final_weights
 
-# ================== TRAIN & EVAL FUNCTIONS ==================
-# (توابع آموزش و ارزیابی حین آموزش برای اختصار حذف نشدند اما تغییری ندارند)
-# ... (توابع load_pruned_models, evaluate_accuracy_ddp, train_hesitant_fuzzy دقیقاً مانند قبل هستند) ...
 
+# ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     try:
         from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     except ImportError:
         raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
+
     models = []
     if is_main: print(f"Loading {len(model_paths)} pruned models...")
     for i, path in enumerate(model_paths):
-        if not os.path.exists(path): continue
+        if not os.path.exists(path):
+            if is_main: print(f" [WARNING] File not found: {path}")
+            continue
         try:
             ckpt = torch.load(path, map_location='cpu', weights_only=False)
             model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
             model.load_state_dict(ckpt['model_state_dict'])
             model = model.to(device).eval()
             models.append(model)
-        except: continue
+        except Exception as e:
+            if is_main: print(f" [ERROR] Failed to load {path}: {e}")
     if len(models) == 0: raise ValueError("No models loaded!")
     return models
 
+
+# ================== EVALUATION FUNCTIONS (Train Time) ==================
+@torch.no_grad()
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
-    total = 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
-        total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
     
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    # نکته: در ارزیابی حین آموزش هم بهتر است از طول واقعی استفاده کرد
-    # اما چون اینجا برای سلکت کردن بهترین مدل است، دقت تقریبی مشکلی ندارد.
-    # برای صحت بیشتر:
+    # نکته: در زمان آموزش برای انتخاب بهترین مدل، دقت تقریبی مشکلی ندارد
+    # اما برای صحت بیشتر از طول واقعی دیتاست استفاده می‌کنیم
     real_total = len(loader.dataset)
     
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     acc = 100. * correct_tensor.item() / real_total
     return acc
 
+
+# ================== TRAINING ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
@@ -297,35 +306,38 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
     best_val_acc = 0.0
-    history = {'train_loss': [], 'train_acc': [], 'val_acc': []}
+
+    if is_main:
+        print("="*70)
+        print("Training Fuzzy Hesitant Network")
+        print("="*70)
 
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
         ensemble_model.train()
-        train_loss = 0.0; train_correct = 0; train_total = 0
-        for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}', disable=not is_main):
+        
+        for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main):
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
             outputs, _, _, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
-            loss.backward(); optimizer.step()
-            train_loss += loss.item() * images.size(0)
-            pred = (outputs.squeeze(1) > 0).long()
-            train_correct += pred.eq(labels.long()).sum().item()
-            train_total += images.size(0)
-        
-        train_acc = 100. * train_correct / train_total
+            loss.backward()
+            optimizer.step()
+
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         scheduler.step()
-        
+
         if is_main:
-            print(f"Epoch {epoch+1}: Train Acc {train_acc:.2f}% | Val Acc {val_acc:.2f}%")
+            print(f"Epoch {epoch+1}/{num_epochs} | Val Acc: {val_acc:.2f}%")
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 torch.save({'hesitant_state_dict': hesitant_net.state_dict()}, os.path.join(save_dir, 'best_hesitant_fuzzy.pt'))
-                print(f"✓ Saved Best Model")
-    return best_val_acc, history
+                print(f"✓ Best model saved -> {val_acc:.2f}%")
+    
+    return best_val_acc
 
+
+# ================== DISTRIBUTED SETUP ==================
 def setup_distributed():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
@@ -334,51 +346,88 @@ def setup_distributed():
         dist.init_process_group(backend='nccl')
         torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
+        if rank == 0: print(f"Distributed: rank {rank}/{world_size}")
         return device, local_rank, rank, world_size
     else:
         return torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 0, 0, 1
 
 def cleanup_distributed():
-    if dist.is_initialized(): dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Optimized Fuzzy Hesitant Ensemble Training")
-    # آرگومان‌ها
+    # تمام آرگومان‌های لازم اضافه شدند
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--dataset', type=str, required=True)
+    parser.add_argument('--dataset', type=str, required=True, choices=['wild', 'hard_fake_real', 'deepfake_lab', 'uadfV', 'custom_genai', 'custom_genai_v2', 'real_fake_dataset'])
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
     parser.add_argument('--seed', type=int, default=42)
+    
+    # آرگومان‌های مدل
+    parser.add_argument('--num_memberships', type=int, default=3)
+    parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
+    parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
+    
+    # آرگومان‌های ویژوالایزیشن
+    parser.add_argument('--num_grad_cam_samples', type=int, default=5)
+    parser.add_argument('--num_lime_samples', type=int, default=5)
+    
     args = parser.parse_args()
 
+    if len(args.model_names) != len(args.model_paths):
+        raise ValueError("Number of model_names must match model_paths")
+
     set_seed(args.seed)
+    
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
+
+    if is_main:
+        print("="*70)
+        print(f"OPTIMIZED FUZZY HESITANT ENSEMBLE TRAINING")
+        print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
+        print("="*70)
 
     # نرمالیزیشن
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-    MEANS = DEFAULT_MEANS[:len(args.model_paths)]
-    STDS = DEFAULT_STDS[:len(args.model_paths)]
+    
+    num_models = len(args.model_paths)
+    if num_models > len(DEFAULT_MEANS):
+        MEANS = DEFAULT_MEANS + [DEFAULT_MEANS[-1]] * (num_models - len(DEFAULT_MEANS))
+        STDS = DEFAULT_STDS + [DEFAULT_STDS[-1]] * (num_models - len(DEFAULT_STDS))
+    else:
+        MEANS = DEFAULT_MEANS[:num_models]
+        STDS = DEFAULT_STDS[:num_models]
 
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    ensemble = FuzzyHesitantEnsemble(base_models, MEANS, STDS).to(device)
+    ensemble = FuzzyHesitantEnsemble(
+        base_models, MEANS, STDS,
+        num_memberships=args.num_memberships, 
+        freeze_models=True,
+        cum_weight_threshold=args.cum_weight_threshold,
+        hesitancy_threshold=args.hesitancy_threshold
+    ).to(device)
+
     if world_size > 1:
         ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
+    # دیتالودرهای آموزشی (توزیع شده)
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
 
-    best_val_acc, history = train_hesitant_fuzzy(
-        ensemble, train_loader, val_loader, args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
+    best_val_acc = train_hesitant_fuzzy(
+        ensemble, train_loader, val_loader,
+        args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
     # لود بهترین مدل
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
@@ -397,37 +446,23 @@ def main():
 
         # ===== اجرای ارزیابی یکپارچه =====
         # این تابع هم دقت را چاپ می‌کند، هم لاگ را ذخیره می‌کند
-        y_true, y_scores, final_acc = final_evaluation_unified(
-            ensemble_module, test_loader_full, device, args.save_dir, MODEL_NAMES, is_main
+        final_acc, y_true, y_scores = final_evaluation_unified(
+            ensemble_module, test_loader_full, device, args.save_dir, MODEL_NAMES, args, is_main
         )
-
-        # ===== ذخیره JSON نهایی =====
-        final_results = {
-            'ensemble_accuracy': final_acc,
-            'best_val_accuracy': float(best_val_acc)
-        }
-        with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
-            json.dump(final_results, f, indent=4)
 
         # ===== ذخیره مدل نهایی =====
         torch.save({
             'ensemble_state_dict': ensemble_module.state_dict(),
+            'hesitant_fuzzy_state_dict': ensemble_module.hesitant_fuzzy.state_dict(),
+            'test_accuracy': final_acc,
             'model_names': MODEL_NAMES,
             'means': MEANS,
             'stds': STDS
         }, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
 
-        # ===== ویژوالایزیشن =====
-        vis_dir = os.path.join(args.save_dir, 'visualizations')
-        generate_visualizations(
-            ensemble_module, test_loader_full, device, vis_dir, MODEL_NAMES,
-            args.num_grad_cam_samples if hasattr(args, 'num_grad_cam_samples') else 5, 
-            args.num_lime_samples if hasattr(args, 'num_lime_samples') else 5,
-            args.dataset, is_main)
-
     cleanup_distributed()
     
-    # رسم ROC بعد از Cleanup (چون تک‌پردازشی است)
+    # رسم ROC بعد از Cleanup
     if is_main:
         plot_roc_and_f1(
             ensemble_module,
