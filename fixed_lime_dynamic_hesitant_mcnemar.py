@@ -31,7 +31,6 @@ from visualization_utils import GradCAM, generate_lime_explanation, generate_vis
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
-
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -39,6 +38,131 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
+
+
+# ================== HELPER TO GET TEST INDICES ==================
+def get_test_indices(test_loader):
+    """
+    استخراج لیست اندیس‌های مربوط به تست از داخل DataLoader.
+    """
+    if hasattr(test_loader, 'sampler') and hasattr(test_loader.sampler, 'indices'):
+        return test_loader.sampler.indices
+    elif hasattr(test_loader.dataset, 'indices'):
+        return test_loader.dataset.indices
+    else:
+        return list(range(len(test_loader.dataset)))
+
+
+# ================== SAVE PREDICTION LOG (MCNEMAR FORMAT) ==================
+def save_prediction_log(model, test_loader, device, save_path, is_main):
+    """
+    ذخیره لیست پیش‌بینی‌ها دقیقاً روی همان داده‌های تستی که مدل دیده است.
+    این تابع برای تست مک‌نمار (McNemar Test) استفاده می‌شود.
+    """
+    if not is_main or test_loader is None: return
+
+    print("\n" + "="*70)
+    print("GENERATING PREDICTION LOG FILE (TEST SET ONLY)")
+    print("="*70)
+
+    model.eval()
+
+    # 1. استخراج دیتاست پایه
+    base_dataset = test_loader.dataset
+    if hasattr(base_dataset, 'dataset'):
+        base_dataset = base_dataset.dataset
+
+    # 2. پیدا کردن اندیس‌های تست
+    test_indices = get_test_indices(test_loader)
+    print(f"Found {len(test_indices)} test samples to log.")
+
+    lines = []
+    TP, TN, FP, FN = 0, 0, 0, 0
+    total_samples = 0
+    correct_count = 0
+
+    lines.append("="*100)
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+    lines.append("="*100)
+    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
+    lines.append(header)
+    lines.append("-"*100)
+
+    # 3. پیمایش فقط روی اندیس‌های تست
+    for i, global_idx in enumerate(tqdm(test_indices, desc="Logging predictions")):
+        try:
+            # گرفتن داده از دیتاست پایه با اندیس سراسری
+            image, label = base_dataset[global_idx]
+            # گرفتن نام فایل
+            path, _ = get_sample_info(base_dataset, global_idx)
+        except Exception as e:
+            print(f"Error loading sample {global_idx}: {e}")
+            continue
+
+        image = image.unsqueeze(0).to(device)
+        label_int = int(label)
+        
+        with torch.no_grad():
+            # مدل Fuzzy Ensemble خودش نرمالایزیشن را انجام می‌دهد
+            output = model(image)
+            
+            # استخراج خروجی اگر تاپل باشد (خروجی مدل (logits, weights) است)
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+                
+        pred_int = int(output.squeeze().item() > 0)
+        
+        is_correct = (pred_int == label_int)
+        if is_correct: correct_count += 1
+
+        # محاسبه ماتریس آشفتگی
+        if label_int == 1: # Real
+            if pred_int == 1: TP += 1
+            else: FN += 1
+        else: # Fake
+            if pred_int == 1: FP += 1
+            else: TN += 1
+        
+        total_samples += 1
+        sample_id = i + 1
+
+        # فرمت‌بندی نام فایل
+        filename = os.path.basename(path)
+        if len(filename) > 55:
+            filename = filename[:25] + "..." + filename[-27:]
+            
+        line = f"{sample_id:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
+        lines.append(line)
+
+    # محاسبه آمار نهایی
+    total = TP + TN + FP + FN
+    acc = (TP + TN) / total if total > 0 else 0
+    prec = TP / (TP + FP) if (TP + FP) > 0 else 0
+    rec = TP / (TP + FN) if (TP + FN) > 0 else 0
+    spec = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+    # ساخت خروجی نهایی
+    output_str = []
+    output_str.append("-" * 100)
+    output_str.append("SUMMARY STATISTICS:")
+    output_str.append("-" * 100)
+    output_str.append(f"Accuracy: {acc*100:.2f}%")
+    output_str.append(f"Precision: {prec:.4f}")
+    output_str.append(f"Recall: {rec:.4f}")
+    output_str.append(f"Specificity: {spec:.4f}")
+    output_str.append("\nConfusion Matrix:")
+    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
+    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
+    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
+    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
+    output_str.extend(lines)
+
+    with open(save_path, 'w') as f:
+        f.write("\n".join(output_str))
+    
+    print(f"✅ Prediction log saved to: {save_path}")
+    print("="*70)
 
 
 class MultiModelNormalization(nn.Module):
@@ -184,7 +308,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
 
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
-def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device,
+def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
                               name: str, mean: Tuple[float, float, float],
                               std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
@@ -466,98 +590,6 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-# ================== MCNEMAR REPORT FUNCTION ==================
-@torch.no_grad()
-def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble", is_main=True):
-    model.eval()
-    
-    # جمع‌آوری local پیش‌بینی‌ها و لیبل‌ها به صورت لیست
-    local_preds = []
-    local_labels = []
-    
-    if is_main:
-        print(f"\nGenerating McNemar report for {model_name}...")
-    
-    for images, labels in loader:
-        images = images.to(device)
-        current_model = model.module if hasattr(model, 'module') else model
-        outputs, _ = current_model(images)
-        preds = (outputs.squeeze(1) > 0).long()
-        
-        local_preds.extend(preds.cpu().numpy().tolist())  # به list ساده
-        local_labels.extend(labels.cpu().numpy().tolist())
-    
-    # جمع‌آوری از همه rankها با all_gather_object (بهترین برای variable size)
-    if dist.is_initialized():
-        world_size = dist.get_world_size()
-        # لیست‌های خالی برای دریافت داده همه rankها
-        gathered_preds = [None] * world_size
-        gathered_labels = [None] * world_size
-        
-        dist.all_gather_object(gathered_preds, local_preds)
-        dist.all_gather_object(gathered_labels, local_labels)
-        
-        # فقط rank 0 همه رو concat کنه
-        if is_main:
-            all_preds = []
-            all_labels = []
-            for p_list, l_list in zip(gathered_preds, gathered_labels):
-                all_preds.extend(p_list)
-                all_labels.extend(l_list)
-    else:
-        # single GPU
-        all_preds = local_preds
-        all_labels = local_labels
-    
-    # فقط روی main process ذخیره کن
-    if is_main:
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
-        
-        total_samples = len(all_labels)
-        correct = np.sum(all_preds == all_labels)
-        accuracy = correct / total_samples * 100 if total_samples > 0 else 0
-        
-        TP = np.sum((all_preds == 1) & (all_labels == 1))
-        TN = np.sum((all_preds == 0) & (all_labels == 0))
-        FP = np.sum((all_preds == 1) & (all_labels == 0))
-        FN = np.sum((all_preds == 0) & (all_labels == 1))
-        
-        precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-        recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-        specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
-        
-        with open(save_path, 'w') as f:
-            f.write("-" * 100 + "\n")
-            f.write("SUMMARY STATISTICS:\n")
-            f.write("-" * 100 + "\n")
-            f.write(f"Accuracy: {accuracy:.2f}%\n")
-            f.write(f"Precision: {precision:.4f}\n")
-            f.write(f"Recall: {recall:.4f}\n")
-            f.write(f"Specificity: {specificity:.4f}\n")
-            f.write("\nConfusion Matrix:\n")
-            f.write(f" Predicted Real    Predicted Fake\n")
-            f.write(f" Actual Real {TN:<12} {FP:<12}\n")
-            f.write(f" Actual Fake {FN:<12} {TP:<12}\n")
-            f.write("\n")
-            f.write(f"Correct: {correct} ({accuracy:.2f}%)\n")
-            f.write(f"Incorrect: {total_samples - correct} ({100-accuracy:.2f}%)\n")
-            f.write("\n" + "=" * 100 + "\n")
-            f.write("SAMPLE-BY-SAMPLE (برای McNemar):\n")
-            f.write("=" * 100 + "\n")
-            header = f"{'Sample_ID':<10} {'True_Label':<12} {'Predicted':<12} {'Correct':<10}\n"
-            f.write(header)
-            f.write("-" * 100 + "\n")
-            for i in range(total_samples):
-                pred = int(all_preds[i])
-                label = int(all_labels[i])
-                correct_str = "Yes" if pred == label else "No"
-                line = f"{i+1:<10} {label:<12} {pred:<12} {correct_str:<10}\n"
-                f.write(line)
-        
-        print(f"McNemar report ذخیره شد: {save_path}")
-
-
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Optimized Fuzzy Hesitant Ensemble Training")
@@ -721,10 +753,10 @@ def main():
         print(f"Model saved: {final_model_path}")
 
         # ==========================================
-        # NEW: Save McNemar Report for Ensemble
+        # Save Prediction Log (McNemar Format)
         # ==========================================
-        mcnemar_report_path = os.path.join(args.save_dir, 'mcnemar_ensemble_results.txt')
-        save_mcnemar_report(ensemble_module, test_loader, device, mcnemar_report_path, model_name="Fuzzy Hesitant Ensemble")
+        log_path = os.path.join(args.save_dir, 'prediction_log.txt')
+        save_prediction_log(ensemble_module, test_loader, device, log_path, is_main)
 
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         generate_visualizations(
@@ -733,7 +765,7 @@ def main():
             args.dataset, is_main)
 
     cleanup_distributed()
-
+    
     if is_main:
         plot_roc_and_f1(
             ensemble_module,
