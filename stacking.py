@@ -550,7 +550,7 @@ def main():
         ).to(device)
 
         if world_size > 1:
-            ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank])
+            ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
         if is_main:
             trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
