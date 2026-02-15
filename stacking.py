@@ -108,7 +108,7 @@ class StackingEnsemble(nn.Module):
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             
-            return final_output, dummy_weights, dummy_memberhips, stacked_logits
+            return final_output, dummy_weights, dummy_memberships, stacked_logits
         else:
             batch_size = x.size(0)
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
