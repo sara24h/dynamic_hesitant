@@ -582,6 +582,68 @@ def main():
     ensemble_test_acc, ensemble_weights = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
+    # ────────────────────────────────────────────────────────────────
+    #                ذخیره داده‌های ROC (فقط روی فرآیند اصلی)
+    # ────────────────────────────────────────────────────────────────
+    if is_main:
+        print("\nCollecting ROC data (y_true & y_score) ...")
+
+        all_y_true = []
+        all_y_score = []
+        all_y_pred = []
+
+        ensemble_module.eval()
+        with torch.no_grad():
+            for images, labels in tqdm(test_loader, desc="ROC collection"):
+                images = images.to(device)
+                labels = labels.to(device).float()
+
+                outputs, _ = ensemble_module(images, return_details=False)
+                probs = torch.sigmoid(outputs).squeeze(1)  # [0,1]
+
+                preds = (probs > 0.5).long()
+
+                all_y_true.append(labels.cpu())
+                all_y_score.append(probs.cpu())
+                all_y_pred.append(preds.cpu())
+
+        y_true = torch.cat(all_y_true).numpy()
+        y_score = torch.cat(all_y_score).numpy()
+        y_pred = torch.cat(all_y_pred).numpy()
+
+        print(f"→ Collected {len(y_true):,} samples for ROC curve")
+
+        # 1. ذخیره در JSON (ساختارمند)
+        roc_json_path = os.path.join(args.save_dir, "roc_data_test.json")
+        roc_data_json = {
+            "metadata": {
+                "seed": args.seed,
+                "dataset": args.dataset,
+                "num_samples": int(len(y_true)),
+                "positive_count": int(np.sum(y_true)),
+                "negative_count": int(len(y_true) - np.sum(y_true)),
+                "model": "weighted_ensemble"
+            },
+            "y_true": y_true.tolist(),
+            "y_score": y_score.tolist(),
+            "y_pred": y_pred.tolist()
+        }
+
+        with open(roc_json_path, 'w', encoding='utf-8') as f:
+            json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
+
+        print(f"ROC data saved (JSON): {roc_json_path}")
+
+        # 2. ذخیره در TXT (ساده)
+        roc_txt_path = os.path.join(args.save_dir, "roc_data_test.txt")
+
+        with open(roc_txt_path, 'w', encoding='utf-8') as f:
+            f.write("y_true\ty_score\ty_pred\n")
+            for t, s, p in zip(y_true, y_score, y_pred):
+                f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
+
+        print(f"ROC data saved (TXT):  {roc_txt_path}")
+
     if is_main:
         print("\n" + "="*70)
         print("FINAL COMPARISON")
@@ -592,6 +654,8 @@ def main():
         print("="*70)
 
         final_results = {
+            'seed': args.seed,
+            'method': 'Weighted_Average',
             'best_single_model': {
                 'name': MODEL_NAMES[best_idx],
                 'accuracy': float(best_single)
@@ -615,7 +679,8 @@ def main():
             'test_accuracy': ensemble_test_acc,
             'model_names': MODEL_NAMES,
             'means': MEANS,
-            'stds': STDS
+            'stds': STDS,
+            'seed': args.seed
         }, final_model_path)
         print(f"Model saved: {final_model_path}")
 
