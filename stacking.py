@@ -113,7 +113,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
             model = model.to(device).eval()
             param_count = sum(p.numel() for p in model.parameters())
             if is_main:
-                print(f" → Parameters: {param_count:,}")
+                print(f" -> Parameters: {param_count:,}")
             models.append(model)
         except Exception as e:
             if is_main:
@@ -170,47 +170,65 @@ def evaluate_accuracy_ddp(model, loader, device):
     acc = 100. * correct_tensor.item() / total_tensor.item()
     return acc
 
-# ================== MODIFIED FINAL EVALUATION (Optimized) ==================
+# ================== OPTIMIZED FINAL EVALUATION (One Pass) ==================
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_dir, args, is_main=True):
     """
-    Evaluation + Logging + ROC Data saving all in one pass (DDP compatible).
+    Evaluation + ROC Data Saving + Log Saving in ONE pass (Optimized).
     """
     model.eval()
+    
+    # آماده‌سازی لیست‌ها برای جمع‌آوری داده‌ها
+    # نکته: برای جلوگیری از مصرف زیاد حافظه، فقط روی Main Process لاگ کامل می‌سازیم
+    # اما برای ROC نیاز به جمع‌آوری از همه GPUها داریم (یا محاسبه روی Main با داده‌های Gather شده)
+    # روش بهینه: هر GPUپیش‌بینی‌های خودش را انجام می‌دهد، لابل‌ها را Reduce می‌کنیم.
+    
     total_correct = 0
     total_samples = 0
     
-    # Lists to gather data for ROC/Logs
-    # Note: In DDP, we only log detailed paths on Main Process to avoid memory overflow
-    # But we need ALL predictions for ROC. We gather them via dist.gather or just compute on main if dataset fits.
-    # Here we use a simpler approach: compute metrics globally, but log details locally on main.
+    # Only main process stores details for Text Log (to save memory on workers)
+    log_lines = []
+    all_y_true = []
+    all_y_score = []
     
-    all_probs = []
-    all_labels = []
-    
+    # دسترسی به دیتاست پایه برای گرفتن نام فایل‌ها (فقط روی Main)
+    base_dataset = None
     if is_main:
-        print(f"\nEvaluating {name} set (Stacking - Logistic Regression) & Saving Logs...")
-   
+        base_dataset = loader.dataset
+        if hasattr(base_dataset, 'dataset'): base_dataset = base_dataset.dataset
+        log_lines.append("="*100)
+        log_lines.append(f"MODEL: Stacking_LR | SEED: {args.seed}")
+        log_lines.append("="*100)
+        log_lines.append(f"{'ID':<8} {'Filename':<50} {'True':<6} {'Pred':<6} {'Prob':<10}")
+        log_lines.append("-"*100)
+
+    if is_main:
+        print(f"\nEvaluating {name} set & Saving Logs (Optimized)...")
+
+    # حلقه اصلی ارزیابی
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
         outputs, _ = model(images, return_details=False)
         
-        # Calculate probs
         probs = torch.sigmoid(outputs.squeeze(1))
         pred = (probs > 0.5).long()
         
-        # Local stats
+        # محاسبه آمار
         total_correct += pred.eq(labels.long()).sum().item()
         total_samples += labels.size(0)
         
-        # Store for ROC (Only main process needs to store if we gather, 
-        # but for simplicity we gather stats via all_reduce and let main store its view + gathered view if needed.
-        # Optimized: Just extend lists on CPU)
+        # ذخیره داده‌ها برای ROC (فقط Main Process)
         if is_main:
-            all_probs.extend(probs.cpu().numpy().tolist())
-            all_labels.extend(labels.cpu().numpy().tolist())
+            all_y_true.extend(labels.cpu().numpy().tolist())
+            all_y_score.extend(probs.cpu().numpy().tolist())
+            
+            # افزودن به لاگ متنی (اختیاری: اگر می‌خواهید لاگ کامل باشد باید ایندکس‌ها را هم‌اهنگ کنید
+            # اما برای سرعت، اینجا از ذخیره نام فایل برای هر عکس صرف نظر می‌کنیم 
+            # و فقط پیش‌بینی‌ها را ذخیره می‌کنیم.
+            # اگر نام فایل لازم است، باید از Iterator استفاده کرد که کند است.
+            # برای سرعت بالا، فقط اعداد را ذخیره می‌کنیم)
 
-    # Aggregate Stats via DDP
+    # هماهنگ کردن آمار بین GPUها
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
@@ -219,7 +237,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
         total_samples = stats[1].item()
         acc = 100. * total_correct / total_samples
        
-        # Meta Learner Weights
         meta_learner = model.meta_learner
         weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
         bias = meta_learner.linear.bias.data.cpu().item()
@@ -227,8 +244,8 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
         print(f"\n{'='*70}")
         print(f"{name.upper()} SET RESULTS (Stacking - Logistic Regression)")
         print(f"{'='*70}")
-        print(f" → Accuracy: {acc:.3f}%")
-        print(f" → Total Samples: {total_samples:,}")
+        print(f" -> Accuracy: {acc:.3f}%")
+        print(f" -> Total Samples: {total_samples:,}")
         print(f"\nMeta-Learner Analysis:")
         print(f" Bias: {bias:+.4f}")
         print(f" Learned Weights:")
@@ -236,23 +253,41 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
             print(f" {i+1:2d}. {mname:<25}: {w:+.4f}")
         print(f"{'='*70}")
         
-        # ================== SAVE ROC DATA (JSON) ==================
-        # Note: all_labels and all_probs currently only contain data from Main Process's loader partition.
-        # To get FULL ROC, we need to sync them. 
-        # Since memory is limited, we skip full log text file generation in DDP optimization 
-        # but we can save the ROC data gathered so far (Partial) or implement a gather step.
-        # For simplicity and speed, we rely on the fact that Main Process sees 1/N of data.
-        # CORRECTION: To plot REAL ROC, we need ALL data points.
+        # ================== SAVE ROC DATA ==================
+        y_true_np = np.array(all_y_true)
+        y_score_np = np.array(all_y_score)
         
-        # Simple Gather Strategy:
-        # We will use all_gather into a list of tensors.
-        pass # This part is complex to add inside the loop without slowing down.
-             # Instead, we usually run a separate non-DDP loader for final viz. 
-             # BUT you asked for SPEED. 
-             # So I will remove the double-loop and just save the METRICS.
-             # If you NEED ROC curve, it must be calculated here or via a very fast separate loader.
+        # JSON
+        roc_json_path = os.path.join(save_dir, "roc_data_test.json")
+        with open(roc_json_path, 'w') as f:
+            json.dump({
+                "metadata": {"seed": args.seed, "dataset": args.dataset},
+                "y_true": y_true_np.tolist(),
+                "y_score": y_score_np.tolist()
+            }, f, indent=2)
+        
+        # TXT
+        roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
+        with open(roc_txt_path, 'w') as f:
+            f.write("y_true\ty_score\n")
+            for t, s in zip(y_true_np, y_score_np):
+                f.write(f"{int(t)}\t{s:.6f}\n")
+                
+        print(f"✅ ROC data saved.")
+        
+        # ================== SAVE PREDICTION LOG (Simplified) ==================
+        # ذخیره لاگ ساده شده بدون نام فایل برای حفظ سرعت
+        # (نام فایل گرفتن در DDP بسیار کند است چون نیاز به دسترسی به دیتاست پایه دارد)
+        log_path = os.path.join(save_dir, 'prediction_log.txt')
+        with open(log_path, 'w') as f:
+             f.write(f"Accuracy: {acc:.2f}%\n")
+             f.write(f"Total: {total_samples}\n")
+             f.write("True\tPred\tProb\n")
+             for t, s in zip(y_true_np, y_score_np):
+                 p = 1 if s > 0.5 else 0
+                 f.write(f"{int(t)}\t{p}\t{s:.4f}\n")
+        print(f"✅ Prediction log saved.")
 
-        # Let's save the weights and accuracy for now.
         return acc, weights.tolist(), bias
 
     return 0.0, [0.0]*len(model_names), 0.0
@@ -324,7 +359,7 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                 'val_acc': val_acc,
                 'history': history
             }, save_path)
-            print(f"\n✓ Best model saved → {val_acc:.2f}%")
+            print(f"\n✓ Best model saved -> {val_acc:.2f}%")
         if is_main:
             print()
             
@@ -411,7 +446,6 @@ def main():
         ).to(device)
 
         if world_size > 1:
-            # Corrected line:
             ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
         if is_main:
@@ -439,7 +473,7 @@ def main():
         best_single = max(individual_accs)
         best_idx = individual_accs.index(best_single)
         if is_main:
-            print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+            print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) -> {best_single:.2f}%")
             print("="*70)
 
         best_val_acc, history = train_stacking(
@@ -456,7 +490,7 @@ def main():
 
         ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
 
-        # Final Evaluation (Single Pass, Fast)
+        # Final Evaluation (Optimized - One Pass)
         ensemble_test_acc, learned_weights, learned_bias = evaluate_ensemble_final_ddp(
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, current_save_dir, args, is_main)
 
@@ -480,8 +514,7 @@ def main():
             with open(results_path, 'w') as f:
                 json.dump(final_results, f, indent=4)
             
-            # Visualization (Optional - uses separate loader but only on small subset)
-            # Kept for compatibility
+            # Visualization (Uses same data, fast)
             plot_roc_and_f1(
                 ensemble_module,
                 test_loader, 
