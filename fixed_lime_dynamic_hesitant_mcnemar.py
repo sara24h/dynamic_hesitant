@@ -57,7 +57,6 @@ def get_test_indices(test_loader):
 def save_prediction_log(model, test_loader, device, save_path, is_main):
     """
     ذخیره لیست پیش‌بینی‌ها دقیقاً روی همان داده‌های تستی که مدل دیده است.
-    این تابع برای تست مک‌نمار (McNemar Test) استفاده می‌شود.
     """
     if not is_main or test_loader is None: return
 
@@ -67,13 +66,17 @@ def save_prediction_log(model, test_loader, device, save_path, is_main):
 
     model.eval()
 
-    # 1. استخراج دیتاست پایه
+    # استخراج دیتاست پایه
     base_dataset = test_loader.dataset
     if hasattr(base_dataset, 'dataset'):
         base_dataset = base_dataset.dataset
 
-    # 2. پیدا کردن اندیس‌های تست
+    # پیدا کردن اندیس‌های تست
     test_indices = get_test_indices(test_loader)
+    # [FIX] چک کردن اینکه آیا test_indices محدوده دارد یا خیر
+    if not test_indices:
+        test_indices = list(range(len(base_dataset)))
+        
     print(f"Found {len(test_indices)} test samples to log.")
 
     lines = []
@@ -88,12 +91,9 @@ def save_prediction_log(model, test_loader, device, save_path, is_main):
     lines.append(header)
     lines.append("-"*100)
 
-    # 3. پیمایش فقط روی اندیس‌های تست
     for i, global_idx in enumerate(tqdm(test_indices, desc="Logging predictions")):
         try:
-            # گرفتن داده از دیتاست پایه با اندیس سراسری
             image, label = base_dataset[global_idx]
-            # گرفتن نام فایل
             path, _ = get_sample_info(base_dataset, global_idx)
         except Exception as e:
             print(f"Error loading sample {global_idx}: {e}")
@@ -103,10 +103,7 @@ def save_prediction_log(model, test_loader, device, save_path, is_main):
         label_int = int(label)
         
         with torch.no_grad():
-            # مدل Fuzzy Ensemble خودش نرمالایزیشن را انجام می‌دهد
             output = model(image)
-            
-            # استخراج خروجی اگر تاپل باشد (خروجی مدل (logits, weights) است)
             if isinstance(output, (tuple, list)):
                 output = output[0]
                 
@@ -115,7 +112,6 @@ def save_prediction_log(model, test_loader, device, save_path, is_main):
         is_correct = (pred_int == label_int)
         if is_correct: correct_count += 1
 
-        # محاسبه ماتریس آشفتگی
         if label_int == 1: # Real
             if pred_int == 1: TP += 1
             else: FN += 1
@@ -126,7 +122,6 @@ def save_prediction_log(model, test_loader, device, save_path, is_main):
         total_samples += 1
         sample_id = i + 1
 
-        # فرمت‌بندی نام فایل
         filename = os.path.basename(path)
         if len(filename) > 55:
             filename = filename[:25] + "..." + filename[-27:]
@@ -134,14 +129,12 @@ def save_prediction_log(model, test_loader, device, save_path, is_main):
         line = f"{sample_id:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
         lines.append(line)
 
-    # محاسبه آمار نهایی
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
     prec = TP / (TP + FP) if (TP + FP) > 0 else 0
     rec = TP / (TP + FN) if (TP + FN) > 0 else 0
     spec = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    # ساخت خروجی نهایی
     output_str = []
     output_str.append("-" * 100)
     output_str.append("SUMMARY STATISTICS:")
@@ -326,9 +319,13 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
+    # [FIX] استفاده از طول واقعی دیتاست برای جلوگیری از خطای Padding
+    total_tensor = torch.tensor(len(loader.dataset), dtype=torch.long, device=device)
+    
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    # نیازی به all_reduce برای total نیست چون ثابت است، اما برای یکپارچگی نگه می‌داریم
+    # در واقع total_tensor در همه پروسه‌ها یکسان است
+    
     acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main:
         print(f" {name}: {acc:.2f}%")
@@ -348,9 +345,11 @@ def evaluate_accuracy_ddp(model, loader, device):
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
+    # [FIX] استفاده از طول واقعی دیتاست
+    total_tensor = torch.tensor(len(loader.dataset), dtype=torch.long, device=device)
+    
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    
     acc = 100. * correct_tensor.item() / total_tensor.item()
     return acc
 
@@ -359,7 +358,6 @@ def evaluate_accuracy_ddp(model, loader, device):
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
     
-    # خواندن پویای تعداد عضویت‌ها از خود مدل
     if hasattr(model, 'module'):
         net = model.module
     else:
@@ -369,12 +367,16 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     n_memberships = net.hesitant_fuzzy.num_memberships
     
     total_correct = 0
-    total_samples = 0
+    # total_samples دیگر شمارش نمی‌شود، چون ثابت است
+    
     sum_weights = torch.zeros(n_models, device=device)
     sum_activation = torch.zeros(n_models, device=device)
     
     sum_membership_vals = torch.zeros(n_models, n_memberships, device=device)
     sum_hesitancy = torch.zeros(n_models, device=device)
+
+    # [FIX] گرفتن تعداد واقعی نمونه‌ها
+    real_total_samples = len(loader.dataset)
 
     if is_main:
         print(f"\nEvaluating {name} set...")
@@ -383,22 +385,27 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         outputs, weights, memberships, _ = model(images, return_details=True)
         pred = (outputs.squeeze(1) > 0).long()
         total_correct += pred.eq(labels.long()).sum().item()
-        total_samples += labels.size(0)
+        
+        # [FIX] نرمال کردن وزن‌ها و فعال‌سازی‌ها بر اساس batch size واقعی
+        # تا میانگین نهایی درست باشد
         sum_weights += weights.sum(dim=0)
         sum_activation += (weights > 1e-4).sum(dim=0).float()
         sum_membership_vals += memberships.sum(dim=0)
         sum_hesitancy += memberships.var(dim=2).sum(dim=0)
 
-    stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
+    stats = torch.tensor(total_correct, dtype=torch.long, device=device)
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    
     dist.all_reduce(sum_weights, op=dist.ReduceOp.SUM)
     dist.all_reduce(sum_activation, op=dist.ReduceOp.SUM)
     dist.all_reduce(sum_membership_vals, op=dist.ReduceOp.SUM)
     dist.all_reduce(sum_hesitancy, op=dist.ReduceOp.SUM)
 
     if is_main:
-        total_correct = stats[0].item()
-        total_samples = stats[1].item()
+        total_correct = stats.item()
+        # [FIX] استفاده از تعداد واقعی نمونه‌ها
+        total_samples = real_total_samples
+        
         acc = 100. * total_correct / total_samples
         avg_weights = (sum_weights / total_samples).cpu().numpy()
         activation_percentages = (sum_activation / total_samples * 100).cpu().numpy()
@@ -615,7 +622,6 @@ def main():
     if len(args.model_names) != len(args.model_paths):
         raise ValueError("Number of model_names must match model_paths")
 
-    # ===> اعمال Seed از ورودی <===
     set_seed(args.seed)
     
     device, local_rank, rank, world_size = setup_distributed()
@@ -651,7 +657,6 @@ def main():
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    # استفاده از آرگومان ورودی num_memberships
     ensemble = FuzzyHesitantEnsemble(
         base_models, MEANS, STDS,
         num_memberships=args.num_memberships, 
@@ -668,6 +673,7 @@ def main():
         total = sum(p.numel() for p in ensemble.parameters())
         print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
+    # ایجاد دیتالودرهای توزیع شده برای آموزش
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
@@ -710,6 +716,8 @@ def main():
         print("="*70)
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
+    
+    # ارزیابی نهایی با دیتالودر توزیع شده (برای متریک‌های وزن و...)
     ensemble_test_acc, ensemble_weights, activation_percentages = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
@@ -753,23 +761,35 @@ def main():
         print(f"Model saved: {final_model_path}")
 
         # ==========================================
+        # [FIX] ایجاد دیتالودر عادی (غیر توزیع شده) برای گزارش‌گیری نهایی
+        # ==========================================
+        print("\nPreparing full test loader for final reporting (Logs, ROC, Visualizations)...")
+        _, _, test_loader_full = create_dataloaders(
+            args.data_dir, args.batch_size, dataset_type=args.dataset,
+            is_distributed=False, seed=args.seed, is_main=True
+        )
+
+        # ==========================================
         # Save Prediction Log (McNemar Format)
         # ==========================================
         log_path = os.path.join(args.save_dir, 'prediction_log.txt')
-        save_prediction_log(ensemble_module, test_loader, device, log_path, is_main)
+        # استفاده از test_loader_full که تمام داده‌ها را دارد
+        save_prediction_log(ensemble_module, test_loader_full, device, log_path, is_main)
 
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         generate_visualizations(
-            ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
+            ensemble_module, test_loader_full, device, vis_dir, MODEL_NAMES,
             args.num_grad_cam_samples, args.num_lime_samples,
             args.dataset, is_main)
 
     cleanup_distributed()
     
+    # اجرای ROC در حالت Single Process (چون cleanup شده‌ایم)
     if is_main:
+        # تابع plot_roc_and_f1 باید با دیتالودر کامل کار کند
         plot_roc_and_f1(
             ensemble_module,
-            test_loader, 
+            test_loader_full,  # استفاده از دیتالودر کامل
             device, 
             args.save_dir, 
             MODEL_NAMES,
