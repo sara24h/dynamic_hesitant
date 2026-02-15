@@ -41,6 +41,7 @@ def set_seed(seed: int = 42):
 def final_evaluation_and_report(model, loader, device, save_dir, model_name, args, is_main):
     """
     ارزیابی نهایی یکپارچه: محاسبه معیارها، چاپ در کنسول، ذخیره لاگ متنی و ذخیره داده‌های ROC.
+    این تابع فقط روی فرآیند اصلی (Main Process) اجرا می‌شود.
     """
     if not is_main or loader is None: return 0.0, None, None
 
@@ -411,13 +412,6 @@ def main():
         print("="*70)
         print("\nSkipping Training (Simple Averaging does not learn parameters)...\n")
 
-    # ساخت دیتالودر تست غیرتوزیع‌شده برای ارزیابی نهایی یکپارچه
-    if is_main:
-        _, _, test_loader_full = create_dataloaders(
-            args.data_dir, args.batch_size, dataset_type=args.dataset,
-            is_distributed=False, seed=args.seed, is_main=True
-        )
-
     if is_main:
         print("\n" + "="*70)
         print("FINAL ENSEMBLE EVALUATION")
@@ -425,13 +419,26 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    # اجرای تابع ارزیابی یکپارچه
-    ensemble_test_acc, y_true, y_score = final_evaluation_and_report(
-        ensemble_module, test_loader_full, device, args.save_dir, 
-        "Simple Averaging Ensemble", args, is_main
-    )
-
+    # ==========================================
+    # اصلاح مهم:
+    # ارزیابی نهایی فقط روی is_main انجام می‌شود.
+    # ابتدا دیتالودر تست کامل (غیرتوزیع‌شده) ساخته می‌شود.
+    # ==========================================
     if is_main:
+        os.makedirs(args.save_dir, exist_ok=True)
+        
+        # ساخت دیتالودر تست غیرتوزیع‌شده فقط روی GPU اصلی
+        _, _, test_loader_full = create_dataloaders(
+            args.data_dir, args.batch_size, dataset_type=args.dataset,
+            is_distributed=False, seed=args.seed, is_main=True
+        )
+
+        # اجرای ارزیابی یکپارچه
+        ensemble_test_acc, y_true, y_score = final_evaluation_and_report(
+            ensemble_module, test_loader_full, device, args.save_dir, 
+            "Simple Averaging Ensemble", args, is_main
+        )
+
         print("\n" + "="*70)
         print("FINAL COMPARISON")
         print("="*70)
@@ -439,8 +446,6 @@ def main():
         print(f"Ensemble Accuracy: {ensemble_test_acc:.2f}%")
         print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
-
-        os.makedirs(args.save_dir, exist_ok=True)
 
         final_results = {
             'method': 'Simple Averaging',
@@ -478,6 +483,7 @@ def main():
 
     cleanup_distributed()
     
+    # رسم ROC نیز فقط روی Main اجرا می‌شود
     if is_main:
         plot_roc_and_f1(
             ensemble_module,
