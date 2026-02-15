@@ -13,6 +13,7 @@ import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 from metrics_utils import plot_roc_and_f1
+
 warnings.filterwarnings("ignore")
 from dataset_utils import (
     UADFVDataset,
@@ -67,8 +68,13 @@ class StackingEnsemble(nn.Module):
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         logits_list = []
+        
+        # اجرای مدل‌ها (نکته: برای DDP مدل‌ها روی همان دستگاه فرآیند هستند)
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
+            # چون مدل‌ها فریز شده‌اند، no_grad برای صرفه‌جویی حافظه بهتر است
+            # اما در DDP برای backward نهایی (اگر weights trainable باشند) نباید no_grad کلی گرفت
+            # اینجا فقط مدل‌های پایه داخل no_grad هستند
             with torch.no_grad():
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
@@ -310,88 +316,109 @@ def get_test_indices(test_loader):
     else:
         return list(range(len(test_loader.dataset)))
 
-# ================== SAVE PREDICTION LOG (MCNEMAR FORMAT) ==================
-def save_prediction_log(model, test_loader, device, save_path, is_main, normalizer=None):
-    if not is_main or test_loader is None: return
-    print("\n" + "="*70)
-    print("GENERATING PREDICTION LOG FILE (TEST SET ONLY)")
-    print("="*70)
+# ================== FINAL EVALUATION & ROC ==================
+@torch.no_grad()
+def final_evaluation_and_roc(model, loader, device, save_dir, model_name, args, is_main):
+    if not is_main or loader is None: return 0.0, None, None
+
     model.eval()
-    base_dataset = test_loader.dataset
-    if hasattr(base_dataset, 'dataset'):
-        base_dataset = base_dataset.dataset
-    test_indices = get_test_indices(test_loader)
-    print(f"Found {len(test_indices)} test samples to log.")
+    
+    base_dataset = loader.dataset
+    if hasattr(base_dataset, 'dataset'): base_dataset = base_dataset.dataset
+    
+    if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'indices'):
+        test_indices = loader.sampler.indices
+    elif hasattr(loader.dataset, 'indices'):
+        test_indices = loader.dataset.indices
+    else:
+        test_indices = list(range(len(base_dataset)))
+
+    all_y_true = []
+    all_y_score = []
+    all_y_pred = []
     lines = []
+
+    lines.append("="*100)
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS")
+    lines.append("="*100)
+    
     TP, TN, FP, FN = 0, 0, 0, 0
-    total_samples = 0
     correct_count = 0
-    lines.append("="*100)
-    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
-    lines.append("="*100)
-    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
-    lines.append(header)
-    lines.append("-"*100)
-    for i, global_idx in enumerate(tqdm(test_indices, desc="Logging predictions")):
+
+    print(f"\nRunning Final Evaluation on {len(test_indices)} samples...")
+    for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
         try:
             image, label = base_dataset[global_idx]
             path, _ = get_sample_info(base_dataset, global_idx)
-        except Exception as e:
-            print(f"Error loading sample {global_idx}: {e}")
-            continue
+        except: continue
+
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
-       
-        with torch.no_grad():
-            input_img = normalizer(image, 0) if normalizer else image
-            output = model(input_img)
-            if isinstance(output, (tuple, list)):
-                output = output[0]
-       
-        pred_int = int(output.squeeze().item() > 0)
-       
-        is_correct = (pred_int == label_int)
-        if is_correct: correct_count += 1
+        
+        output = model(image)
+        if isinstance(output, (tuple, list)): output = output[0]
+        prob = torch.sigmoid(output.squeeze()).item()
+        pred_int = int(prob > 0.5)
+        
+        all_y_true.append(label_int)
+        all_y_score.append(prob)
+        all_y_pred.append(pred_int)
+        
+        if pred_int == label_int: correct_count += 1
         if label_int == 1:
             if pred_int == 1: TP += 1
             else: FN += 1
         else:
             if pred_int == 1: FP += 1
             else: TN += 1
-       
-        total_samples += 1
-        sample_id = i + 1
+            
         filename = os.path.basename(path)
-        if len(filename) > 55:
-            filename = filename[:25] + "..." + filename[-27:]
-           
-        line = f"{sample_id:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
+        line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if pred_int==label_int else 'No':<10}"
         lines.append(line)
+
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
     prec = TP / (TP + FP) if (TP + FP) > 0 else 0
     rec = TP / (TP + FN) if (TP + FN) > 0 else 0
     spec = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+    # Print
+    print(f"\nPrecision: {prec:.4f}")
+    print(f"Recall: {rec:.4f}")
+    print(f"Specificity: {spec:.4f}")
+    print(f"\nConfusion Matrix:")
+    print(f"                 Predicted Real  Predicted Fake")
+    print(f"    Actual Real      {TP:<15} {FN:<15}")
+    print(f"    Actual Fake      {FP:<15} {TN:<15}")
+    print(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    print(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
+
+    # Save Log
     output_str = []
-    output_str.append("-" * 100)
-    output_str.append("SUMMARY STATISTICS:")
-    output_str.append("-" * 100)
     output_str.append(f"Accuracy: {acc*100:.2f}%")
-    output_str.append(f"Precision: {prec:.4f}")
-    output_str.append(f"Recall: {rec:.4f}")
-    output_str.append(f"Specificity: {spec:.4f}")
-    output_str.append("\nConfusion Matrix:")
-    output_str.append(f" {'Predicted Real':<15} {'Predicted Fake':<15}")
-    output_str.append(f" Actual Real {TP:<15} {FN:<15}")
-    output_str.append(f" Actual Fake {FP:<15} {TN:<15}")
-    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
-    output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
     output_str.extend(lines)
-    with open(save_path, 'w') as f:
+    with open(os.path.join(save_dir, 'prediction_log.txt'), 'w') as f:
         f.write("\n".join(output_str))
-   
-    print(f"✅ Prediction log saved to: {save_path}")
-    print("="*70)
+
+    # Save ROC
+    y_true_np = np.array(all_y_true)
+    y_score_np = np.array(all_y_score)
+    
+    roc_json_path = os.path.join(save_dir, "roc_data_test.json")
+    with open(roc_json_path, 'w') as f:
+        json.dump({
+            "metadata": {"seed": args.seed, "dataset": args.dataset},
+            "y_true": y_true_np.tolist(),
+            "y_score": y_score_np.tolist()
+        }, f, indent=2)
+    
+    roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
+    with open(roc_txt_path, 'w') as f:
+        f.write("y_true\ty_score\n")
+        for t, s in zip(y_true_np, y_score_np):
+            f.write(f"{int(t)}\t{s:.6f}\n")
+            
+    return acc * 100, y_true_np, y_score_np
 
 # ================== MAIN FUNCTION ==================
 def main():
@@ -493,77 +520,21 @@ def main():
         ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
 
         if is_main:
+            os.makedirs(current_save_dir, exist_ok=True)
+            # ساخت دیتالودر تست کامل فقط روی GPU اصلی برای ارزیابی نهایی
+            _, _, test_loader_full = create_dataloaders(
+                args.data_dir, args.batch_size, dataset_type=args.dataset,
+                is_distributed=False, seed=current_seed, is_main=True)
+
             print("\n" + "="*70)
             print("FINAL ENSEMBLE EVALUATION")
             print("="*70)
 
-        ensemble_test_acc, learned_weights, learned_bias = evaluate_ensemble_final_ddp(
-            ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
+            ensemble_test_acc, y_true, y_score = final_evaluation_and_roc(
+                ensemble_module, test_loader_full, device, current_save_dir, 
+                "Stacking_LR", args, is_main
+            )
 
-        # ────────────────────────────────────────────────────────────────
-        #                ذخیره داده‌های ROC (فقط روی فرآیند اصلی)
-        # ────────────────────────────────────────────────────────────────
-        if is_main:
-            print("\nCollecting ROC data (y_true & y_score) ...")
-
-            all_y_true = []
-            all_y_score = []
-            all_y_pred = []
-
-            ensemble_module.eval()
-            with torch.no_grad():
-                for images, labels in tqdm(test_loader, desc="ROC collection"):
-                    images = images.to(device)
-                    labels = labels.to(device).float()
-
-                    outputs, _ = ensemble_module(images, return_details=False)
-                    probs = torch.sigmoid(outputs).squeeze(1)  # [0,1]
-
-                    preds = (probs > 0.5).long()
-
-                    all_y_true.append(labels.cpu())
-                    all_y_score.append(probs.cpu())
-                    all_y_pred.append(preds.cpu())
-
-            y_true = torch.cat(all_y_true).numpy()
-            y_score = torch.cat(all_y_score).numpy()
-            y_pred = torch.cat(all_y_pred).numpy()
-
-            print(f"→ Collected {len(y_true):,} samples for ROC curve")
-
-            # 1. ذخیره در JSON (ساختارمند - توصیه شده)
-            roc_json_path = os.path.join(current_save_dir, "roc_data_test.json")
-            roc_data_json = {
-                "metadata": {
-                    "seed": current_seed,
-                    "dataset": args.dataset,
-                    "num_samples": int(len(y_true)),
-                    "positive_count": int(np.sum(y_true)),
-                    "negative_count": int(len(y_true) - np.sum(y_true)),
-                    "saved_at": "2026-02-15",
-                    "model": "stacking_ensemble_lr"
-                },
-                "y_true": y_true.tolist(),
-                "y_score": y_score.tolist(),
-                "y_pred": y_pred.tolist()  # اگر نمی‌خواهید این خط را حذف کنید
-            }
-
-            with open(roc_json_path, 'w', encoding='utf-8') as f:
-                json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
-
-            print(f"ROC data saved (JSON): {roc_json_path}")
-
-            # 2. ذخیره در TXT (ساده و قابل باز شدن در اکسل)
-            roc_txt_path = os.path.join(current_save_dir, "roc_data_test.txt")
-
-            with open(roc_txt_path, 'w', encoding='utf-8') as f:
-                f.write("y_true\ty_score\ty_pred\n")
-                for t, s, p in zip(y_true, y_score, y_pred):
-                    f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
-
-            print(f"ROC data saved (TXT):  {roc_txt_path}")
-
-        if is_main:
             print("\n" + "="*70)
             print("FINAL COMPARISON")
             print("="*70)
@@ -575,57 +546,22 @@ def main():
             final_results = {
                 'seed': current_seed,
                 'method': 'Stacking_LR',
-                'best_single_model': {
-                    'name': MODEL_NAMES[best_idx],
-                    'accuracy': float(best_single)
-                },
-                'ensemble': {
-                    'test_accuracy': float(ensemble_test_acc),
-                    'learned_weights': {name: float(w) for name, w in zip(MODEL_NAMES, learned_weights)},
-                    'learned_bias': float(learned_bias)
-                },
-                'improvement': float(ensemble_test_acc - best_single),
-                'training_history': history
+                'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
+                'ensemble': {'test_accuracy': float(ensemble_test_acc)},
+                'improvement': float(ensemble_test_acc - best_single)
             }
             results_path = os.path.join(current_save_dir, 'final_results_stacking_lr.json')
             with open(results_path, 'w') as f:
                 json.dump(final_results, f, indent=4)
-            print(f"\nResults saved: {results_path}")
-
-            final_model_path = os.path.join(current_save_dir, 'final_stacking_lr_model.pt')
-            torch.save({
-                'ensemble_state_dict': ensemble_module.state_dict(),
-                'meta_learner_state_dict': ensemble_module.meta_learner.state_dict(),
-                'test_accuracy': ensemble_test_acc,
-                'model_names': MODEL_NAMES,
-                'means': MEANS,
-                'stds': STDS,
-                'seed': current_seed
-            }, final_model_path)
-            print(f"Model saved: {final_model_path}")
-
-            # Save Prediction Logs (McNemar)
-            log_path_ensemble = os.path.join(current_save_dir, 'prediction_log_stacking.txt')
-            save_prediction_log(ensemble_module, test_loader, device, log_path_ensemble, is_main, normalizer=None)
-
-            log_path_single = os.path.join(current_save_dir, 'prediction_log_best_single.txt')
-            single_normalizer = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
-            save_prediction_log(base_models[best_idx], test_loader, device, log_path_single, is_main, normalizer=single_normalizer)
-
-            vis_dir = os.path.join(current_save_dir, 'visualizations')
-            generate_visualizations(
-                ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
-                args.num_grad_cam_samples, args.num_lime_samples,
-                args.dataset, is_main)
 
         cleanup_distributed()
-
+        
         if is_main:
             plot_roc_and_f1(
                 ensemble_module,
-                test_loader,
-                device,
-                current_save_dir,
+                test_loader_full, 
+                device, 
+                current_save_dir, 
                 MODEL_NAMES,
                 is_main
             )
