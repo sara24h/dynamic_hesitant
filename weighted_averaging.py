@@ -36,115 +36,128 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
-# ================== MCNEMAR REPORT FUNCTION ==================
-@torch.no_grad()
-def save_mcnemar_report(model, loader, device, save_path, model_name="Ensemble", is_main=True):
+# ================== HELPER TO GET TEST INDICES ==================
+def get_test_indices(test_loader):
     """
-    Evaluate model and save results in text format for McNemar test.
-    Compatible with DDP using all_gather_object (safe for variable batch sizes)
+    استخراج لیست اندیس‌های مربوط به تست از داخل DataLoader.
     """
+    if hasattr(test_loader, 'sampler') and hasattr(test_loader.sampler, 'indices'):
+        return test_loader.sampler.indices
+    elif hasattr(test_loader.dataset, 'indices'):
+        return test_loader.dataset.indices
+    else:
+        return list(range(len(test_loader.dataset)))
+
+
+# ================== SAVE PREDICTION LOG (MCNEMAR FORMAT) ==================
+def save_prediction_log(model, test_loader, device, save_path, is_main):
+    """
+    ذخیره لیست پیش‌بینی‌ها دقیقاً روی همان داده‌های تستی که مدل دیده است.
+    """
+    if not is_main or test_loader is None: return
+
+    print("\n" + "="*70)
+    print("GENERATING PREDICTION LOG FILE (TEST SET ONLY)")
+    print("="*70)
+
     model.eval()
-    
-    local_preds = []
-    local_labels = []
-    # local_paths = []   # اگر واقعاً نیاز دارید مسیرها را جمع کنید، بعداً اضافه می‌کنیم (پیچیده در DDP)
 
-    if is_main:
-        print(f"\nGenerating McNemar report for {model_name}...")
-    
-    # مرحله 1: جمع‌آوری محلی روی هر GPU
-    for images, labels in loader:
-        images = images.to(device)
-        # مدیریت DDP wrapper
-        current_model = model.module if hasattr(model, 'module') else model
-        outputs, _ = current_model(images)  # فقط خروجی نهایی + weights (paths لازم نیست)
-        preds = (outputs.squeeze(1) > 0).long()
-        
-        local_preds.extend(preds.cpu().numpy().tolist())
-        local_labels.extend(labels.cpu().numpy().tolist())
-        # اگر مسیرها خیلی مهم هستند بعداً می‌توان با روش دیگری (مثل seed ثابت + بازسازی) جمع کرد
+    # 1. استخراج دیتاست پایه
+    base_dataset = test_loader.dataset
+    if hasattr(base_dataset, 'dataset'):
+        base_dataset = base_dataset.dataset
 
-    # مرحله 2: جمع‌آوری از همه rankها با روش امن
-    if dist.is_initialized() and dist.get_world_size() > 1:
-        all_preds_lists = [None] * dist.get_world_size()
-        all_labels_lists = [None] * dist.get_world_size()
-        
-        dist.all_gather_object(all_preds_lists, local_preds)
-        dist.all_gather_object(all_labels_lists, local_labels)
-        
-        if is_main:
-            all_preds = []
-            all_labels = []
-            for preds_list, labels_list in zip(all_preds_lists, all_labels_lists):
-                all_preds.extend(preds_list)
-                all_labels.extend(labels_list)
-    else:
-        # single GPU یا non-distributed
-        all_preds = local_preds
-        all_labels = local_labels
+    # 2. پیدا کردن اندیس‌های تست
+    test_indices = get_test_indices(test_loader)
+    print(f"Found {len(test_indices)} test samples to log.")
 
-    # فقط rank اصلی (is_main) ادامه می‌دهد و فایل را می‌نویسد
-    if is_main:
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
+    lines = []
+    TP, TN, FP, FN = 0, 0, 0, 0
+    total_samples = 0
+    correct_count = 0
+
+    lines.append("="*100)
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+    lines.append("="*100)
+    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
+    lines.append(header)
+    lines.append("-"*100)
+
+    # 3. پیمایش فقط روی اندیس‌های تست
+    for i, global_idx in enumerate(tqdm(test_indices, desc="Logging predictions")):
+        try:
+            # گرفتن داده از دیتاست پایه با اندیس سراسری
+            image, label = base_dataset[global_idx]
+            # گرفتن نام فایل
+            path, _ = get_sample_info(base_dataset, global_idx)
+        except Exception as e:
+            print(f"Error loading sample {global_idx}: {e}")
+            continue
+
+        image = image.unsqueeze(0).to(device)
+        label_int = int(label)
         
-        total_samples = len(all_labels)
-        if total_samples == 0:
-            print("Warning: No samples collected for McNemar report!")
-            return
-        
-        correct = np.sum(all_preds == all_labels)
-        incorrect = total_samples - correct
-        accuracy = correct / total_samples * 100 if total_samples > 0 else 0
-        
-        # Confusion Matrix
-        TP = np.sum((all_preds == 1) & (all_labels == 1))
-        TN = np.sum((all_preds == 0) & (all_labels == 0))
-        FP = np.sum((all_preds == 1) & (all_labels == 0))
-        FN = np.sum((all_preds == 0) & (all_labels == 1))
-        
-        precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-        recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-        specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
-        
-        # نوشتن فایل
-        with open(save_path, 'w', encoding='utf-8') as f:
-            f.write("-" * 100 + "\n")
-            f.write("SUMMARY STATISTICS:\n")
-            f.write("-" * 100 + "\n")
-            f.write(f"Accuracy:          {accuracy:.2f}%\n")
-            f.write(f"Precision:         {precision:.4f}\n")
-            f.write(f"Recall:            {recall:.4f}\n")
-            f.write(f"Specificity:       {specificity:.4f}\n")
-            f.write("\n")
-            f.write("Confusion Matrix:\n")
-            f.write(f"                  Predicted Real    Predicted Fake\n")
-            f.write(f"    Actual Real   {TN:<14} {FP:<14}\n")
-            f.write(f"    Actual Fake   {FN:<14} {TP:<14}\n")
-            f.write("\n")
-            f.write(f"Correct Predictions:   {correct:,} ({accuracy:.2f}%)\n")
-            f.write(f"Incorrect Predictions: {incorrect:,} ({100-accuracy:.2f}%)\n")
-            f.write("\n")
-            f.write("=" * 100 + "\n")
-            f.write("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):\n")
-            f.write("=" * 100 + "\n")
-            header = f"{'Sample_ID':<10} {'True_Label':<12} {'Predicted':<12} {'Correct':<10}\n"
-            f.write(header)
-            f.write("-" * 100 + "\n")
+        with torch.no_grad():
+            # مدل Weighted Ensemble خودش نرمالایزیشن را انجام می‌دهد
+            output = model(image)
             
-            for i in range(total_samples):
-                pred = int(all_preds[i])
-                label = int(all_labels[i])
-                is_correct = "Yes" if pred == label else "No"
-                # مسیر را ساده کردیم (اگر نیاز شدید بعداً اضافه کنید)
-                path = f"Sample_{i+1:06d}"
-                line = f"{i+1:<10} {label:<12} {pred:<12} {is_correct:<10}   ({path})\n"
-                f.write(line)
+            # استخراج خروجی اگر تاپل باشد (خروجی مدل (logits, weights) است)
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+                
+        pred_int = int(output.squeeze().item() > 0)
         
-        print(f"McNemar report saved to: {save_path}")
-    else:
-        # workerهای دیگر فقط صبر می‌کنند و چیزی نمی‌نویسند
-        pass
+        is_correct = (pred_int == label_int)
+        if is_correct: correct_count += 1
+
+        # محاسبه ماتریس آشفتگی
+        if label_int == 1: # Real
+            if pred_int == 1: TP += 1
+            else: FN += 1
+        else: # Fake
+            if pred_int == 1: FP += 1
+            else: TN += 1
+        
+        total_samples += 1
+        sample_id = i + 1
+
+        # فرمت‌بندی نام فایل
+        filename = os.path.basename(path)
+        if len(filename) > 55:
+            filename = filename[:25] + "..." + filename[-27:]
+            
+        line = f"{sample_id:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
+        lines.append(line)
+
+    # محاسبه آمار نهایی
+    total = TP + TN + FP + FN
+    acc = (TP + TN) / total if total > 0 else 0
+    prec = TP / (TP + FP) if (TP + FP) > 0 else 0
+    rec = TP / (TP + FN) if (TP + FN) > 0 else 0
+    spec = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+    # ساخت خروجی نهایی
+    output_str = []
+    output_str.append("-" * 100)
+    output_str.append("SUMMARY STATISTICS:")
+    output_str.append("-" * 100)
+    output_str.append(f"Accuracy: {acc*100:.2f}%")
+    output_str.append(f"Precision: {prec:.4f}")
+    output_str.append(f"Recall: {rec:.4f}")
+    output_str.append(f"Specificity: {spec:.4f}")
+    output_str.append("\nConfusion Matrix:")
+    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
+    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
+    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
+    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
+    output_str.extend(lines)
+
+    with open(save_path, 'w') as f:
+        f.write("\n".join(output_str))
+    
+    print(f"✅ Prediction log saved to: {save_path}")
+    print("="*70)
 
 
 class MultiModelNormalization(nn.Module):
@@ -295,7 +308,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     model.eval()
     total_correct = 0
     total_samples = 0
-    # Just storing weights for logging, they are constant per batch in WA but might change if training
     last_weights = None 
     
     if is_main:
@@ -305,7 +317,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         images, labels = images.to(device), labels.to(device)
         outputs, weights, _, _ = model(images, return_details=True)
         
-        # Capture weights from the first batch for reporting
         if last_weights is None:
             last_weights = weights.detach().cpu()
             
@@ -321,8 +332,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_samples = stats[1].item()
         acc = 100. * total_correct / total_samples
         
-        # Since weights are static/global in WA, we just take the ones captured
-        # (Note: if evaluating during training where weights change, this shows final state)
         final_weights = last_weights.numpy() if last_weights is not None else np.zeros(len(model_names))
 
         print(f"\n{'='*70}")
@@ -340,12 +349,8 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 
 def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
-    """
-    تابع آموزش برای Weighted Average Ensemble
-    """
     os.makedirs(save_dir, exist_ok=True)
     
-    # Access the weights parameter directly
     if hasattr(ensemble_model, 'module'):
         weights_param = ensemble_model.module.weights
     else:
@@ -375,11 +380,10 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
         
-        ensemble_model.train() # Set to train mode to allow grad on weights
+        ensemble_model.train()
         train_loss = 0.0
         train_correct = 0
         train_total = 0
-        num_batches = 0
 
         for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main):
             images, labels = images.to(device), labels.to(device).float()
@@ -388,10 +392,6 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
             outputs, weights, _, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
-            
-            # Optional: Clip gradients for stability
-            # torch.nn.utils.clip_grad_norm_([weights_param], 1.0)
-            
             optimizer.step()
 
             batch_size = images.size(0)
@@ -399,12 +399,10 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
             pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
-            num_batches += 1
 
         train_acc = 100. * train_correct / train_total
         train_loss = train_loss / train_total
         
-        # Get current weights for logging
         current_weights = F.softmax(weights_param, dim=0).detach().cpu()
         
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
@@ -432,7 +430,6 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
             save_path = os.path.join(save_dir, 'best_weighted_ensemble.pt')
-            # Save the weights directly (not state_dict, because it's a Parameter)
             torch.save({
                 'epoch': epoch + 1,
                 'weights': weights_param.data.cpu(),
@@ -479,7 +476,7 @@ def cleanup_distributed():
 def main():
     parser = argparse.ArgumentParser(description="Weighted Average Ensemble Training")
     parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--lr', type=float, default=0.01) # Higher LR often okay for just weights
+    parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
@@ -512,7 +509,7 @@ def main():
 
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-    # Adjust means/stds to number of models
+    
     if len(args.model_paths) > len(MEANS):
         MEANS = MEANS * (len(args.model_paths) // len(MEANS) + 1)
         STDS = STDS * (len(args.model_paths) // len(STDS) + 1)
@@ -568,7 +565,6 @@ def main():
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         
-        # Load weights directly using data.copy_
         if hasattr(ensemble, 'module'):
             ensemble.module.weights.data.copy_(ckpt['weights'])
         else:
@@ -616,7 +612,6 @@ def main():
         final_model_path = os.path.join(args.save_dir, 'final_ensemble_model.pt')
         torch.save({
             'ensemble_state_dict': ensemble_module.state_dict(),
-            # Note: 'ensemble_state_dict' already includes weights now
             'test_accuracy': ensemble_test_acc,
             'model_names': MODEL_NAMES,
             'means': MEANS,
@@ -625,10 +620,10 @@ def main():
         print(f"Model saved: {final_model_path}")
 
         # ==========================================
-        # NEW: Save McNemar Report for Ensemble
+        # Save Prediction Log (McNemar Format)
         # ==========================================
-        mcnemar_report_path = os.path.join(args.save_dir, 'mcnemar_ensemble_results.txt')
-        save_mcnemar_report(ensemble_module, test_loader, device, mcnemar_report_path, model_name="Weighted Average Ensemble")
+        log_path = os.path.join(args.save_dir, 'prediction_log.txt')
+        save_prediction_log(ensemble_module, test_loader, device, log_path, is_main)
 
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         generate_visualizations(
@@ -637,7 +632,7 @@ def main():
             args.dataset, is_main)
 
     cleanup_distributed()
-
+    
     if is_main:
         plot_roc_and_f1(
             ensemble_module,
