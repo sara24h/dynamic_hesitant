@@ -108,7 +108,7 @@ class StackingEnsemble(nn.Module):
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
             
-            return final_output, dummy_weights, dummy_memberships, stacked_logits
+            return final_output, dummy_weights, dummy_memberhips, stacked_logits
         else:
             batch_size = x.size(0)
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
@@ -361,114 +361,135 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-# ================== MCNEMAR REPORT FUNCTION ==================
-@torch.no_grad()
-def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is_ensemble=True, single_model_idx=None, means=None, stds=None):
+# ================== HELPER TO GET TEST INDICES ==================
+def get_test_indices(test_loader):
     """
-    Save results in a specific text format for McNemar test.
-    Works for both Ensemble (Stacking) and Single models.
+    استخراج لیست اندیس‌های مربوط به تست از داخل DataLoader.
+    این تابع از Sampler استفاده می‌کند.
     """
+    if hasattr(test_loader, 'sampler') and hasattr(test_loader.sampler, 'indices'):
+        # حالت DistributedSampler یا SubsetSampler
+        return test_loader.sampler.indices
+    elif hasattr(test_loader.dataset, 'indices'):
+        # حالت Subset
+        return test_loader.dataset.indices
+    else:
+        # حالت کل دیتاست (اگر Shuffle=False باشد ترتیب حفظ می‌شود)
+        return list(range(len(test_loader.dataset)))
+
+
+# ================== SAVE PREDICTION LOG (MCNEMAR FORMAT) ==================
+def save_prediction_log(model, test_loader, device, save_path, is_main, normalizer=None):
+    """
+    ذخیره لیست پیش‌بینی‌ها دقیقاً روی همان داده‌های تستی که مدل دیده است.
+    این تابع برای تست مک‌نمار (McNemar Test) استفاده می‌شود.
+    """
+    if not is_main or test_loader is None: return
+
+    print("\n" + "="*70)
+    print("GENERATING PREDICTION LOG FILE (TEST SET ONLY)")
+    print("="*70)
+
     model.eval()
-    all_preds = []
-    all_labels = []
-    all_paths = []
-    
-    has_paths = hasattr(loader.dataset, 'samples') or hasattr(loader.dataset, 'paths')
-    
-    print(f"\nGenerating McNemar report for {model_name}...")
-    
-    # Normalizer for single model case
-    normalizer = None
-    if not is_ensemble and single_model_idx is not None and means is not None:
-        normalizer = MultiModelNormalization([means[single_model_idx]], [stds[single_model_idx]]).to(device)
 
-    for batch_idx, (images, labels) in enumerate(loader):
-        images = images.to(device)
-        
-        if is_ensemble:
-            outputs, _ = model(images)
-        else:
-            if normalizer:
-                images = normalizer(images, 0)
-            outputs = model(images)
-            
-        if isinstance(outputs, (tuple, list)):
-            outputs = outputs[0]
-            
-        preds = (outputs.squeeze(1) > 0).long()
-        
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        
-        if has_paths:
-            try:
-                start_idx = batch_idx * loader.batch_size
-                end_idx = start_idx + images.size(0)
-                if hasattr(loader.dataset, 'samples'):
-                    batch_paths = [loader.dataset.samples[i][0] for i in range(start_idx, min(end_idx, len(loader.dataset)))]
-                    all_paths.extend(batch_paths)
-                elif hasattr(loader.dataset, 'paths'):
-                     batch_paths = [loader.dataset.paths[i] for i in range(start_idx, min(end_idx, len(loader.dataset)))]
-                     all_paths.extend(batch_paths)
-            except:
-                pass
+    # 1. استخراج دیتاست پایه
+    base_dataset = test_loader.dataset
+    if hasattr(base_dataset, 'dataset'):
+        base_dataset = base_dataset.dataset
 
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    
-    correct = np.sum(all_preds == all_labels)
-    incorrect = len(all_labels) - correct
-    accuracy = correct / len(all_labels) * 100
-    
-    TP = np.sum((all_preds == 1) & (all_labels == 1))
-    TN = np.sum((all_preds == 0) & (all_labels == 0))
-    FP = np.sum((all_preds == 1) & (all_labels == 0))
-    FN = np.sum((all_preds == 0) & (all_labels == 1))
-    
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+    # 2. پیدا کردن اندیس‌های تست
+    test_indices = get_test_indices(test_loader)
+    print(f"Found {len(test_indices)} test samples to log.")
+
+    lines = []
+    TP, TN, FP, FN = 0, 0, 0, 0
+    total_samples = 0
+    correct_count = 0
+
+    lines.append("="*100)
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+    lines.append("="*100)
+    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
+    lines.append(header)
+    lines.append("-"*100)
+
+    # 3. پیمایش فقط روی اندیس‌های تست
+    for i, global_idx in enumerate(tqdm(test_indices, desc="Logging predictions")):
+        try:
+            # گرفتن داده از دیتاست پایه با اندیس سراسری
+            image, label = base_dataset[global_idx]
+            # گرفتن نام فایل
+            path, _ = get_sample_info(base_dataset, global_idx)
+        except Exception as e:
+            print(f"Error loading sample {global_idx}: {e}")
+            continue
+
+        image = image.unsqueeze(0).to(device)
+        label_int = int(label)
+        
+        with torch.no_grad():
+            # اگر نرمالایزر خارجی داده شود (برای مدل‌های تکی) استفاده می‌شود
+            # در غیر این صورت مدل خودش نرمالایزیشن را انجام می‌دهد (مانند StackingEnsemble)
+            input_img = normalizer(image, 0) if normalizer else image
+            output = model(input_img)
+            
+            # استخراج خروجی اگر تاپل باشد
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+        
+        pred_int = int(output.squeeze().item() > 0)
+        
+        is_correct = (pred_int == label_int)
+        if is_correct: correct_count += 1
+
+        # محاسبه ماتریس آشفتگی
+        if label_int == 1: # Real
+            if pred_int == 1: TP += 1
+            else: FN += 1
+        else: # Fake
+            if pred_int == 1: FP += 1
+            else: TN += 1
+        
+        total_samples += 1
+        sample_id = i + 1
+
+        # فرمت‌بندی نام فایل
+        filename = os.path.basename(path)
+        if len(filename) > 55:
+            filename = filename[:25] + "..." + filename[-27:]
+            
+        line = f"{sample_id:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
+        lines.append(line)
+
+    # محاسبه آمار نهایی
+    total = TP + TN + FP + FN
+    acc = (TP + TN) / total if total > 0 else 0
+    prec = TP / (TP + FP) if (TP + FP) > 0 else 0
+    rec = TP / (TP + FN) if (TP + FN) > 0 else 0
+    spec = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+    # ساخت خروجی نهایی
+    output_str = []
+    output_str.append("-" * 100)
+    output_str.append("SUMMARY STATISTICS:")
+    output_str.append("-" * 100)
+    output_str.append(f"Accuracy: {acc*100:.2f}%")
+    output_str.append(f"Precision: {prec:.4f}")
+    output_str.append(f"Recall: {rec:.4f}")
+    output_str.append(f"Specificity: {spec:.4f}")
+    output_str.append("\nConfusion Matrix:")
+    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
+    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
+    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
+    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
+    output_str.extend(lines)
 
     with open(save_path, 'w') as f:
-        f.write("-" * 100 + "\n")
-        f.write(f"SUMMARY STATISTICS ({model_name}):\n")
-        f.write("-" * 100 + "\n")
-        f.write(f"Accuracy: {accuracy:.2f}%\n")
-        f.write(f"Precision: {precision:.4f}\n")
-        f.write(f"Recall: {recall:.4f}\n")
-        f.write(f"Specificity: {specificity:.4f}\n")
-        f.write("\n")
-        f.write("Confusion Matrix:\n")
-        f.write(f"                 Predicted Real  Predicted Fake\n")
-        f.write(f"    Actual Real            {TN:<12}    {FP:<12}\n")
-        f.write(f"    Actual Fake            {FN:<12}    {TP:<12}\n")
-        f.write("\n")
-        f.write(f"Correct Predictions: {correct} ({accuracy:.2f}%)\n")
-        f.write(f"Incorrect Predictions: {incorrect} ({100-accuracy:.2f}%)\n")
-        f.write("\n")
-        f.write("=" * 100 + "\n")
-        f.write("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):\n")
-        f.write("=" * 100 + "\n")
-        header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}\n"
-        f.write(header)
-        f.write("-" * 100 + "\n")
-        
-        for i in range(len(all_labels)):
-            pred = all_preds[i]
-            label = all_labels[i]
-            is_correct = "Yes" if pred == label else "No"
-            
-            if all_paths:
-                path = all_paths[i]
-                if len(path) > 58:
-                    path = "..." + path[-55:]
-            else:
-                path = f"Sample_{i}"
-                
-            line = f"{i+1:<10} {path:<60} {label:<12} {pred:<15} {is_correct:<10}\n"
-            f.write(line)
-
-    print(f"McNemar test info saved to: {save_path}")
+        f.write("\n".join(output_str))
+    
+    print(f"✅ Prediction log saved to: {save_path}")
+    print("="*70)
 
 
 # ================== MAIN FUNCTION ==================
@@ -529,7 +550,7 @@ def main():
         ).to(device)
 
         if world_size > 1:
-            ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
+            ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank])
 
         if is_main:
             trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
@@ -625,19 +646,18 @@ def main():
             print(f"Model saved: {final_model_path}")
 
             # ==========================================
-            # Save McNemar Reports
+            # Save Prediction Logs (McNemar Test Data)
             # ==========================================
             
             # 1. Ensemble (Stacking) Report
-            mcnemar_ensemble_path = os.path.join(current_save_dir, 'mcnemar_stacking_results.txt')
-            save_mcnemar_report(ensemble_module, test_loader, device, mcnemar_ensemble_path, 
-                                model_name="Stacking Ensemble", is_ensemble=True)
+            log_path_ensemble = os.path.join(current_save_dir, 'prediction_log_stacking.txt')
+            save_prediction_log(ensemble_module, test_loader, device, log_path_ensemble, is_main, normalizer=None)
 
             # 2. Best Single Model Report
-            mcnemar_single_path = os.path.join(current_save_dir, 'mcnemar_best_single_results.txt')
-            save_mcnemar_report(base_models[best_idx], test_loader, device, mcnemar_single_path, 
-                                model_name=MODEL_NAMES[best_idx], is_ensemble=False, 
-                                single_model_idx=best_idx, means=MEANS, stds=STDS)
+            log_path_single = os.path.join(current_save_dir, 'prediction_log_best_single.txt')
+            # ساخت نرمالایزر برای مدل تکی
+            single_normalizer = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
+            save_prediction_log(base_models[best_idx], test_loader, device, log_path_single, is_main, normalizer=single_normalizer)
 
             vis_dir = os.path.join(current_save_dir, 'visualizations')
             generate_visualizations(
