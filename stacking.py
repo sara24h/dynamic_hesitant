@@ -467,7 +467,7 @@ def main():
             print(f"Best Single Model: {best_single:.2f}%")
             print(f"Stacking Accuracy (LR): {ensemble_test_acc:.2f}%")
             print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
-            print("="*70")
+            print("="*70)
 
             final_results = {
                 'seed': current_seed,
