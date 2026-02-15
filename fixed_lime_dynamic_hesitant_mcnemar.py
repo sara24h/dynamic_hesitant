@@ -37,6 +37,7 @@ def set_seed(seed: int = 42):
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
     """
     ارزیابی نهایی یکپارچه برای اطمینان از یکسان بودن اعداد در کنسول و لاگ.
+    شامل ذخیره داده‌های ROC.
     """
     if not is_main: return 0.0, None, None
 
@@ -46,6 +47,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     if hasattr(base_dataset, 'dataset'):
         base_dataset = base_dataset.dataset
     
+    # استخراج اندیس‌های تست
     if hasattr(test_loader_full, 'sampler') and hasattr(test_loader_full.sampler, 'indices'):
         test_indices = test_loader_full.sampler.indices
     elif hasattr(test_loader_full.dataset, 'indices'):
@@ -62,8 +64,11 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     lines.append("-"*100)
 
     TP, TN, FP, FN = 0, 0, 0, 0
-    all_probs = []
-    all_labels = []
+    
+    # لیست‌های برای ذخیره داده‌های ROC
+    all_y_true = []
+    all_y_score = []
+    all_y_pred = []
     
     print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
     
@@ -78,14 +83,20 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
+            # پیش‌بینی مدل
             output = model(image)
             if isinstance(output, (tuple, list)): output = output[0]
+            
+            # محاسبه احتمال (Score) و کلاس پیش‌بینی شده
             prob = torch.sigmoid(output.squeeze()).item()
             pred_int = int(prob > 0.5)
             
-            all_probs.append(prob)
-            all_labels.append(label_int)
+            # ذخیره برای ROC
+            all_y_true.append(label_int)
+            all_y_score.append(prob)
+            all_y_pred.append(pred_int)
             
+            # محاسبه ماتریس آشفتگی
             if label_int == 1:
                 if pred_int == 1: TP += 1
                 else: FN += 1
@@ -99,39 +110,85 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             line = f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}"
             lines.append(line)
 
-    total_samples = len(all_labels)
+    total_samples = len(all_y_true)
     correct_count = TP + TN
     acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
     
-    # چاپ نتایج نهایی مطابق فرمت خواسته شده
-    print(f"\n{'='*70}")
-    print(f"TEST SET RESULTS")
-    print(f"{'='*70}")
-    print(f" → Accuracy: {acc:.3f}%")
-    print(f" → Total Samples: {total_samples:,}")
-    print(f"\nConfusion Matrix:")
-    print(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
-    print(f"    Actual Real   {TP:<15} {FN:<15}")
-    print(f"    Actual Fake   {FP:<15} {TN:<15}")
-    print(f"{'='*70}")
+    # محاسبه معیارهای عملکرد
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    # ذخیره لاگ
+    # چاپ نتایج نهایی مطابق فرمت خواسته شده در کنسول
+    print(f"\nPrecision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"Specificity: {specificity:.4f}")
+    print(f"\nConfusion Matrix:")
+    print(f"                 Predicted Real  Predicted Fake")
+    print(f"    Actual Real      {TP:<15} {FN:<15}")
+    print(f"    Actual Fake      {FP:<15} {TN:<15}")
+    print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
+    print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
+    print("="*70)
+
+    # ذخیره لاگ متنی
     output_str = []
     output_str.append("-" * 100)
     output_str.append("SUMMARY STATISTICS:")
     output_str.append("-" * 100)
     output_str.append(f"Accuracy: {acc:.2f}%")
-    output_str.append(f"Correct: {correct_count} / {total_samples}")
+    output_str.append(f"Precision: {precision:.4f}")
+    output_str.append(f"Recall: {recall:.4f}")
+    output_str.append(f"Specificity: {specificity:.4f}")
     output_str.append("\nConfusion Matrix:")
     output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
     output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
     output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
+    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
+    output_str.append(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     output_str.extend(lines)
     
     log_path = os.path.join(save_dir, 'prediction_log.txt')
     with open(log_path, 'w') as f:
         f.write("\n".join(output_str))
     print(f"✅ Prediction log saved to: {log_path}")
+
+    # ────────────────────────────────────────────────────────────────
+    #                ذخیره داده‌های ROC (JSON & TXT)
+    # ────────────────────────────────────────────────────────────────
+    print("\nCollecting ROC data (y_true & y_score) ...")
+    
+    # تبدیل به آرایه نامپای
+    y_true_np = np.array(all_y_true)
+    y_score_np = np.array(all_y_score)
+    y_pred_np = np.array(all_y_pred)
+
+    # 1. ذخیره در JSON
+    roc_json_path = os.path.join(save_dir, "roc_data_test.json")
+    roc_data_json = {
+        "metadata": {
+            "seed": args.seed,
+            "dataset": args.dataset,
+            "num_samples": int(total_samples),
+            "positive_count": int(np.sum(y_true_np)),
+            "negative_count": int(total_samples - np.sum(y_true_np)),
+            "model": "fuzzy_hesitant_ensemble"
+        },
+        "y_true": y_true_np.tolist(),
+        "y_score": y_score_np.tolist(),
+        "y_pred": y_pred_np.tolist()
+    }
+    with open(roc_json_path, 'w', encoding='utf-8') as f:
+        json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
+    print(f"ROC data saved (JSON): {roc_json_path}")
+
+    # 2. ذخیره در TXT
+    roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
+    with open(roc_txt_path, 'w', encoding='utf-8') as f:
+        f.write("y_true\ty_score\ty_pred\n")
+        for t, s, p in zip(y_true_np, y_score_np, y_pred_np):
+            f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
+    print(f"ROC data saved (TXT):  {roc_txt_path}")
 
     # ویژوالایزیشن
     vis_dir = os.path.join(save_dir, 'visualizations')
@@ -140,7 +197,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
         args.num_grad_cam_samples, args.num_lime_samples,
         args.dataset, is_main)
 
-    return acc, np.array(all_labels), np.array(all_probs)
+    return acc, y_true_np, y_score_np
 
 
 # ================== MODEL CLASSES ==================
@@ -332,7 +389,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         train_correct = 0
         train_total = 0
         
-        # متغیرهای برای آمارهای دوره (Hesitancy, Cumsum, Activation)
+        # متغیرهای برای آمارهای دوره
         sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
         sum_cumsum_used = 0
         sum_active_models = torch.zeros(len(model_names), device=device)
