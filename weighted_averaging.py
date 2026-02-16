@@ -36,130 +36,6 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
-# ================== HELPER TO GET TEST INDICES ==================
-def get_test_indices(test_loader):
-    """
-    استخراج لیست اندیس‌های مربوط به تست از داخل DataLoader.
-    """
-    if hasattr(test_loader, 'sampler') and hasattr(test_loader.sampler, 'indices'):
-        return test_loader.sampler.indices
-    elif hasattr(test_loader.dataset, 'indices'):
-        return test_loader.dataset.indices
-    else:
-        return list(range(len(test_loader.dataset)))
-
-
-# ================== SAVE PREDICTION LOG (MCNEMAR FORMAT) ==================
-def save_prediction_log(model, test_loader, device, save_path, is_main):
-    """
-    ذخیره لیست پیش‌بینی‌ها دقیقاً روی همان داده‌های تستی که مدل دیده است.
-    """
-    if not is_main or test_loader is None: return
-
-    print("\n" + "="*70)
-    print("GENERATING PREDICTION LOG FILE (TEST SET ONLY)")
-    print("="*70)
-
-    model.eval()
-
-    # 1. استخراج دیتاست پایه
-    base_dataset = test_loader.dataset
-    if hasattr(base_dataset, 'dataset'):
-        base_dataset = base_dataset.dataset
-
-    # 2. پیدا کردن اندیس‌های تست
-    test_indices = get_test_indices(test_loader)
-    print(f"Found {len(test_indices)} test samples to log.")
-
-    lines = []
-    TP, TN, FP, FN = 0, 0, 0, 0
-    total_samples = 0
-    correct_count = 0
-
-    lines.append("="*100)
-    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
-    lines.append("="*100)
-    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
-    lines.append(header)
-    lines.append("-"*100)
-
-    # 3. پیمایش فقط روی اندیس‌های تست
-    for i, global_idx in enumerate(tqdm(test_indices, desc="Logging predictions")):
-        try:
-            # گرفتن داده از دیتاست پایه با اندیس سراسری
-            image, label = base_dataset[global_idx]
-            # گرفتن نام فایل
-            path, _ = get_sample_info(base_dataset, global_idx)
-        except Exception as e:
-            print(f"Error loading sample {global_idx}: {e}")
-            continue
-
-        image = image.unsqueeze(0).to(device)
-        label_int = int(label)
-        
-        with torch.no_grad():
-            # مدل Weighted Ensemble خودش نرمالایزیشن را انجام می‌دهد
-            output = model(image)
-            
-            # استخراج خروجی اگر تاپل باشد (خروجی مدل (logits, weights) است)
-            if isinstance(output, (tuple, list)):
-                output = output[0]
-                
-        pred_int = int(output.squeeze().item() > 0)
-        
-        is_correct = (pred_int == label_int)
-        if is_correct: correct_count += 1
-
-        # محاسبه ماتریس آشفتگی
-        if label_int == 1: # Real
-            if pred_int == 1: TP += 1
-            else: FN += 1
-        else: # Fake
-            if pred_int == 1: FP += 1
-            else: TN += 1
-        
-        total_samples += 1
-        sample_id = i + 1
-
-        # فرمت‌بندی نام فایل
-        filename = os.path.basename(path)
-        if len(filename) > 55:
-            filename = filename[:25] + "..." + filename[-27:]
-            
-        line = f"{sample_id:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
-        lines.append(line)
-
-    # محاسبه آمار نهایی
-    total = TP + TN + FP + FN
-    acc = (TP + TN) / total if total > 0 else 0
-    prec = TP / (TP + FP) if (TP + FP) > 0 else 0
-    rec = TP / (TP + FN) if (TP + FN) > 0 else 0
-    spec = TN / (TN + FP) if (TN + FP) > 0 else 0
-
-    # ساخت خروجی نهایی
-    output_str = []
-    output_str.append("-" * 100)
-    output_str.append("SUMMARY STATISTICS:")
-    output_str.append("-" * 100)
-    output_str.append(f"Accuracy: {acc*100:.2f}%")
-    output_str.append(f"Precision: {prec:.4f}")
-    output_str.append(f"Recall: {rec:.4f}")
-    output_str.append(f"Specificity: {spec:.4f}")
-    output_str.append("\nConfusion Matrix:")
-    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
-    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
-    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
-    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
-    output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
-    output_str.extend(lines)
-
-    with open(save_path, 'w') as f:
-        f.write("\n".join(output_str))
-    
-    print(f"✅ Prediction log saved to: {save_path}")
-    print("="*70)
-
-
 class MultiModelNormalization(nn.Module):
     def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
         super().__init__()
@@ -305,27 +181,66 @@ def evaluate_accuracy_ddp(model, loader, device):
 
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
+    """
+    ارزیابی نهایی و جمع‌آوری داده‌های y_true, y_score, y_pred برای خروجی JSON
+    منطق مشابه کد Stacking برای پشتیبانی از DDP و خروجی‌های دقیق
+    """
     model.eval()
     total_correct = 0
     total_samples = 0
-    last_weights = None 
     
+    # Get world_size from dist directly
+    ws = dist.get_world_size() if dist.is_initialized() else 1
+    
+    # Lists to store predictions for JSON export
+    all_y_true = []
+    all_y_score = []
+    all_y_pred = []
+    
+    last_weights = None
+
     if is_main:
-        print(f"\nEvaluating {name} set...")
+        print(f"\nEvaluating {name} set (Weighted Average)...")
         
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
         outputs, weights, _, _ = model(images, return_details=True)
         
+        # ذخیره وزن‌ها برای نمایش نهایی (فقط یک بار)
         if last_weights is None:
             last_weights = weights.detach().cpu()
             
-        pred = (outputs.squeeze(1) > 0).long()
-        total_correct += pred.eq(labels.long()).sum().item()
+        # Sigmoid to get probabilities
+        probs = torch.sigmoid(outputs.squeeze(1))
+        pred_int = (probs > 0.5).long()
+        
+        # Store results (CPU)
+        all_y_true.extend(labels.cpu().numpy().tolist())
+        all_y_score.extend(probs.cpu().numpy().tolist())
+        all_y_pred.extend(pred_int.cpu().numpy().tolist())
+        
+        total_correct += pred_int.eq(labels.long()).sum().item()
         total_samples += labels.size(0)
 
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+    # Aggregate results from all GPUs
+    if ws > 1:
+        # Gather lists from all processes
+        gathered_true = [None for _ in range(ws)]
+        gathered_score = [None for _ in range(ws)]
+        gathered_pred = [None for _ in range(ws)]
+        
+        dist.all_gather_object(gathered_true, all_y_true)
+        dist.all_gather_object(gathered_score, all_y_score)
+        dist.all_gather_object(gathered_pred, all_y_pred)
+        
+        if is_main:
+            # Flatten the list of lists
+            all_y_true = [item for sublist in gathered_true for item in sublist]
+            all_y_score = [item for sublist in gathered_score for item in sublist]
+            all_y_pred = [item for sublist in gathered_pred for item in sublist]
 
     if is_main:
         total_correct = stats[0].item()
@@ -335,7 +250,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         final_weights = last_weights.numpy() if last_weights is not None else np.zeros(len(model_names))
 
         print(f"\n{'='*70}")
-        print(f"{name.upper()} SET RESULTS")
+        print(f"{name.upper()} SET RESULTS (Weighted Average)")
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Samples: {total_samples:,}")
@@ -343,8 +258,10 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         for i, (w, mname) in enumerate(zip(final_weights, model_names)):
             print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
         print(f"{'='*70}")
-        return acc, final_weights.tolist()
-    return 0.0, [0.0]*len(model_names)
+        return acc, final_weights.tolist(), (all_y_true, all_y_score, all_y_pred)
+    
+    # Non-main processes return dummy data (not used)
+    return 0.0, [0.0]*len(model_names), ([], [], [])
 
 
 def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs, lr,
@@ -472,6 +389,153 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+# ================== HELPER TO GET TEST INDICES ==================
+def get_test_indices(test_loader):
+   
+    if hasattr(test_loader, 'sampler') and hasattr(test_loader.sampler, 'indices'):
+        return test_loader.sampler.indices
+    elif hasattr(test_loader.dataset, 'indices'):
+        return test_loader.dataset.indices
+    else:
+        return list(range(len(test_loader.dataset)))
+
+
+# ================== SAVE PREDICTION LOG (MCNEMAR FORMAT) ==================
+def save_prediction_log(model, test_loader, device, save_path, is_main):
+    
+    if not is_main or test_loader is None: return
+
+    print("\n" + "="*70)
+    print("GENERATING PREDICTION LOG FILE (TEST SET ONLY)")
+    print("="*70)
+
+    model.eval()
+
+    # 1. استخراج دیتاست پایه
+    base_dataset = test_loader.dataset
+    if hasattr(base_dataset, 'dataset'):
+        base_dataset = base_dataset.dataset
+
+    # 2. پیدا کردن اندیس‌های تست
+    test_indices = get_test_indices(test_loader)
+    print(f"Found {len(test_indices)} test samples to log.")
+
+    lines = []
+    TP, TN, FP, FN = 0, 0, 0, 0
+    total_samples = 0
+    correct_count = 0
+
+    lines.append("="*100)
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+    lines.append("="*100)
+    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
+    lines.append(header)
+    lines.append("-"*100)
+
+    # 3. پیمایش فقط روی اندیس‌های تست
+    for i, global_idx in enumerate(tqdm(test_indices, desc="Logging predictions")):
+        try:
+            # گرفتن داده از دیتاست پایه با اندیس سراسری
+            image, label = base_dataset[global_idx]
+            # گرفتن نام فایل
+            path, _ = get_sample_info(base_dataset, global_idx)
+        except Exception as e:
+            print(f"Error loading sample {global_idx}: {e}")
+            continue
+
+        image = image.unsqueeze(0).to(device)
+        label_int = int(label)
+        
+        with torch.no_grad():
+            # مدل Weighted Ensemble خودش نرمالایزیشن را انجام می‌دهد
+            output = model(image)
+            
+            # استخراج خروجی اگر تاپل باشد (خروجی مدل (logits, weights) است)
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+                
+        pred_int = int(output.squeeze().item() > 0)
+        
+        is_correct = (pred_int == label_int)
+        if is_correct: correct_count += 1
+
+        # محاسبه ماتریس آشفتگی
+        if label_int == 1: # Real
+            if pred_int == 1: TP += 1
+            else: FN += 1
+        else: # Fake
+            if pred_int == 1: FP += 1
+            else: TN += 1
+        
+        total_samples += 1
+        sample_id = i + 1
+
+        # فرمت‌بندی نام فایل
+        filename = os.path.basename(path)
+        if len(filename) > 55:
+            filename = filename[:25] + "..." + filename[-27:]
+            
+        line = f"{sample_id:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
+        lines.append(line)
+
+    # محاسبه آمار نهایی
+    total = TP + TN + FP + FN
+    acc = (TP + TN) / total if total > 0 else 0
+    prec = TP / (TP + FP) if (TP + FP) > 0 else 0
+    rec = TP / (TP + FN) if (TP + FN) > 0 else 0
+    spec = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+    # ساخت خروجی نهایی
+    output_str = []
+    output_str.append("-" * 100)
+    output_str.append("SUMMARY STATISTICS:")
+    output_str.append("-" * 100)
+    output_str.append(f"Accuracy: {acc*100:.2f}%")
+    output_str.append(f"Precision: {prec:.4f}")
+    output_str.append(f"Recall: {rec:.4f}")
+    output_str.append(f"Specificity: {spec:.4f}")
+    output_str.append("\nConfusion Matrix:")
+    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
+    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
+    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
+    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
+    output_str.extend(lines)
+
+    with open(save_path, 'w') as f:
+        f.write("\n".join(output_str))
+    
+    print(f"✅ Prediction log saved to: {save_path}")
+    print("="*70)
+
+
+# ================== NEW HELPER: SAVE PREDICTIONS JSON ==================
+def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name):
+    """
+    ذخیره خروجی‌ها در فرمت JSON مشخص شده
+    """
+    pos_count = sum(y_true)
+    neg_count = len(y_true) - pos_count
+    
+    output_data = {
+        "metadata": {
+            "seed": seed,
+            "dataset": dataset_name,
+            "num_samples": len(y_true),
+            "positive_count": pos_count,
+            "negative_count": neg_count,
+        },
+        "y_true": y_true,
+        "y_score": y_score,
+        "y_pred": y_pred
+    }
+
+    with open(save_path, 'w') as f:
+        json.dump(output_data, f, indent=4)
+    
+    print(f"✅ Predictions JSON saved to: {save_path}")
+
+
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Weighted Average Ensemble Training")
@@ -579,70 +643,10 @@ def main():
         print("="*70)
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
-    ensemble_test_acc, ensemble_weights = evaluate_ensemble_final_ddp(
+    
+    # --- دریافت خروجی‌ها برای JSON ---
+    ensemble_test_acc, ensemble_weights, predictions_data = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
-
-    # ────────────────────────────────────────────────────────────────
-    #                ذخیره داده‌های ROC (فقط روی فرآیند اصلی)
-    # ────────────────────────────────────────────────────────────────
-    if is_main:
-        print("\nCollecting ROC data (y_true & y_score) ...")
-
-        all_y_true = []
-        all_y_score = []
-        all_y_pred = []
-
-        ensemble_module.eval()
-        with torch.no_grad():
-            for images, labels in tqdm(test_loader, desc="ROC collection"):
-                images = images.to(device)
-                labels = labels.to(device).float()
-
-                outputs, _ = ensemble_module(images, return_details=False)
-                probs = torch.sigmoid(outputs).squeeze(1)  # [0,1]
-
-                preds = (probs > 0.5).long()
-
-                all_y_true.append(labels.cpu())
-                all_y_score.append(probs.cpu())
-                all_y_pred.append(preds.cpu())
-
-        y_true = torch.cat(all_y_true).numpy()
-        y_score = torch.cat(all_y_score).numpy()
-        y_pred = torch.cat(all_y_pred).numpy()
-
-        print(f"→ Collected {len(y_true):,} samples for ROC curve")
-
-        # 1. ذخیره در JSON (ساختارمند)
-        roc_json_path = os.path.join(args.save_dir, "roc_data_test.json")
-        roc_data_json = {
-            "metadata": {
-                "seed": args.seed,
-                "dataset": args.dataset,
-                "num_samples": int(len(y_true)),
-                "positive_count": int(np.sum(y_true)),
-                "negative_count": int(len(y_true) - np.sum(y_true)),
-                "model": "weighted_ensemble"
-            },
-            "y_true": y_true.tolist(),
-            "y_score": y_score.tolist(),
-            "y_pred": y_pred.tolist()
-        }
-
-        with open(roc_json_path, 'w', encoding='utf-8') as f:
-            json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
-
-        print(f"ROC data saved (JSON): {roc_json_path}")
-
-        # 2. ذخیره در TXT (ساده)
-        roc_txt_path = os.path.join(args.save_dir, "roc_data_test.txt")
-
-        with open(roc_txt_path, 'w', encoding='utf-8') as f:
-            f.write("y_true\ty_score\ty_pred\n")
-            for t, s, p in zip(y_true, y_score, y_pred):
-                f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
-
-        print(f"ROC data saved (TXT):  {roc_txt_path}")
 
     if is_main:
         print("\n" + "="*70)
@@ -652,6 +656,11 @@ def main():
         print(f"Ensemble Accuracy: {ensemble_test_acc:.2f}%")
         print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
+
+        # --- ذخیره فایل JSON ---
+        y_true, y_score, y_pred = predictions_data
+        json_path = os.path.join(args.save_dir, 'test_predictions.json')
+        save_predictions_json(y_true, y_score, y_pred, json_path, args.seed, args.dataset)
 
         final_results = {
             'seed': args.seed,
