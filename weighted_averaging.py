@@ -626,7 +626,9 @@ def main():
         args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
     ckpt_path = os.path.join(args.save_dir, 'best_weighted_ensemble.pt')
-    if os.path.exists(ckpt_path):
+    
+    # --- اصلاح: شرط is_main اضافه شد تا فقط GPU اصلی فایل را بخواند ---
+    if is_main and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         
         if hasattr(ensemble, 'module'):
@@ -634,8 +636,7 @@ def main():
         else:
             ensemble.weights.data.copy_(ckpt['weights'])
             
-        if is_main:
-            print("Best model weights loaded.\n")
+        print("Best model weights loaded.\n")
 
     if is_main:
         print("\n" + "="*70)
