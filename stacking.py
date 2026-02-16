@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,15 +41,18 @@ def set_seed(seed: int = 42):
 class MultiModelNormalization(nn.Module):
     def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
         super().__init__()
-        for i, (m, s) in enumerate(zip(means, stds)):
-            self.register_buffer(f'mean_{i}', torch.tensor(m).view(1, 3, 1, 1))
-            self.register_buffer(f'std_{i}', torch.tensor(s).view(1, 3, 1, 1))
+        # Register buffers for all models at once for efficiency
+        self.register_buffer('means', torch.tensor(means).view(-1, 3, 1, 1))
+        self.register_buffer('stds', torch.tensor(stds).view(-1, 3, 1, 1))
 
-    def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
-        return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (Batch, 3, H, W)
+        # Output shape: (Batch, Num_Models, 3, H, W) if we were to broadcast
+        # But here we just return the params, processing is done in ensemble
+        return x, self.means, self.stds
 
 
-# ================== STACKING META LEARNER (Logistic Regression) ==================
+# ================== STACKING META LEARNER ==================
 class StackingMetaLearner(nn.Module):
     def __init__(self, num_models: int):
         super().__init__()
@@ -58,14 +62,15 @@ class StackingMetaLearner(nn.Module):
         return self.linear(x)
 
 
-# ================== STACKING ENSEMBLE CLASS ==================
+# ================== OPTIMIZED STACKING ENSEMBLE ==================
 class StackingEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
                  stds: List[Tuple[float]], freeze_models: bool = True):
         super().__init__()
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
-        self.normalizations = MultiModelNormalization(means, stds)
+        self.normalization_params = MultiModelNormalization(means, stds)
+        
         self.meta_learner = StackingMetaLearner(self.num_models)
 
         if freeze_models:
@@ -75,16 +80,32 @@ class StackingEnsemble(nn.Module):
                     p.requires_grad = False
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
+        # 1. Get Normalization Parameters
+        _, means, stds = self.normalization_params(x)
+        
         logits_list = []
+        
+        # 2. Process each model (Optimized Loop)
+        # Note: Since models are frozen, we use torch.no_grad context manager outside if possible,
+        # but meta-learner needs grad. So we use it inside for the base models.
+        
         for i in range(self.num_models):
-            x_n = self.normalizations(x, i)
+            # Normalize on the fly
+            x_n = (x - means[i]) / stds[i]
+            
+            # Forward pass
             with torch.no_grad():
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-            logits_list.append(out)
+            
+            # Detach to ensure graph is cut (saves memory and compute for meta learner)
+            logits_list.append(out.detach())
         
+        # 3. Stack outputs
         stacked_logits = torch.cat(logits_list, dim=1)
+        
+        # 4. Meta Learner (Trainable)
         final_output = self.meta_learner(stacked_logits)
 
         if return_details:
@@ -142,12 +163,16 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
                               name: str, mean: Tuple[float, float, float],
                               std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
-    normalizer = MultiModelNormalization([mean], [std]).to(device)
+    # Simple normalization for single model
+    mean_t = torch.tensor(mean).view(1, 3, 1, 1).to(device)
+    std_t = torch.tensor(std).view(1, 3, 1, 1).to(device)
+
     correct = 0
     total = 0
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
-        images = normalizer(images, 0)
+        images = (images - mean_t) / std_t
+        
         out = model(images)
         if isinstance(out, (tuple, list)):
             out = out[0]
@@ -285,7 +310,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
             is_correct_str = "Yes" if t_label == p_label else "No"
             sample_path = f"sample_{i+1}.jpg"
             
-            if i < 20: # Print only first 20 to console to save time
+            if i < 20:
                 print(f"{i+1:<10} {sample_path:<60} {int(t_label):<12} {int(p_label):<15} {is_correct_str:<10}")
             elif i == 20:
                 print(f"... (Remaining {total_samples - 20} samples omitted from console log)")
@@ -300,7 +325,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
 
         print(f"{'='*100}")
 
-        # --- Save TXT Report ---
         txt_path = os.path.join(save_dir, 'classification_report.txt')
         with open(txt_path, 'w') as f:
             f.write(f"SUMMARY STATISTICS:\n")
@@ -326,7 +350,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
         
         print(f"\nReport saved to: {txt_path}")
 
-        # --- Save JSON Report ---
         json_output = {
             "metadata": {
                 "seed": seed,
@@ -357,7 +380,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
     return 0.0, [0.0]*len(model_names), 0.0
 
 
-# ================== OPTIMIZED TRAINING FUNCTION ==================
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
@@ -387,13 +409,15 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
         train_correct = 0
         train_total = 0
         
-        # Optimized loop: minimal overhead
+        # Optimization: Minimize overhead inside loop
         for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main):
-            images, labels = images.to(device), labels.to(device).float()
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True).float()
+            
             optimizer.zero_grad()
             
             outputs, _ = ensemble_model(images)
             loss = criterion(outputs.squeeze(1), labels)
+            
             loss.backward()
             optimizer.step()
 
@@ -420,7 +444,6 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
             print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
 
-        # Save only if best (minimal I/O)
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
             save_path = os.path.join(save_dir, 'best_stacking_lr.pt')
@@ -432,7 +455,6 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             }, save_path)
             print(f"\n✓ Best model saved -> {val_acc:.2f}%")
 
-        # Sync processes
         if dist.is_initialized():
             dist.barrier()
 
