@@ -37,7 +37,7 @@ def set_seed(seed: int = 42):
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
     """
     ارزیابی نهایی یکپارچه برای اطمینان از یکسان بودن اعداد در کنسول و لاگ.
-    شامل ذخیره داده‌های ROC.
+    شامل ذخیره داده‌های McNemar و ROC (y_true, y_score, y_pred).
     """
     if not is_main: return 0.0, None, None
 
@@ -57,7 +57,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
 
     lines = []
     lines.append("="*100)
-    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS")
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
     lines.append("="*100)
     header = f"{'ID':<10} {'Filename':<60} {'True':<10} {'Pred':<10} {'Correct':<10}"
     lines.append(header)
@@ -65,7 +65,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
 
     TP, TN, FP, FN = 0, 0, 0, 0
     
-    # لیست‌های برای ذخیره داده‌های ROC
+    # لیست‌های برای ذخیره داده‌های ROC و JSON
     all_y_true = []
     all_y_score = []
     all_y_pred = []
@@ -91,7 +91,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             prob = torch.sigmoid(output.squeeze()).item()
             pred_int = int(prob > 0.5)
             
-            # ذخیره برای ROC
+            # ذخیره برای ROC و JSON
             all_y_true.append(label_int)
             all_y_score.append(prob)
             all_y_pred.append(pred_int)
@@ -120,7 +120,10 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
 
     # چاپ نتایج نهایی مطابق فرمت خواسته شده در کنسول
-    print(f"\nPrecision: {precision:.4f}")
+    print(f"\n{'='*70}")
+    print("FINAL RESULTS")
+    print(f"{'='*70}")
+    print(f"Precision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"Specificity: {specificity:.4f}")
     print(f"\nConfusion Matrix:")
@@ -131,7 +134,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     print("="*70)
 
-    # ذخیره لاگ متنی
+    # ذخیره لاگ متنی (McNemar Format)
     output_str = []
     output_str.append("-" * 100)
     output_str.append("SUMMARY STATISTICS:")
@@ -601,10 +604,12 @@ def main():
     # لود بهترین مدل
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
-    if os.path.exists(ckpt_path):
+    
+    # --- FIX: فقط GPU اصلی فایل را بخواند تا ارور PytorchStreamReader برطرف شود ---
+    if is_main and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device)
         ensemble_module.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
-        if is_main: print("Best model loaded.\n")
+        print("Best model loaded.\n")
 
     if is_main:
         print("\n" + "="*70)
@@ -632,6 +637,8 @@ def main():
 
         # ذخیره نتایج JSON
         final_results = {
+            'seed': args.seed,
+            'method': 'Fuzzy_Hesitant',
             'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
             'ensemble': {'test_accuracy': float(final_acc)},
             'improvement': float(final_acc - best_single)
@@ -639,17 +646,16 @@ def main():
         with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
             json.dump(final_results, f, indent=4)
 
-        # ذخیره مدل نهایی
         torch.save({
             'ensemble_state_dict': ensemble_module.state_dict(),
             'model_names': MODEL_NAMES,
             'means': MEANS,
-            'stds': STDS
+            'stds': STDS,
+            'seed': args.seed
         }, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
 
     cleanup_distributed()
     
-    # رسم ROC
     if is_main:
         plot_roc_and_f1(
             ensemble_module,
