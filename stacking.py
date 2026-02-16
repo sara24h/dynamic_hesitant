@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -213,7 +212,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"\nEvaluating {name} set (Stacking - Logistic Regression)...")
     
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
-        images, labels = images.to(device), labels.to(device).float()
+        images, labels = images.to(device), labels.to(device)
         # Only need final output for accuracy
         outputs, _ = model(images, return_details=False)
         
@@ -362,50 +361,29 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-# ================== MCNEMAR REPORT FUNCTION (FIXED) ==================
+# ================== MCNEMAR REPORT FUNCTION ==================
 @torch.no_grad()
 def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is_ensemble=True, single_model_idx=None, means=None, stds=None):
     """
     Save results in a specific text format for McNemar test.
-    FIXED: Logic now strictly mirrors evaluate_accuracy_ddp to ensure consistency.
+    Works for both Ensemble (Stacking) and Single models.
     """
     model.eval()
+    all_preds = []
+    all_labels = []
+    all_paths = []
     
-    # Local buffers
-    local_correct = 0
-    local_total = 0
+    has_paths = hasattr(loader.dataset, 'samples') or hasattr(loader.dataset, 'paths')
     
-    # Buffers for Confusion Matrix (TP, TN, FP, FN)
-    local_TP = 0
-    local_TN = 0
-    local_FP = 0
-    local_FN = 0
-    
-    # Check if running in DDP mode
-    is_distributed = dist.is_initialized()
-    rank = 0
-    world_size = 1
-    if is_distributed:
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-    
-    is_main = (rank == 0)
+    print(f"\nGenerating McNemar report for {model_name}...")
     
     # Normalizer for single model case
     normalizer = None
     if not is_ensemble and single_model_idx is not None and means is not None:
         normalizer = MultiModelNormalization([means[single_model_idx]], [stds[single_model_idx]]).to(device)
 
-    # Only collect paths on Main Process to avoid duplicates
-    all_paths = []
-    has_paths = hasattr(loader.dataset, 'samples') or hasattr(loader.dataset, 'paths')
-
-    print(f"\n[Rank {rank}] Generating McNemar report for {model_name}...")
-
-    # 1. Evaluation Loop (Gather local stats)
     for batch_idx, (images, labels) in enumerate(loader):
         images = images.to(device)
-        labels = labels.to(device).float()  # Cast to float first to match eval functions
         
         if is_ensemble:
             outputs, _ = model(images)
@@ -414,220 +392,85 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is
                 images = normalizer(images, 0)
             outputs = model(images)
             
-        # Handle tuple outputs (e.g., from single models returning features)
         if isinstance(outputs, (tuple, list)):
             outputs = outputs[0]
             
-        # Prediction Logic: MUST match evaluate_accuracy_ddp
-        pred = (outputs.squeeze(1) > 0).long()
-        labels_long = labels.long()  # Convert labels to long for comparison
+        preds = (outputs.squeeze(1) > 0).long()
         
-        # Calculate local stats
-        local_total += labels_long.size(0)
-        local_correct += (pred == labels_long).sum().item()
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
         
-        # Update Confusion Matrix elements
-        local_TP += ((pred == 1) & (labels_long == 1)).sum().item()
-        local_TN += ((pred == 0) & (labels_long == 0)).sum().item()
-        local_FP += ((pred == 1) & (labels_long == 0)).sum().item()
-        local_FN += ((pred == 0) & (labels_long == 1)).sum().item()
-
-        # Only collect paths on Main Process
-        if is_main and has_paths:
+        if has_paths:
             try:
                 start_idx = batch_idx * loader.batch_size
                 end_idx = start_idx + images.size(0)
-                
-                # NOTE: In DistributedSampler, indices are shuffled per process.
-                # Getting paths by global index here is tricky without the sampler indices.
-                # This simplified path collection might be incomplete or misordered in DDP.
-                # However, the stats (Accuracy) gathered above are correct.
-                
                 if hasattr(loader.dataset, 'samples'):
-                    # Try to handle if samples is list of tuples (path, label)
                     batch_paths = [loader.dataset.samples[i][0] for i in range(start_idx, min(end_idx, len(loader.dataset)))]
+                    all_paths.extend(batch_paths)
                 elif hasattr(loader.dataset, 'paths'):
                      batch_paths = [loader.dataset.paths[i] for i in range(start_idx, min(end_idx, len(loader.dataset)))]
-                else:
-                    batch_paths = []
-                
-                all_paths.extend(batch_paths)
-            except Exception as e:
-                # Silently fail path collection to not break accuracy calculation
+                     all_paths.extend(batch_paths)
+            except:
                 pass
 
-    # 2. Aggregate Stats across all GPUs
-    if is_distributed:
-        # Create tensors for reduction
-        stats_tensor = torch.tensor([local_correct, local_total, local_TP, local_TN, local_FP, local_FN], 
-                                    dtype=torch.long, device=device)
-        
-        # Sum up stats from all processes
-        dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
-        
-        correct = stats_tensor[0].item()
-        total = stats_tensor[1].item()
-        TP = stats_tensor[2].item()
-        TN = stats_tensor[3].item()
-        FP = stats_tensor[4].item()
-        FN = stats_tensor[5].item()
-    else:
-        correct = local_correct
-        total = local_total
-        TP = local_TP
-        TN = local_TN
-        FP = local_FP
-        FN = local_FN
-
-    # 3. Calculate Metrics
-    accuracy = correct / total * 100 if total > 0 else 0
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    
+    correct = np.sum(all_preds == all_labels)
+    incorrect = len(all_labels) - correct
+    accuracy = correct / len(all_labels) * 100
+    
+    TP = np.sum((all_preds == 1) & (all_labels == 1))
+    TN = np.sum((all_preds == 0) & (all_labels == 0))
+    FP = np.sum((all_preds == 1) & (all_labels == 0))
+    FN = np.sum((all_preds == 0) & (all_labels == 1))
+    
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    # 4. Write to File (Only Main Process)
-    if is_main:
-        with open(save_path, 'w') as f:
-            f.write("-" * 100 + "\n")
-            f.write(f"SUMMARY STATISTICS ({model_name}):\n")
-            f.write("-" * 100 + "\n")
-            f.write(f"Accuracy: {accuracy:.2f}%\n")
-            f.write(f"Precision: {precision:.4f}\n")
-            f.write(f"Recall: {recall:.4f}\n")
-            f.write(f"Specificity: {specificity:.4f}\n")
-            f.write("\n")
-            f.write("Confusion Matrix:\n")
-            f.write(f"                 Predicted Real  Predicted Fake\n")
-            f.write(f"    Actual Real            {TN:<12}    {FP:<12}\n")
-            f.write(f"    Actual Fake            {FN:<12}    {TP:<12}\n")
-            f.write("\n")
-            f.write(f"Correct Predictions: {correct} ({accuracy:.2f}%)\n")
-            f.write(f"Incorrect Predictions: {total - correct} ({100-accuracy:.2f}%)\n")
-            f.write("\n")
-            f.write("=" * 100 + "\n")
-            f.write("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):\n")
-            f.write("=" * 100 + "\n")
-            header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}\n"
-            f.write(header)
-            f.write("-" * 100 + "\n")
+    with open(save_path, 'w') as f:
+        f.write("-" * 100 + "\n")
+        f.write(f"SUMMARY STATISTICS ({model_name}):\n")
+        f.write("-" * 100 + "\n")
+        f.write(f"Accuracy: {accuracy:.2f}%\n")
+        f.write(f"Precision: {precision:.4f}\n")
+        f.write(f"Recall: {recall:.4f}\n")
+        f.write(f"Specificity: {specificity:.4f}\n")
+        f.write("\n")
+        f.write("Confusion Matrix:\n")
+        f.write(f"                 Predicted Real  Predicted Fake\n")
+        f.write(f"    Actual Real            {TN:<12}    {FP:<12}\n")
+        f.write(f"    Actual Fake            {FN:<12}    {TP:<12}\n")
+        f.write("\n")
+        f.write(f"Correct Predictions: {correct} ({accuracy:.2f}%)\n")
+        f.write(f"Incorrect Predictions: {incorrect} ({100-accuracy:.2f}%)\n")
+        f.write("\n")
+        f.write("=" * 100 + "\n")
+        f.write("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):\n")
+        f.write("=" * 100 + "\n")
+        header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}\n"
+        f.write(header)
+        f.write("-" * 100 + "\n")
+        
+        for i in range(len(all_labels)):
+            pred = all_preds[i]
+            label = all_labels[i]
+            is_correct = "Yes" if pred == label else "No"
             
-            # NOTE: Due to DDP shuffling, we cannot easily reconstruct the exact order of samples 
-            # across all GPUs to list them 1-by-1 correctly without passing a global index. 
-            # Since McNemar Test only needs the Confusion Matrix (Accuracy), the table below 
-            # will only show samples seen by Rank 0 (approximately 1/world_size of data).
-            
-            for i in range(len(all_paths)):
+            if all_paths:
                 path = all_paths[i]
                 if len(path) > 58:
                     path = "..." + path[-55:]
+            else:
+                path = f"Sample_{i}"
                 
-                # Since we didn't store preds/labels for every sample to save memory/complexity 
-                # in this specific fix, we'll just list the paths here or indicate aggregation.
-                # To keep the format, we will leave label/pred columns as "N/A" or similar if we didn't store them.
-                # However, to match the requested format strictly, we would need to store all preds.
-                # Given the priority is the ACCURACY MATCH, the summary above is the most critical part.
-                
-                line = f"{i+1:<10} {path:<60} {'N/A':<12} {'N/A':<15} {'N/A':<10}\n"
-                f.write(line)
-                
-            if is_distributed:
-                 f.write("\n[INFO] Due to distributed training, detailed sample-by-sample list shows only Rank 0's portion.\n")
-                 f.write("[INFO] Aggregated Accuracy and Confusion Matrix (above) cover the FULL test set.\n")
+            line = f"{i+1:<10} {path:<60} {label:<12} {pred:<15} {is_correct:<10}\n"
+            f.write(line)
 
-        print(f"McNemar test info saved to: {save_path} (Aggregated Accuracy: {accuracy:.2f}%)")
+    print(f"McNemar test info saved to: {save_path}")
 
 
-# ================== SAVE PREDICTIONS TO TXT (FIXED FOR DDP) ==================
-def save_predictions_to_txt(model, loader, device, save_path, metadata_info):
-    """
-    Generates and saves y_true, y_score, y_pred, and metadata to a .txt file in JSON format.
-    FIXED: Handles DDP by gathering results from all GPUs to Main Process.
-    """
-    model.eval()
-    
-    is_distributed = dist.is_initialized()
-    rank = 0
-    if is_distributed:
-        rank = dist.get_rank()
-    
-    # Local lists
-    local_y_true = []
-    local_y_score = []
-    
-    print(f"\n[Rank {rank}] Generating prediction results for JSON export...")
-
-    with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            
-            # Get model output
-            outputs, _ = model(images, return_details=False)
-            
-            # Apply Sigmoid to get probabilities (Scores)
-            probs = torch.sigmoid(outputs).squeeze(1).cpu().numpy()
-            
-            # Get True Labels
-            trues = labels.cpu().numpy().astype(int)
-            
-            local_y_score.extend(probs.tolist())
-            local_y_true.extend(trues.tolist())
-
-    # Aggregate logic
-    if is_distributed:
-        # Convert lists to tensors for gathering
-        # Note: For very large datasets, this might hit GPU memory limits. 
-        # Usually test sets fit, or we can gather on CPU.
-        
-        # Gather sizes first
-        size = torch.tensor([len(local_y_score)], dtype=torch.long, device=device)
-        all_sizes = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(dist.get_world_size())]
-        dist.all_gather(all_sizes, size)
-        all_sizes = [int(s.item()) for s in all_sizes]
-        
-        max_size = max(all_sizes)
-        
-        # Pad tensors to max_size for gathering
-        # We use CPU tensors to save GPU memory if possible, but dist.gather usually needs GPU or handled carefully.
-        # Let's stick to GPU for simplicity of DDP API.
-        
-        t_scores = torch.tensor(local_y_score + [0.0]*(max_size - len(local_y_score)), dtype=torch.float32, device=device)
-        t_labels = torch.tensor(local_y_true + [0]*(max_size - len(local_y_true)), dtype=torch.int, device=device)
-        
-        gathered_scores = [torch.zeros(max_size, dtype=torch.float32, device=device) for _ in range(dist.get_world_size())]
-        gathered_labels = [torch.zeros(max_size, dtype=torch.int, device=device) for _ in range(dist.get_world_size())]
-        
-        dist.all_gather(gathered_scores, t_scores)
-        dist.all_gather(gathered_labels, t_labels)
-        
-        if rank == 0:
-            all_y_true = []
-            all_y_score = []
-            for i, sz in enumerate(all_sizes):
-                all_y_score.extend(gathered_scores[i][:sz].cpu().numpy().tolist())
-                all_y_true.extend(gathered_labels[i][:sz].cpu().numpy().tolist())
-    else:
-        all_y_true = local_y_true
-        all_y_score = local_y_score
-
-    # Save only on Main Process
-    if rank == 0:
-        # Get Predictions (0 or 1)
-        all_y_pred = [1 if s > 0.5 else 0 for s in all_y_score]
-
-        # Prepare the dictionary structure
-        output_data = {
-            "metadata": metadata_info,
-            "y_true": all_y_true,
-            "y_score": all_y_score,
-            "y_pred": all_y_pred
-        }
-
-        # Save to text file (as JSON content)
-        with open(save_path, 'w') as f:
-            json.dump(output_data, f, indent=4)
-        
-        print(f"Prediction data saved to: {save_path}")
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Stacking Ensemble Training with Logistic Regression")
@@ -813,42 +656,6 @@ def main():
                 MODEL_NAMES,
                 is_main
             )
-
-            # ==========================================
-            # NEW: Save Detailed Predictions to TXT
-            # ==========================================
-            
-            # We run a quick loop to get exact counts for metadata
-            # Alternatively, you could calculate this inside save_predictions_to_txt
-            temp_true = []
-            ensemble_module.eval()
-            with torch.no_grad():
-                for _, labels in test_loader:
-                    temp_true.extend(labels.numpy().tolist())
-            
-            num_pos = sum(temp_true)
-            num_neg = len(temp_true) - num_pos
-            
-            pred_metadata = {
-                "seed": current_seed,
-                "dataset": args.dataset,
-                "num_samples": len(temp_true),
-                "positive_count": int(num_pos),
-                "negative_count": int(num_neg),
-            }
-            
-            json_output_path = os.path.join(current_save_dir, 'detailed_predictions.txt')
-            save_predictions_to_txt(
-                ensemble_module, 
-                test_loader, 
-                device, 
-                json_output_path, 
-                pred_metadata
-            )
-            
-            print("-" * 70)
-            print(f"Detailed prediction results exported to {json_output_path}")
-            print("-" * 70)
 
 if __name__ == "__main__":
     main()
