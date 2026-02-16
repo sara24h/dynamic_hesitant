@@ -208,6 +208,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     total_correct = 0
     total_samples = 0
     
+    # Get world_size from dist directly to fix scope error
+    ws = dist.get_world_size() if dist.is_initialized() else 1
+    
     # Lists to store predictions for JSON export
     all_y_true = []
     all_y_score = []
@@ -236,19 +239,19 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
-    # Aggregate results from all GPUs (Simple concatenation/gathering)
-    # Note: In multi-GPU, order might differ, but set-wise it's consistent for ROC/AUC
-    if world_size > 1:
+    # Aggregate results from all GPUs
+    if ws > 1:
         # Gather lists from all processes
-        gathered_true = [None for _ in range(world_size)]
-        gathered_score = [None for _ in range(world_size)]
-        gathered_pred = [None for _ in range(world_size)]
+        gathered_true = [None for _ in range(ws)]
+        gathered_score = [None for _ in range(ws)]
+        gathered_pred = [None for _ in range(ws)]
         
         dist.all_gather_object(gathered_true, all_y_true)
         dist.all_gather_object(gathered_score, all_y_score)
         dist.all_gather_object(gathered_pred, all_y_pred)
         
         if is_main:
+            # Flatten the list of lists
             all_y_true = [item for sublist in gathered_true for item in sublist]
             all_y_score = [item for sublist in gathered_score for item in sublist]
             all_y_pred = [item for sublist in gathered_pred for item in sublist]
@@ -278,6 +281,8 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         
         print(f"{'='*70}")
         return acc, weights.tolist(), bias, (all_y_true, all_y_score, all_y_pred)
+    
+    # Non-main processes return dummy data (not used)
     return 0.0, [0.0]*len(model_names), 0.0, ([], [], [])
 
 
