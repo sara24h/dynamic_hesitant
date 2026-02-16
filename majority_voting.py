@@ -499,9 +499,29 @@ def main():
 
     ensemble = MajorityVotingEnsemble(base_models, MEANS, STDS, freeze_models=True).to(device)
 
-    train_loader, val_loader, test_loader = create_dataloaders(
-        args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
+    # --- تغییر مهم: مدیریت خطای لود کردن دیتاست ---
+    try:
+        train_loader, val_loader, test_loader = create_dataloaders(
+            args.data_dir, args.batch_size, dataset_type=args.dataset,
+            is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
+    except FileNotFoundError as e:
+        if is_main:
+            print(f"\n[ERROR] Dataset loading failed: {e}")
+            print(f"[HINT] Please check if your --data_dir ('{args.data_dir}') contains the correct folder structure.")
+            print(f"[HINT] Listing contents of provided directory:")
+            if os.path.exists(args.data_dir):
+                print(os.listdir(args.data_dir))
+                # بررسی عمیق‌تر برای Kaggle
+                for item in os.listdir(args.data_dir):
+                    subpath = os.path.join(args.data_dir, item)
+                    if os.path.isdir(subpath):
+                        print(f"  -> Contents of '{item}': {os.listdir(subpath)}")
+        cleanup_distributed()
+        return
+    except Exception as e:
+        if is_main: print(f"Unexpected error: {e}")
+        cleanup_distributed()
+        return
 
     if is_main: print("\n" + "="*70); print("INDIVIDUAL MODEL PERFORMANCE"); print("="*70)
     individual_accs = []
@@ -515,11 +535,10 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    # ارزیابی سریع (اختیاری - برای نمایش توزیع آراء در کنسول)
+    # ارزیابی سریع (اختیاری)
     ensemble_test_acc, vote_dist, stats = evaluate_ensemble_final_ddp(ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
     if is_main:
-        # ایجاد پوشه خروجی
         os.makedirs(args.save_dir, exist_ok=True)
 
         print("\n" + "="*70)
@@ -545,10 +564,8 @@ def main():
         print(f"Improvement: {final_acc - best_single:+.2f}%")
         print("="*70)
 
-        # ذخیره فایل چک‌پوینت
         save_ensemble_checkpoint(os.path.join(args.save_dir, 'best_ensemble_model.pt'), ensemble, args.model_paths, MODEL_NAMES, final_acc, MEANS, STDS)
 
-        # ذخیره نتایج نهایی JSON
         final_results = {
             'seed': args.seed,
             'method': 'Majority Voting',
