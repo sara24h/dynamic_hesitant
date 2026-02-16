@@ -552,7 +552,7 @@ def main():
             if world_size > 1:
                 # فعال‌سازی find_unused_parameters برای مدل‌های فریز شده
                 ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank, 
-                               find_unused_parameters=True, gradient_as_bucket_view=True)
+                               find_unused_parameters=False, gradient_as_bucket_view=True)
 
             if is_main:
                 trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
