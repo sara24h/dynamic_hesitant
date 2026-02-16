@@ -207,6 +207,11 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     model.eval()
     total_correct = 0
     total_samples = 0
+    
+    # Lists to store predictions for JSON export
+    all_y_true = []
+    all_y_score = []
+    all_y_pred = []
 
     if is_main:
         print(f"\nEvaluating {name} set (Stacking - Logistic Regression)...")
@@ -216,12 +221,37 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         # Only need final output for accuracy
         outputs, _ = model(images, return_details=False)
         
-        pred = (outputs.squeeze(1) > 0).long()
-        total_correct += pred.eq(labels.long()).sum().item()
+        # Sigmoid to get probabilities
+        probs = torch.sigmoid(outputs.squeeze(1))
+        pred_int = (probs > 0.5).long()
+        
+        # Store results (CPU)
+        all_y_true.extend(labels.cpu().numpy().tolist())
+        all_y_score.extend(probs.cpu().numpy().tolist())
+        all_y_pred.extend(pred_int.cpu().numpy().tolist())
+        
+        total_correct += pred_int.eq(labels.long()).sum().item()
         total_samples += labels.size(0)
 
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+    # Aggregate results from all GPUs (Simple concatenation/gathering)
+    # Note: In multi-GPU, order might differ, but set-wise it's consistent for ROC/AUC
+    if world_size > 1:
+        # Gather lists from all processes
+        gathered_true = [None for _ in range(world_size)]
+        gathered_score = [None for _ in range(world_size)]
+        gathered_pred = [None for _ in range(world_size)]
+        
+        dist.all_gather_object(gathered_true, all_y_true)
+        dist.all_gather_object(gathered_score, all_y_score)
+        dist.all_gather_object(gathered_pred, all_y_pred)
+        
+        if is_main:
+            all_y_true = [item for sublist in gathered_true for item in sublist]
+            all_y_score = [item for sublist in gathered_score for item in sublist]
+            all_y_pred = [item for sublist in gathered_pred for item in sublist]
 
     if is_main:
         total_correct = stats[0].item()
@@ -247,8 +277,8 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
             print(f"    {i+1:2d}. {mname:<25}: {w:+.4f}")
         
         print(f"{'='*70}")
-        return acc, weights.tolist(), bias
-    return 0.0, [0.0]*len(model_names), 0.0
+        return acc, weights.tolist(), bias, (all_y_true, all_y_score, all_y_pred)
+    return 0.0, [0.0]*len(model_names), 0.0, ([], [], [])
 
 
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
@@ -492,6 +522,33 @@ def save_prediction_log(model, test_loader, device, save_path, is_main, normaliz
     print("="*70)
 
 
+# ================== NEW HELPER: SAVE PREDICTIONS JSON ==================
+def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name):
+    """
+    ذخیره خروجی‌ها در فرمت JSON مشخص شده
+    """
+    pos_count = sum(y_true)
+    neg_count = len(y_true) - pos_count
+    
+    output_data = {
+        "metadata": {
+            "seed": seed,
+            "dataset": dataset_name,
+            "num_samples": len(y_true),
+            "positive_count": pos_count,
+            "negative_count": neg_count,
+        },
+        "y_true": y_true,
+        "y_score": y_score,
+        "y_pred": y_pred
+    }
+
+    with open(save_path, 'w') as f:
+        json.dump(output_data, f, indent=4)
+    
+    print(f"✅ Predictions JSON saved to: {save_path}")
+
+
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Stacking Ensemble Training with Logistic Regression")
@@ -600,7 +657,8 @@ def main():
 
         ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
         
-        ensemble_test_acc, learned_weights, learned_bias = evaluate_ensemble_final_ddp(
+        # --- دریافت خروجی‌ها برای JSON ---
+        ensemble_test_acc, learned_weights, learned_bias, predictions_data = evaluate_ensemble_final_ddp(
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
         if is_main:
@@ -611,6 +669,11 @@ def main():
             print(f"Stacking Accuracy (LR): {ensemble_test_acc:.2f}%")
             print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
             print("="*70)
+
+            # --- ذخیره فایل JSON ---
+            y_true, y_score, y_pred = predictions_data
+            json_path = os.path.join(current_save_dir, 'test_predictions.json')
+            save_predictions_json(y_true, y_score, y_pred, json_path, current_seed, args.dataset)
 
             final_results = {
                 'seed': current_seed,
