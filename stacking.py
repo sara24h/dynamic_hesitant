@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -196,7 +195,7 @@ def gather_all_data(local_data, world_size):
     return gathered_data
 
 
-# ================== UPDATED EVALUATION FUNCTION FOR REPORT ==================
+# ================== DETAILED EVALUATION FUNCTION ==================
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_dir, seed, dataset_name, is_main=True):
     model.eval()
@@ -258,7 +257,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
         weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
         bias = meta_learner.linear.bias.data.cpu().item()
 
-        # --- Print Report to Console ---
         print(f"\n{'='*100}")
         print(f"SUMMARY STATISTICS:")
         print(f"{'-'*100}")
@@ -279,7 +277,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
         print(f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}")
         print(f"{'-'*100}")
         
-        # === FIX: Define and populate json_sample_list ===
         json_sample_list = []
         
         for i in range(total_samples):
@@ -288,10 +285,10 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
             is_correct_str = "Yes" if t_label == p_label else "No"
             sample_path = f"sample_{i+1}.jpg"
             
-            if i < 50:
+            if i < 20: # Print only first 20 to console to save time
                 print(f"{i+1:<10} {sample_path:<60} {int(t_label):<12} {int(p_label):<15} {is_correct_str:<10}")
-            elif i == 50:
-                print(f"... (Remaining {total_samples - 50} samples omitted from console log)")
+            elif i == 20:
+                print(f"... (Remaining {total_samples - 20} samples omitted from console log)")
                 
             json_sample_list.append({
                 "id": i+1,
@@ -360,6 +357,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
     return 0.0, [0.0]*len(model_names), 0.0
 
 
+# ================== OPTIMIZED TRAINING FUNCTION ==================
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
@@ -389,6 +387,7 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
         train_correct = 0
         train_total = 0
         
+        # Optimized loop: minimal overhead
         for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main):
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
@@ -421,6 +420,7 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
             print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
 
+        # Save only if best (minimal I/O)
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
             save_path = os.path.join(save_dir, 'best_stacking_lr.pt')
@@ -430,8 +430,9 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                 'val_acc': val_acc,
                 'history': history
             }, save_path)
-            print(f"\n✓ Best model saved → {val_acc:.2f}%")
+            print(f"\n✓ Best model saved -> {val_acc:.2f}%")
 
+        # Sync processes
         if dist.is_initialized():
             dist.barrier()
 
@@ -555,7 +556,7 @@ def main():
         best_idx = individual_accs.index(best_single)
 
         if is_main:
-            print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+            print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) -> {best_single:.2f}%")
             print("="*70)
 
         best_val_acc, history = train_stacking(
