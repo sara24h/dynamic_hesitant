@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,10 +13,13 @@ import json
 import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
-from metrics_utils import plot_roc_and_f1
 
+# Suppress warnings
 warnings.filterwarnings("ignore")
 
+# Assuming these utils exist in your project structure
+# If running standalone, ensure these files are available.
+from metrics_utils import plot_roc_and_f1
 from dataset_utils import (
     UADFVDataset, 
     CustomGenAIDataset, 
@@ -23,7 +27,6 @@ from dataset_utils import (
     get_sample_info, 
     worker_init_fn
 )
-
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
 
 # ================== UTILITY FUNCTIONS ==================
@@ -113,6 +116,7 @@ class StackingEnsemble(nn.Module):
             batch_size = x.size(0)
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             return final_output, dummy_weights
+
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
@@ -361,7 +365,6 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-# ================== MCNEMAR REPORT FUNCTION ==================
 # ================== MCNEMAR REPORT FUNCTION (FIXED FOR DDP) ==================
 @torch.no_grad()
 def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is_ensemble=True, single_model_idx=None, means=None, stds=None):
@@ -620,6 +623,8 @@ def save_predictions_to_txt(model, loader, device, save_path, metadata_info):
             json.dump(output_data, f, indent=4)
         
         print(f"Prediction data saved to: {save_path}")
+
+
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Stacking Ensemble Training with Logistic Regression")
@@ -731,6 +736,12 @@ def main():
         ensemble_test_acc, learned_weights, learned_bias = evaluate_ensemble_final_ddp(
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
+        # ============================================================
+        # CRITICAL FIX: BARRIER TO SYNC ALL PROCESSES BEFORE IO OPS
+        # ============================================================
+        if dist.is_initialized():
+            dist.barrier()
+
         if is_main:
             print("\n" + "="*70)
             print("FINAL COMPARISON")
@@ -773,11 +784,17 @@ def main():
             }, final_model_path)
             print(f"Model saved: {final_model_path}")
 
-            # ==========================================
-            # Save McNemar Reports
-            # ==========================================
-            
-            # 1. Ensemble (Stacking) Report
+        # ============================================================
+        # SECTION: SAVE REPORTS AND VISUALIZATIONS (MAIN PROCESS ONLY)
+        # ============================================================
+        
+        # We use another barrier here to ensure Rank 0 finished saving JSON/Model 
+        # before we potentially touch the loader or model again for reports.
+        if dist.is_initialized():
+            dist.barrier()
+
+        if is_main:
+            # 1. Save McNemar Reports
             mcnemar_ensemble_path = os.path.join(current_save_dir, 'mcnemar_stacking_results.txt')
             save_mcnemar_report(ensemble_module, test_loader, device, mcnemar_ensemble_path, 
                                 model_name="Stacking Ensemble", is_ensemble=True)
@@ -788,15 +805,14 @@ def main():
                                 model_name=MODEL_NAMES[best_idx], is_ensemble=False, 
                                 single_model_idx=best_idx, means=MEANS, stds=STDS)
 
+            # 3. Generate Visualizations
             vis_dir = os.path.join(current_save_dir, 'visualizations')
             generate_visualizations(
                 ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
                 args.num_grad_cam_samples, args.num_lime_samples,
                 args.dataset, is_main)
 
-        cleanup_distributed()
-        
-        if is_main:
+            # 4. Plot ROC and F1
             plot_roc_and_f1(
                 ensemble_module,
                 test_loader, 
@@ -806,12 +822,8 @@ def main():
                 is_main
             )
 
-            # ==========================================
-            # NEW: Save Detailed Predictions to TXT
-            # ==========================================
-            
-            # We run a quick loop to get exact counts for metadata
-            # Alternatively, you could calculate this inside save_predictions_to_txt
+            # 5. Save Detailed Predictions to TXT
+            # Calculate metadata
             temp_true = []
             ensemble_module.eval()
             with torch.no_grad():
@@ -841,6 +853,15 @@ def main():
             print("-" * 70)
             print(f"Detailed prediction results exported to {json_output_path}")
             print("-" * 70)
+
+        # ============================================================
+        # FINAL CLEANUP
+        # ============================================================
+        
+        # Important: Other processes (Rank != 0) must skip the heavy IO above 
+        # and reach here to perform cleanup correctly.
+        
+        cleanup_distributed()
 
 if __name__ == "__main__":
     main()
