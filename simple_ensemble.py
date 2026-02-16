@@ -89,16 +89,16 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         label_int = int(label)
         
         # پیش‌بینی مدل
-        output = model(image)
-        if isinstance(output, (tuple, list)): output = output[0]
+        output, _, _, stacked_logits = model(image, return_details=True)
         
         # محاسبه Score و Pred
-        prob = torch.sigmoid(output.squeeze()).item()
-        pred_int = int(prob > 0.5)
+        # در Simple Averaging، Score میانگین Sigmoid لاجیت‌هاست
+        probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
+        pred_int = int(probs > 0.5)
         
         # ذخیره برای ROC
         all_y_true.append(label_int)
-        all_y_score.append(prob)
+        all_y_score.append(probs)
         all_y_pred.append(pred_int)
         
         # محاسبه آمار
@@ -116,7 +116,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         
         # آماده‌سازی خط لاگ
         filename = os.path.basename(path)
-        if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
+        if len(filename) >55: filename = filename[:25] + "..." + filename[-27:]
         line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
         lines.append(line)
 
@@ -130,7 +130,10 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     # ============================================
     # 1. چاپ خروجی در کنسول (فرمت درخواست شده)
     # ============================================
-    print(f"\nPrecision: {prec:.4f}")
+    print(f"\n{'='*70}")
+    print("FINAL RESULTS")
+    print(f"{'='*70}")
+    print(f"Precision: {prec:.4f}")
     print(f"Recall: {rec:.4f}")
     print(f"Specificity: {spec:.4f}")
     print(f"\nConfusion Matrix:")
@@ -181,7 +184,9 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
             "seed": args.seed,
             "dataset": args.dataset,
             "num_samples": int(total_samples),
-            "model": model_name
+            "positive_count": int(np.sum(y_true_np)),
+            "negative_count": int(total_samples - np.sum(y_true_np)),
+            "model": "simple_averaging_ensemble"
         },
         "y_true": y_true_np.tolist(),
         "y_score": y_score_np.tolist(),
@@ -419,15 +424,10 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    # ==========================================
-    # اصلاح مهم:
-    # ارزیابی نهایی فقط روی is_main انجام می‌شود.
-    # ابتدا دیتالودر تست کامل (غیرتوزیع‌شده) ساخته می‌شود.
-    # ==========================================
     if is_main:
         os.makedirs(args.save_dir, exist_ok=True)
         
-        # ساخت دیتالودر تست غیرتوزیع‌شده فقط روی GPU اصلی
+        # ساخت دیتالودر تست غیرتوزیع‌شده
         _, _, test_loader_full = create_dataloaders(
             args.data_dir, args.batch_size, dataset_type=args.dataset,
             is_distributed=False, seed=args.seed, is_main=True
@@ -483,7 +483,6 @@ def main():
 
     cleanup_distributed()
     
-    # رسم ROC نیز فقط روی Main اجرا می‌شود
     if is_main:
         plot_roc_and_f1(
             ensemble_module,
