@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,7 +17,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 warnings.filterwarnings("ignore")
 
 # Assuming these utils exist in your project structure
-# If running standalone, ensure these files are available.
 from metrics_utils import plot_roc_and_f1
 from dataset_utils import (
     UADFVDataset, 
@@ -106,11 +104,8 @@ class StackingEnsemble(nn.Module):
         if return_details:
             # For compatibility with previous evaluation functions
             batch_size = x.size(0)
-            
-            # Dummy uniform weights for compatibility
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
-            
             return final_output, dummy_weights, dummy_memberships, stacked_logits
         else:
             batch_size = x.size(0)
@@ -217,7 +212,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
-        # Only need final output for accuracy
         outputs, _ = model(images, return_details=False)
         
         pred = (outputs.squeeze(1) > 0).long()
@@ -232,8 +226,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_samples = stats[1].item()
         acc = 100. * total_correct / total_samples
         
-        # Extract Learned Weights from the Meta Learner
-        # Note: We extract weights ONCE, they are constant across samples
         meta_learner = model.meta_learner
         weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
         bias = meta_learner.linear.bias.data.cpu().item()
@@ -243,13 +235,11 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Samples: {total_samples:,}")
-        
         print(f"\nMeta-Learner (Logistic Regression) Analysis:")
         print(f"  Bias (Intercept): {bias:+.4f}")
         print(f"  Learned Weights (Importance of each base model):")
         for i, (w, mname) in enumerate(zip(weights, model_names)):
             print(f"    {i+1:2d}. {mname:<25}: {w:+.4f}")
-        
         print(f"{'='*70}")
         return acc, weights.tolist(), bias
     return 0.0, [0.0]*len(model_names), 0.0
@@ -257,13 +247,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
-    """
-    Training function for Stacking using Logistic Regression
-    """
     os.makedirs(save_dir, exist_ok=True)
     meta_learner = ensemble_model.module.meta_learner if hasattr(ensemble_model, 'module') else ensemble_model.meta_learner
     
-    # Optimizer only for the linear layer weights
     optimizer = torch.optim.AdamW(meta_learner.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
@@ -368,44 +354,25 @@ def cleanup_distributed():
 # ================== MCNEMAR REPORT FUNCTION (FIXED FOR DDP) ==================
 @torch.no_grad()
 def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is_ensemble=True, single_model_idx=None, means=None, stds=None):
-    """
-    Save results in a specific text format for McNemar test.
-    FIXED: Now correctly handles Distributed Data Parallel (DDP) by aggregating results from all GPUs.
-    """
     model.eval()
-    
-    # Local buffers
     local_correct = 0
     local_total = 0
+    local_TP, local_TN, local_FP, local_FN = 0, 0, 0, 0
     
-    # Buffers for Confusion Matrix (TP, TN, FP, FN)
-    local_TP = 0
-    local_TN = 0
-    local_FP = 0
-    local_FN = 0
-    
-    # Check if running in DDP mode
     is_distributed = dist.is_initialized()
     rank = 0
-    world_size = 1
     if is_distributed:
         rank = dist.get_rank()
-        world_size = dist.get_world_size()
     
     is_main = (rank == 0)
-    
-    # Normalizer for single model case
     normalizer = None
     if not is_ensemble and single_model_idx is not None and means is not None:
         normalizer = MultiModelNormalization([means[single_model_idx]], [stds[single_model_idx]]).to(device)
 
-    # Only collect paths on Main Process to avoid duplicates and save memory
     all_paths = []
     has_paths = hasattr(loader.dataset, 'samples') or hasattr(loader.dataset, 'paths')
-
     print(f"\n[Rank {rank}] Generating McNemar report for {model_name}...")
 
-    # 1. Evaluation Loop (Gather local stats)
     for batch_idx, (images, labels) in enumerate(loader):
         images = images.to(device)
         labels = labels.to(device)
@@ -423,17 +390,13 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is
         preds = (outputs.squeeze(1) > 0).long()
         labels = labels.long()
         
-        # Calculate local stats
         local_total += labels.size(0)
         local_correct += (preds == labels).sum().item()
-        
-        # Update Confusion Matrix elements
         local_TP += ((preds == 1) & (labels == 1)).sum().item()
         local_TN += ((preds == 0) & (labels == 0)).sum().item()
         local_FP += ((preds == 1) & (labels == 0)).sum().item()
         local_FN += ((preds == 0) & (labels == 1)).sum().item()
 
-        # Only collect paths on Main Process
         if is_main and has_paths:
             try:
                 start_idx = batch_idx * loader.batch_size
@@ -446,15 +409,10 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is
             except:
                 pass
 
-    # 2. Aggregate Stats across all GPUs
     if is_distributed:
-        # Create tensors for reduction
         stats_tensor = torch.tensor([local_correct, local_total, local_TP, local_TN, local_FP, local_FN], 
                                     dtype=torch.long, device=device)
-        
-        # Sum up stats from all processes
         dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
-        
         correct = stats_tensor[0].item()
         total = stats_tensor[1].item()
         TP = stats_tensor[2].item()
@@ -462,20 +420,14 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is
         FP = stats_tensor[4].item()
         FN = stats_tensor[5].item()
     else:
-        correct = local_correct
-        total = local_total
-        TP = local_TP
-        TN = local_TN
-        FP = local_FP
-        FN = local_FN
+        correct, total = local_correct, local_total
+        TP, TN, FP, FN = local_TP, local_TN, local_FP, local_FN
 
-    # 3. Calculate Metrics
     accuracy = correct / total * 100 if total > 0 else 0
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    # 4. Write to File (Only Main Process)
     if is_main:
         with open(save_path, 'w') as f:
             f.write("-" * 100 + "\n")
@@ -501,27 +453,10 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is
             f.write(header)
             f.write("-" * 100 + "\n")
             
-            # NOTE: Due to DDP shuffling, we cannot easily reconstruct the exact order of samples 
-            # across all GPUs to list them 1-by-1 correctly without passing a global index. 
-            # Since McNemar Test only needs the Confusion Matrix (Accuracy), the table below 
-            # will only show samples seen by Rank 0 (approximately 1/world_size of data).
-            
             for i in range(len(all_paths)):
-                # To avoid IndexError if path collection is slightly off vs batch count
-                # Ideally, we would collect preds/labels too, but that consumes memory.
-                # We will skip the detailed table if it's incomplete in distributed mode 
-                # or fill it with what we have. Let's fill what we have.
-                
                 path = all_paths[i]
                 if len(path) > 58:
                     path = "..." + path[-55:]
-                
-                # Since we didn't store preds/labels for every sample to save memory/complexity 
-                # in this specific fix, we'll just list the paths here or indicate aggregation.
-                # To keep the format, we will leave label/pred columns as "N/A" or similar if we didn't store them.
-                # However, to match the requested format strictly, we would need to store all preds.
-                # Given the priority is the ACCURACY MATCH, the summary above is the most critical part.
-                
                 line = f"{i+1:<10} {path:<60} {'N/A':<12} {'N/A':<15} {'N/A':<10}\n"
                 f.write(line)
                 
@@ -534,18 +469,12 @@ def save_mcnemar_report(model, loader, device, save_path, model_name="Model", is
 
 # ================== SAVE PREDICTIONS TO TXT (FIXED FOR DDP) ==================
 def save_predictions_to_txt(model, loader, device, save_path, metadata_info):
-    """
-    Generates and saves y_true, y_score, y_pred, and metadata to a .txt file in JSON format.
-    FIXED: Handles DDP by gathering results from all GPUs to Main Process.
-    """
     model.eval()
-    
     is_distributed = dist.is_initialized()
     rank = 0
     if is_distributed:
         rank = dist.get_rank()
     
-    # Local lists
     local_y_true = []
     local_y_score = []
     
@@ -556,35 +485,20 @@ def save_predictions_to_txt(model, loader, device, save_path, metadata_info):
             images = images.to(device)
             labels = labels.to(device)
             
-            # Get model output
             outputs, _ = model(images, return_details=False)
-            
-            # Apply Sigmoid to get probabilities (Scores)
             probs = torch.sigmoid(outputs).squeeze(1).cpu().numpy()
-            
-            # Get True Labels
             trues = labels.cpu().numpy().astype(int)
             
             local_y_score.extend(probs.tolist())
             local_y_true.extend(trues.tolist())
 
-    # Aggregate logic
     if is_distributed:
-        # Convert lists to tensors for gathering
-        # Note: For very large datasets, this might hit GPU memory limits. 
-        # Usually test sets fit, or we can gather on CPU.
-        
-        # Gather sizes first
         size = torch.tensor([len(local_y_score)], dtype=torch.long, device=device)
         all_sizes = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(dist.get_world_size())]
         dist.all_gather(all_sizes, size)
         all_sizes = [int(s.item()) for s in all_sizes]
         
         max_size = max(all_sizes)
-        
-        # Pad tensors to max_size for gathering
-        # We use CPU tensors to save GPU memory if possible, but dist.gather usually needs GPU or handled carefully.
-        # Let's stick to GPU for simplicity of DDP API.
         
         t_scores = torch.tensor(local_y_score + [0.0]*(max_size - len(local_y_score)), dtype=torch.float32, device=device)
         t_labels = torch.tensor(local_y_true + [0]*(max_size - len(local_y_true)), dtype=torch.int, device=device)
@@ -605,23 +519,16 @@ def save_predictions_to_txt(model, loader, device, save_path, metadata_info):
         all_y_true = local_y_true
         all_y_score = local_y_score
 
-    # Save only on Main Process
     if rank == 0:
-        # Get Predictions (0 or 1)
         all_y_pred = [1 if s > 0.5 else 0 for s in all_y_score]
-
-        # Prepare the dictionary structure
         output_data = {
             "metadata": metadata_info,
             "y_true": all_y_true,
             "y_score": all_y_score,
             "y_pred": all_y_pred
         }
-
-        # Save to text file (as JSON content)
         with open(save_path, 'w') as f:
             json.dump(output_data, f, indent=4)
-        
         print(f"Prediction data saved to: {save_path}")
 
 
@@ -719,12 +626,34 @@ def main():
             args.epochs, args.lr, device, current_save_dir, is_main, MODEL_NAMES)
 
         ckpt_path = os.path.join(current_save_dir, 'best_stacking_lr.pt')
-        if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            meta_learner = ensemble.module.meta_learner if hasattr(ensemble, 'module') else ensemble.meta_learner
-            meta_learner.load_state_dict(ckpt['meta_state_dict'])
-            if is_main:
+        
+        # ============================================================
+        # FIX: Only Rank 0 loads the checkpoint
+        # ============================================================
+        if is_main:
+            if os.path.exists(ckpt_path):
+                ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+                meta_learner = ensemble.module.meta_learner if hasattr(ensemble, 'module') else ensemble.meta_learner
+                meta_learner.load_state_dict(ckpt['meta_state_dict'])
                 print("Best model loaded.\n")
+
+        # ============================================================
+        # SYNC WEIGHTS: Broadcast loaded weights from Rank 0 to all other ranks
+        # ============================================================
+        if world_size > 1:
+            # Get reference to meta_learner
+            if hasattr(ensemble, 'module'):
+                target_module = ensemble.module.meta_learner
+            else:
+                target_module = ensemble.meta_learner
+
+            # Broadcast parameters
+            for param in target_module.parameters():
+                dist.broadcast(param.data, src=0)
+            
+            # Broadcast buffers
+            for buf in target_module.buffers():
+                dist.broadcast(buf, src=0)
 
         if is_main:
             print("\n" + "="*70)
@@ -788,8 +717,6 @@ def main():
         # SECTION: SAVE REPORTS AND VISUALIZATIONS (MAIN PROCESS ONLY)
         # ============================================================
         
-        # We use another barrier here to ensure Rank 0 finished saving JSON/Model 
-        # before we potentially touch the loader or model again for reports.
         if dist.is_initialized():
             dist.barrier()
 
@@ -823,7 +750,6 @@ def main():
             )
 
             # 5. Save Detailed Predictions to TXT
-            # Calculate metadata
             temp_true = []
             ensemble_module.eval()
             with torch.no_grad():
@@ -854,13 +780,6 @@ def main():
             print(f"Detailed prediction results exported to {json_output_path}")
             print("-" * 70)
 
-        # ============================================================
-        # FINAL CLEANUP
-        # ============================================================
-        
-        # Important: Other processes (Rank != 0) must skip the heavy IO above 
-        # and reach here to perform cleanup correctly.
-        
         cleanup_distributed()
 
 if __name__ == "__main__":
