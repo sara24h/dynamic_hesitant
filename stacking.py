@@ -417,7 +417,6 @@ def get_test_indices(test_loader):
 def save_prediction_log(model, test_loader, device, save_path, is_main, normalizer=None):
     """
     ذخیره لیست پیش‌بینی‌ها دقیقاً روی همان داده‌های تستی که مدل دیده است.
-    این تابع برای تست مک‌نمار (McNemar Test) استفاده می‌شود.
     """
     if not is_main or test_loader is None: return
 
@@ -434,12 +433,16 @@ def save_prediction_log(model, test_loader, device, save_path, is_main, normaliz
 
     # 2. پیدا کردن اندیس‌های تست
     test_indices = get_test_indices(test_loader)
-    print(f"Found {len(test_indices)} test samples to log.")
+    print(f"Found {len(test_indices)} test indices.")
+    
+    # اطمینان از اینکه لیست ما دقیقاً به اندیس‌ها می‌خورد
+    # (این مرحله مهم است تا تعداد نمونه‌ها کمتر نشود)
 
     lines = []
     TP, TN, FP, FN = 0, 0, 0, 0
-    total_samples = 0
+    total_samples_processed = 0  # شمارنده واقعی پردازش شده‌ها
     correct_count = 0
+    error_count = 0
 
     lines.append("="*100)
     lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
@@ -448,27 +451,24 @@ def save_prediction_log(model, test_loader, device, save_path, is_main, normaliz
     lines.append(header)
     lines.append("-"*100)
 
-    # 3. پیمایش فقط روی اندیس‌های تست
+    # 3. پیمایش روی اندیس‌های تست
     for i, global_idx in enumerate(tqdm(test_indices, desc="Logging predictions")):
         try:
-            # گرفتن داده از دیتاست پایه با اندیس سراسری
             image, label = base_dataset[global_idx]
-            # گرفتن نام فایل
             path, _ = get_sample_info(base_dataset, global_idx)
         except Exception as e:
-            print(f"Error loading sample {global_idx}: {e}")
+            # اگر خطایی در لود کردن عکس رخ داد، لاگ کن و ادامه بده (نمونه را حذف نکن مگر اینکه لازم باشد)
+            print(f"Skipping index {global_idx} due to error: {e}")
+            error_count += 1
             continue
 
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
         
         with torch.no_grad():
-            # اگر نرمالایزر خارجی داده شود (برای مدل‌های تکی) استفاده می‌شود
-            # در غیر این صورت مدل خودش نرمالایزیشن را انجام می‌دهد (مانند StackingEnsemble)
             input_img = normalizer(image, 0) if normalizer else image
             output = model(input_img)
             
-            # استخراج خروجی اگر تاپل باشد
             if isinstance(output, (tuple, list)):
                 output = output[0]
         
@@ -485,10 +485,9 @@ def save_prediction_log(model, test_loader, device, save_path, is_main, normaliz
             if pred_int == 1: FP += 1
             else: TN += 1
         
-        total_samples += 1
+        total_samples_processed += 1
         sample_id = i + 1
 
-        # فرمت‌بندی نام فایل
         filename = os.path.basename(path)
         if len(filename) > 55:
             filename = filename[:25] + "..." + filename[-27:]
@@ -496,22 +495,27 @@ def save_prediction_log(model, test_loader, device, save_path, is_main, normaliz
         line = f"{sample_id:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
         lines.append(line)
 
-    # محاسبه آمار نهایی
+    # محاسبه آمار نهایی بر اساس پردازش شده‌ها (نه ایندکس‌های اولیه)
     total = TP + TN + FP + FN
-    acc = (TP + TN) / total if total > 0 else 0
-    prec = TP / (TP + FP) if (TP + FP) > 0 else 0
-    rec = TP / (TP + FN) if (TP + FN) > 0 else 0
-    spec = TN / (TN + FP) if (TN + FP) > 0 else 0
+    if total != total_samples_processed:
+         print(f"WARNING: Count mismatch! Sum of Confusion Matrix ({total}) != Processed Samples ({total_samples_processed})")
 
+    acc = (TP + TN) / total if total > 0 else 0
+    
     # ساخت خروجی نهایی
     output_str = []
     output_str.append("-" * 100)
     output_str.append("SUMMARY STATISTICS:")
     output_str.append("-" * 100)
+    # اضافه کردن تعداد خطاها برای دیباگ
+    if error_count > 0:
+        output_str.append(f"WARNING: {error_count} samples were skipped due to loading errors.")
+        
     output_str.append(f"Accuracy: {acc*100:.2f}%")
-    output_str.append(f"Precision: {prec:.4f}")
-    output_str.append(f"Recall: {rec:.4f}")
-    output_str.append(f"Specificity: {spec:.4f}")
+    output_str.append(f"Total Processed: {total}")
+    output_str.append(f"Precision: {TP / (TP + FP) if (TP + FP) > 0 else 0:.4f}")
+    output_str.append(f"Recall: {TP / (TP + FN) if (TP + FN) > 0 else 0:.4f}")
+    output_str.append(f"Specificity: {TN / (TN + FP) if (TN + FP) > 0 else 0:.4f}")
     output_str.append("\nConfusion Matrix:")
     output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
     output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
@@ -524,6 +528,7 @@ def save_prediction_log(model, test_loader, device, save_path, is_main, normaliz
         f.write("\n".join(output_str))
     
     print(f"✅ Prediction log saved to: {save_path}")
+    print(f"Total samples in log: {total}")
     print("="*70)
 
 
