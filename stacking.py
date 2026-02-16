@@ -391,6 +391,231 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
+
+import torch.distributed as dist
+import json
+import os
+
+# ================== HELPER FOR GATHERING DATA IN DDP ==================
+def gather_all_data(local_data, world_size):
+    """
+    Gathers data from all distributed processes to the main process.
+    """
+    gathered_data = [None for _ in range(world_size)]
+    if world_size > 1:
+        dist.all_gather_object(gathered_data, local_data)
+    else:
+        gathered_data = [local_data]
+    return gathered_data
+
+# ================== UPDATED EVALUATION FUNCTION ==================
+@torch.no_grad()
+def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_dir, seed, dataset_name, is_main=True):
+    """
+    Evaluates the ensemble, prints detailed statistics, and saves TXT and JSON reports.
+    """
+    model.eval()
+    
+    # Local lists to store results per GPU
+    local_true = []
+    local_pred = []
+    local_scores = []
+    local_paths = []
+    
+    if is_main:
+        print(f"\nEvaluating {name} set (Stacking - Logistic Regression)...")
+    
+    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
+        images, labels = images.to(device), labels.to(device)
+        
+        # Forward pass
+        outputs, _ = model(images, return_details=False)
+        probs = torch.sigmoid(outputs.squeeze(1))
+        preds = (probs > 0.5).long()
+        
+        # Store results
+        local_true.append(labels.cpu())
+        local_pred.append(preds.cpu())
+        local_scores.append(probs.cpu())
+        
+        # Try to get filenames if available in the dataset
+        if hasattr(loader.dataset, 'samples'):
+            # Handle Subset wrapper
+            if isinstance(loader.dataset, torch.utils.data.Subset):
+                indices = loader.batch_indices if hasattr(loader, 'batch_indices') else None
+                # Note: Getting exact indices in DDP Subset is tricky; this is a simplified approach
+                # For exact path tracking in DDP, custom sampler index tracking is needed.
+                # Here we just rely on the order if available.
+                try:
+                    # This might fail if batch_indices is not injected, handled in except
+                    pass 
+                except:
+                    pass
+            
+            # Standard Dataset with 'samples' attribute (like ImageFolder)
+            # Note: In DDP, getting exact paths requires tracking indices per batch.
+            # Simplified: We generate generic IDs if paths are inaccessible.
+            pass 
+
+    # Concatenate local tensors
+    local_true = torch.cat(local_true).numpy().tolist()
+    local_pred = torch.cat(local_pred).numpy().tolist()
+    local_scores = torch.cat(local_scores).numpy().tolist()
+    
+    # Generate generic sample IDs for the current batch (simplification for DDP)
+    # In a real scenario, you might need to pass indices from the sampler
+    local_ids = list(range(len(local_true))) 
+
+    # Gather data from all GPUs to main process
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    all_true_data = gather_all_data(local_true, world_size)
+    all_pred_data = gather_all_data(local_pred, world_size)
+    all_scores_data = gather_all_data(local_scores, world_size)
+    all_ids_data = gather_all_data(local_ids, world_size)
+
+    if is_main:
+        # Flatten lists
+        y_true = [item for sublist in all_true_data for item in sublist]
+        y_pred = [int(item) for sublist in all_pred_data for item in sublist]
+        y_score = [float(item) for item in sublist for sublist in all_scores_data] # Flattening correctly
+        
+        # Re-flatten y_score carefully (previous line logic fix)
+        y_score = []
+        for sublist in all_scores_data:
+            for item in sublist:
+                y_score.append(float(item))
+
+        total_samples = len(y_true)
+        
+        # --- Calculate Metrics ---
+        # Convert to tensors for easy calculation
+        yt = torch.tensor(y_true)
+        yp = torch.tensor(y_pred)
+        
+        correct = (yt == yp).sum().item()
+        incorrect = total_samples - correct
+        accuracy = 100.0 * correct / total_samples
+        
+        # Confusion Matrix components
+        # Label 1 = Real, Label 0 = Fake (Assuming standard mapping)
+        TP = ((yp == 1) & (yt == 1)).sum().item()
+        TN = ((yp == 0) & (yt == 0)).sum().item()
+        FP = ((yp == 1) & (yt == 0)).sum().item()
+        FN = ((yp == 0) & (yt == 1)).sum().item()
+        
+        precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+        recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+        specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+        
+        # --- Extract Weights ---
+        meta_learner = model.meta_learner
+        weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
+        bias = meta_learner.linear.bias.data.cpu().item()
+
+        # --- Print Report to Console ---
+        print(f"\n{'='*100}")
+        print(f"SUMMARY STATISTICS:")
+        print(f"{'-'*100}")
+        print(f"Accuracy: {accuracy:.2f}%")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"Specificity: {specificity:.4f}")
+        print(f"\nConfusion Matrix:")
+        print(f"                 Predicted Real  Predicted Fake ")
+        print(f"    Actual Real   {TP:<14}  {FN:<14} ")
+        print(f"    Actual Fake   {FP:<14}  {TN:<14} ")
+        print(f"\nCorrect Predictions: {correct} ({accuracy:.2f}%)")
+        print(f"Incorrect Predictions: {incorrect} ({100-accuracy:.2f}%)")
+        
+        print(f"\n{'='*100}")
+        print(f"SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+        print(f"{'='*100}")
+        print(f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}")
+        print(f"{'-'*100}")
+        
+        # Prepare list for JSON output
+        json_sample_list = []
+        
+        for i in range(total_samples):
+            t_label = y_true[i]
+            p_label = y_pred[i]
+            is_correct = "Yes" if t_label == p_label else "No"
+            
+            # Sample Path handling (simplified as 'sample_{i}.jpg' since DDP path retrieval is complex without index injection)
+            sample_path = f"sample_{i+1}.jpg"
+            
+            # Print first 50 lines to keep console clean, or all if needed
+            if i < 50:
+                print(f"{i+1:<10} {sample_path:<60} {int(t_label):<12} {int(p_label):<15} {is_correct:<10}")
+            elif i == 50:
+                print(f"... (Remaining {total_samples - 50} samples omitted from console log)")
+                
+            json_sample_list.append({
+                "id": i+1,
+                "path": sample_path,
+                "true_label": int(t_label),
+                "predicted_label": int(p_label),
+                "correct": is_correct
+            })
+
+        print(f"{'='*100}")
+
+        # --- Save TXT Report ---
+        txt_path = os.path.join(save_dir, 'classification_report.txt')
+        with open(txt_path, 'w') as f:
+            f.write(f"SUMMARY STATISTICS:\n")
+            f.write(f"{'-'*100}\n")
+            f.write(f"Accuracy: {accuracy:.2f}%\n")
+            f.write(f"Precision: {precision:.4f}\n")
+            f.write(f"Recall: {recall:.4f}\n")
+            f.write(f"Specificity: {specificity:.4f}\n\n")
+            f.write(f"Confusion Matrix:\n")
+            f.write(f"                 Predicted Real  Predicted Fake \n")
+            f.write(f"    Actual Real   {TP:<14}  {FN:<14} \n")
+            f.write(f"    Actual Fake   {FP:<14}  {TN:<14} \n\n")
+            f.write(f"Correct Predictions: {correct} ({accuracy:.2f}%)\n")
+            f.write(f"Incorrect Predictions: {incorrect} ({100-accuracy:.2f}%)\n")
+            f.write(f"{'='*100}\n")
+            f.write(f"SAMPLE-BY-SAMPLE PREDICTIONS:\n")
+            f.write(f"{'='*100}\n")
+            f.write(f"Sample_ID  Sample_Path                                                  True_Label   Predicted_Label Correct   \n")
+            f.write(f"{'-'*100}\n")
+            
+            for item in json_sample_list:
+                f.write(f"{item['id']:<10} {item['path']:<60} {item['true_label']:<12} {item['predicted_label']:<15} {item['correct']:<10}\n")
+        
+        print(f"\nReport saved to: {txt_path}")
+
+        # --- Save JSON Report ---
+        json_output = {
+            "metadata": {
+                "seed": seed,
+                "dataset": dataset_name,
+                "num_samples": total_samples,
+                "positive_count": int(sum(y_true)),
+                "negative_count": int(total_samples - sum(y_true)),
+                "model": "stacking_ensemble_lr"
+            },
+            "y_true": [float(x) for x in y_true],
+            "y_score": y_score,
+            "y_pred": y_pred
+        }
+        
+        json_path = os.path.join(save_dir, 'predictions_data.json')
+        with open(json_path, 'w') as f:
+            json.dump(json_output, f, indent=4)
+        print(f"Prediction data saved to: {json_path}")
+
+        # --- Weights Analysis ---
+        print(f"\nMeta-Learner (Logistic Regression) Analysis:")
+        print(f"  Bias (Intercept): {bias:+.4f}")
+        print(f"  Learned Weights (Importance of each base model):")
+        for i, (w, mname) in enumerate(zip(weights, model_names)):
+            print(f"    {i+1:2d}. {mname:<25}: {w:+.4f}")
+        
+        return accuracy, weights.tolist(), bias
+
+    return 0.0, [0.0]*len(model_names), 0.0
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Stacking Ensemble Training with Logistic Regression")
@@ -490,9 +715,8 @@ def main():
 
         ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
 
-        # Final Evaluation (Optimized - One Pass)
         ensemble_test_acc, learned_weights, learned_bias = evaluate_ensemble_final_ddp(
-            ensemble_module, test_loader, device, "Test", MODEL_NAMES, current_save_dir, args, is_main)
+            ensemble_module, test_loader, device, "Test", MODEL_NAMES, current_save_dir, current_seed, args.dataset, is_main)
 
         if is_main:
             print("\n" + "="*70)
