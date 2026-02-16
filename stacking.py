@@ -531,7 +531,6 @@ def save_predictions_to_txt(model, loader, device, save_path, metadata_info):
             json.dump(output_data, f, indent=4)
         print(f"Prediction data saved to: {save_path}")
 
-
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Stacking Ensemble Training with Logistic Regression")
@@ -666,8 +665,14 @@ def main():
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
         # ============================================================
-        # CRITICAL FIX: BARRIER TO SYNC ALL PROCESSES BEFORE IO OPS
+        # CRITICAL FIX: BARRIER BEFORE MAIN PROCESS IO OPERATIONS
         # ============================================================
+        # We need all processes to reach here. 
+        # Then Rank 0 will do IO, while others wait at the NEXT barrier 
+        # (inside save_mcnemar_report logic or the barrier below it).
+        # But to prevent Rank 1 from jumping ahead into save_mcnemar_report 
+        # while Rank 0 is saving JSON, we put a barrier HERE.
+        
         if dist.is_initialized():
             dist.barrier()
 
@@ -717,6 +722,7 @@ def main():
         # SECTION: SAVE REPORTS AND VISUALIZATIONS (MAIN PROCESS ONLY)
         # ============================================================
         
+        # Wait for Rank 0 to finish saving JSON/Model
         if dist.is_initialized():
             dist.barrier()
 
