@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,18 +51,11 @@ class MultiModelNormalization(nn.Module):
 
 # ================== STACKING META LEARNER (Logistic Regression) ==================
 class StackingMetaLearner(nn.Module):
-    """
-    Meta-Learner for Stacking using Logistic Regression.
-    Input: Logits from all base models (Batch_Size x Num_Models)
-    Output: Final Score (Batch_Size x 1)
-    """
     def __init__(self, num_models: int):
         super().__init__()
-        # Logistic Regression is simply a single Linear layer
         self.linear = nn.Linear(num_models, 1)
 
     def forward(self, x):
-        # x shape: (Batch, Num_Models)
         return self.linear(x)
 
 
@@ -73,8 +67,6 @@ class StackingEnsemble(nn.Module):
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
-        
-        # Meta learner operating on model outputs (Logistic Regression)
         self.meta_learner = StackingMetaLearner(self.num_models)
 
         if freeze_models:
@@ -84,20 +76,16 @@ class StackingEnsemble(nn.Module):
                     p.requires_grad = False
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        # 1. Collect raw outputs (Logits) from all models
         logits_list = []
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            with torch.no_grad(): # Base models are assumed Frozen
+            with torch.no_grad():
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
             logits_list.append(out)
         
-        # Stack outputs: (Batch, Num_Models, 1) -> (Batch, Num_Models)
         stacked_logits = torch.cat(logits_list, dim=1)
-        
-        # 2. Pass outputs to meta learner
         final_output = self.meta_learner(stacked_logits)
 
         if return_details:
@@ -200,9 +188,6 @@ def evaluate_accuracy_ddp(model, loader, device):
 
 # ================== HELPER FOR GATHERING DATA IN DDP ==================
 def gather_all_data(local_data, world_size):
-    """
-    Gathers data from all distributed processes to the main process.
-    """
     gathered_data = [None for _ in range(world_size)]
     if world_size > 1:
         dist.all_gather_object(gathered_data, local_data)
@@ -214,12 +199,8 @@ def gather_all_data(local_data, world_size):
 # ================== UPDATED EVALUATION FUNCTION FOR REPORT ==================
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_dir, seed, dataset_name, is_main=True):
-    """
-    Evaluates the ensemble, prints detailed statistics, and saves TXT and JSON reports.
-    """
     model.eval()
     
-    # Local lists to store results per GPU
     local_true = []
     local_pred = []
     local_scores = []
@@ -229,34 +210,27 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
     
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
-        
-        # Forward pass
         outputs, _ = model(images, return_details=False)
         probs = torch.sigmoid(outputs.squeeze(1))
         preds = (probs > 0.5).long()
         
-        # Store results
         local_true.append(labels.cpu())
         local_pred.append(preds.cpu())
         local_scores.append(probs.cpu())
 
-    # Concatenate local tensors
     local_true = torch.cat(local_true).numpy().tolist()
     local_pred = torch.cat(local_pred).numpy().tolist()
     local_scores = torch.cat(local_scores).numpy().tolist()
 
-    # Gather data from all GPUs to main process
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     all_true_data = gather_all_data(local_true, world_size)
     all_pred_data = gather_all_data(local_pred, world_size)
     all_scores_data = gather_all_data(local_scores, world_size)
 
     if is_main:
-        # Flatten lists
         y_true = [item for sublist in all_true_data for item in sublist]
         y_pred = [int(item) for sublist in all_pred_data for item in sublist]
         
-        # Flatten y_score correctly
         y_score = []
         for sublist in all_scores_data:
             for item in sublist:
@@ -264,7 +238,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
 
         total_samples = len(y_true)
         
-        # --- Calculate Metrics ---
         yt = torch.tensor(y_true)
         yp = torch.tensor(y_pred)
         
@@ -272,7 +245,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
         incorrect = total_samples - correct
         accuracy = 100.0 * correct / total_samples
         
-        # Confusion Matrix components: Label 1 = Real, Label 0 = Fake
         TP = ((yp == 1) & (yt == 1)).sum().item()
         TN = ((yp == 0) & (yt == 0)).sum().item()
         FP = ((yp == 1) & (yt == 0)).sum().item()
@@ -282,10 +254,54 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
         recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
         specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
         
-        # --- Extract Weights ---
         meta_learner = model.meta_learner
         weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
         bias = meta_learner.linear.bias.data.cpu().item()
+
+        # --- Print Report to Console ---
+        print(f"\n{'='*100}")
+        print(f"SUMMARY STATISTICS:")
+        print(f"{'-'*100}")
+        print(f"Accuracy: {accuracy:.2f}%")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"Specificity: {specificity:.4f}")
+        print(f"\nConfusion Matrix:")
+        print(f"                 Predicted Real  Predicted Fake ")
+        print(f"    Actual Real   {TP:<14}  {FN:<14} ")
+        print(f"    Actual Fake   {FP:<14}  {TN:<14} ")
+        print(f"\nCorrect Predictions: {correct} ({accuracy:.2f}%)")
+        print(f"Incorrect Predictions: {incorrect} ({100-accuracy:.2f}%)")
+        
+        print(f"\n{'='*100}")
+        print(f"SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+        print(f"{'='*100}")
+        print(f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}")
+        print(f"{'-'*100}")
+        
+        # === FIX: Define and populate json_sample_list ===
+        json_sample_list = []
+        
+        for i in range(total_samples):
+            t_label = y_true[i]
+            p_label = y_pred[i]
+            is_correct_str = "Yes" if t_label == p_label else "No"
+            sample_path = f"sample_{i+1}.jpg"
+            
+            if i < 50:
+                print(f"{i+1:<10} {sample_path:<60} {int(t_label):<12} {int(p_label):<15} {is_correct_str:<10}")
+            elif i == 50:
+                print(f"... (Remaining {total_samples - 50} samples omitted from console log)")
+                
+            json_sample_list.append({
+                "id": i+1,
+                "path": sample_path,
+                "true_label": int(t_label),
+                "predicted_label": int(p_label),
+                "correct": is_correct_str
+            })
+
+        print(f"{'='*100}")
 
         # --- Save TXT Report ---
         txt_path = os.path.join(save_dir, 'classification_report.txt')
@@ -333,7 +349,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
             json.dump(json_output, f, indent=4)
         print(f"Prediction data saved to: {json_path}")
 
-        # --- Weights Analysis ---
         print(f"\nMeta-Learner (Logistic Regression) Analysis:")
         print(f"  Bias (Intercept): {bias:+.4f}")
         print(f"  Learned Weights (Importance of each base model):")
@@ -347,11 +362,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, save_d
 
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
- 
     os.makedirs(save_dir, exist_ok=True)
     meta_learner = ensemble_model.module.meta_learner if hasattr(ensemble_model, 'module') else ensemble_model.meta_learner
     
-    # Optimizer only for the linear layer weights
     optimizer = torch.optim.AdamW(meta_learner.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
@@ -380,7 +393,7 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
             
-            outputs, _ = ensemble_model(images) # (Batch, 1)
+            outputs, _ = ensemble_model(images)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
             optimizer.step()
@@ -419,7 +432,6 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             }, save_path)
             print(f"\n✓ Best model saved → {val_acc:.2f}%")
 
-        # CRITICAL: Sync all processes before proceeding (fixes race condition on save/load)
         if dist.is_initialized():
             dist.barrier()
 
@@ -550,7 +562,6 @@ def main():
             ensemble, train_loader, val_loader,
             args.epochs, args.lr, device, current_save_dir, is_main, MODEL_NAMES)
 
-        # Ensure all processes wait for Rank 0 to finish saving
         if dist.is_initialized():
             dist.barrier()
 
@@ -576,7 +587,6 @@ def main():
 
         ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
         
-        # Pass extra args for report generation
         ensemble_test_acc, learned_weights, learned_bias = evaluate_ensemble_final_ddp(
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, 
             current_save_dir, current_seed, args.dataset, is_main
