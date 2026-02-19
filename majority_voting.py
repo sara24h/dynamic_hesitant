@@ -103,7 +103,18 @@ class MultiModelNormalization(nn.Module):
 
 # ================== MAJORITY VOTING ENSEMBLE CLASS ==================
 class MajorityVotingEnsemble(nn.Module):
-    # ... (بقیه متد __init__ بدون تغییر) ...
+    # اصلاح شده: اضافه شدن پارامتر freeze_models
+    def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
+                 stds: List[Tuple[float]], freeze_models: bool = True):
+        super().__init__()
+        self.num_models = len(models)
+        self.models = nn.ModuleList(models)
+        self.normalizations = MultiModelNormalization(means, stds)
+        if freeze_models:
+            for model in self.models:
+                model.eval()
+                for p in model.parameters():
+                    p.requires_grad = False
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         votes_logits = []
@@ -120,18 +131,15 @@ class MajorityVotingEnsemble(nn.Module):
 
         stacked_logits = torch.cat(votes_logits, dim=1)
         
+        # اصلاح شده: استفاده از Soft Voting برای محاسبه AUC صحیح
         avg_logits = stacked_logits.mean(dim=1, keepdim=True)
         
-        # اگر به جزئیات رأی‌ها نیاز داریم
         if return_details:
             batch_size = x.size(0)
             weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
-            # برگرداندن avg_logits به عنوان خروجی اصلی
             return avg_logits, weights, dummy_memberships, stacked_logits
             
-        # خروجی پیش‌فرض برای توابع ارزیابی خارجی
-        # برگرداندن avg_logits (معادل احتمال) به جای final_vote (0 یا 1)
         hard_votes = (stacked_logits > 0).long()
         return avg_logits, hard_votes
 
@@ -162,7 +170,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
 
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
-def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device,
+def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
                               name: str, mean: Tuple[float, float, float],
                               std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
@@ -263,10 +271,6 @@ def get_test_indices(test_loader):
 
 # ================== UNIFIED FINAL EVALUATION (McNemar + ROC) ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
-    """
-    ارزیابی نهایی یکپارچه برای اطمینان از یکسان بودن اعداد در کنسول و لاگ.
-    شامل ذخیره داده‌های McNemar و ROC (y_true, y_score, y_pred).
-    """
     if not is_main: return 0.0, None, None
 
     model.eval()
@@ -275,7 +279,6 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     if hasattr(base_dataset, 'dataset'):
         base_dataset = base_dataset.dataset
     
-    # استخراج اندیس‌های تست
     if hasattr(test_loader_full, 'sampler') and hasattr(test_loader_full.sampler, 'indices'):
         test_indices = test_loader_full.sampler.indices
     elif hasattr(test_loader_full.dataset, 'indices'):
@@ -293,7 +296,6 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
 
     TP, TN, FP, FN = 0, 0, 0, 0
     
-    # لیست‌های برای ذخیره داده‌های ROC و JSON
     all_y_true = []
     all_y_score = []
     all_y_pred = []
@@ -311,20 +313,16 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
-            # پیش‌بینی مدل
             output, _, _, stacked_logits = model(image, return_details=True)
             
-            # محاسبه احتمال (Score) و کلاس پیش‌بینی شده
-            # برای Majority Voting، Score میانگین احتمالات مدل‌ها در نظر گرفته می‌شود
+            # محاسبه صحیح احتمال برای AUC
             probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
             pred_int = int(output.squeeze().item() > 0)
             
-            # ذخیره برای ROC و JSON
             all_y_true.append(label_int)
             all_y_score.append(probs)
             all_y_pred.append(pred_int)
             
-            # محاسبه ماتریس آشفتگی
             if label_int == 1:
                 if pred_int == 1: TP += 1
                 else: FN += 1
@@ -342,12 +340,10 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     correct_count = TP + TN
     acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
     
-    # محاسبه معیارهای عملکرد
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    # چاپ نتایج نهایی مطابق فرمت خواسته شده در کنسول
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
@@ -362,7 +358,6 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     print("="*70)
 
-    # ذخیره لاگ متنی (McNemar Format)
     output_str = []
     output_str.append("-" * 100)
     output_str.append("SUMMARY STATISTICS:")
@@ -384,17 +379,12 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
         f.write("\n".join(output_str))
     print(f"✅ Prediction log saved to: {log_path}")
 
-    # ────────────────────────────────────────────────────────────────
-    #                ذخیره داده‌های ROC (JSON & TXT)
-    # ────────────────────────────────────────────────────────────────
     print("\nCollecting ROC data (y_true & y_score) ...")
     
-    # تبدیل به آرایه نامپای
     y_true_np = np.array(all_y_true)
     y_score_np = np.array(all_y_score)
     y_pred_np = np.array(all_y_pred)
 
-    # 1. ذخیره در JSON
     roc_json_path = os.path.join(save_dir, "roc_data_test.json")
     roc_data_json = {
         "metadata": {
@@ -413,7 +403,6 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
         json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
     print(f"ROC data saved (JSON): {roc_json_path}")
 
-    # 2. ذخیره در TXT
     roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
     with open(roc_txt_path, 'w', encoding='utf-8') as f:
         f.write("y_true\ty_score\ty_pred\n")
@@ -421,7 +410,6 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
     print(f"ROC data saved (TXT):  {roc_txt_path}")
 
-    # ویژوالایزیشن (اگر تابع وجود داشته باشد)
     try:
         from visualization_utils import generate_visualizations
         vis_dir = os.path.join(save_dir, 'visualizations')
@@ -490,7 +478,6 @@ def main():
 
     ensemble = MajorityVotingEnsemble(base_models, MEANS, STDS, freeze_models=True).to(device)
 
-    # --- تغییر مهم: مدیریت خطای لود کردن دیتاست ---
     try:
         train_loader, val_loader, test_loader = create_dataloaders(
             args.data_dir, args.batch_size, dataset_type=args.dataset,
@@ -499,14 +486,6 @@ def main():
         if is_main:
             print(f"\n[ERROR] Dataset loading failed: {e}")
             print(f"[HINT] Please check if your --data_dir ('{args.data_dir}') contains the correct folder structure.")
-            print(f"[HINT] Listing contents of provided directory:")
-            if os.path.exists(args.data_dir):
-                print(os.listdir(args.data_dir))
-                # بررسی عمیق‌تر برای Kaggle
-                for item in os.listdir(args.data_dir):
-                    subpath = os.path.join(args.data_dir, item)
-                    if os.path.isdir(subpath):
-                        print(f"  -> Contents of '{item}': {os.listdir(subpath)}")
         cleanup_distributed()
         return
     except Exception as e:
@@ -526,7 +505,6 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    # ارزیابی سریع (اختیاری)
     ensemble_test_acc, vote_dist, stats = evaluate_ensemble_final_ddp(ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
     if is_main:
@@ -536,13 +514,11 @@ def main():
         print("FINAL ENSEMBLE EVALUATION (Unified)")
         print("="*70)
 
-        # ساخت دیتالودر تست غیرتوزیع‌شده برای ارزیابی یکپارچه
         _, _, test_loader_full = create_dataloaders(
             args.data_dir, args.batch_size, dataset_type=args.dataset,
             is_distributed=False, seed=args.seed, is_main=True
         )
 
-        # اجرای ارزیابی نهایی (McNemar + ROC)
         final_acc, y_true, y_scores = final_evaluation_unified(
             ensemble_module, test_loader_full, device, args.save_dir, MODEL_NAMES, args, is_main
         )
