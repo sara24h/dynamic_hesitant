@@ -101,7 +101,7 @@ class MultiModelNormalization(nn.Module):
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
-# ================== MAJORITY VOTING ENSEMBLE CLASS ( HARD VOTING ) ==================
+# ================== MAJORITY VOTING ENSEMBLE CLASS (FIXED) ==================
 class MajorityVotingEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
                  stds: List[Tuple[float]], freeze_models: bool = True):
@@ -130,31 +130,31 @@ class MajorityVotingEnsemble(nn.Module):
 
         stacked_logits = torch.cat(votes_logits, dim=1) # [Batch, Num_Models]
         
-        # =================== پیاده‌سازی Hard Voting ===================
+        # =================== Hard Voting Logic ===================
         # تبدیل لاجیت‌ها به رأی قطعی (0 یا 1)
-        # فرض: لاجیت مثبت -> کلاس 1 (Real)، لاجیت منفی -> کلاس 0 (Fake)
         hard_votes = (stacked_logits > 0).long() 
         
         # محاسبه رأی نهایی (اکثریت)
-        # مجموع آراء. اگر مجموع > نصف تعداد مدل‌ها باشد، یعنی اکثریت ۱ داده‌اند.
         sum_votes = hard_votes.sum(dim=1, keepdim=True)
         
-        # اگر تعداد مدل‌ها زوج باشد، تسطیح را به نفع کلاس 1 (Real) می‌شکنیم یا برعکس.
-        # در اینجا اگر >= نصف باشد، 1 در نظر گرفته می‌شود.
+        # اگر مجموع آراء >= نصف تعداد مدل‌ها باشد، برنده کلاس 1 است
         threshold = self.num_models / 2.0
         final_decision = (sum_votes >= threshold).long().float()
         
+        # =================== Soft Score for ROC ===================
         # برای محاسبه AUC/ROC ما به یک امتیاز (Score) نیاز داریم.
-        # در Hard Voting امتیاز وجود ندارد، اما برای نمودار از "میانگین احتمالات" استفاده می‌کنیم
-        # تا بتوانیم عملکرد را با نمودار ROC نمایش دهیم.
+        # از میانگین احتمالات استفاده می‌کنیم.
         avg_probs = torch.sigmoid(stacked_logits).mean(dim=1, keepdim=True)
         
         if return_details:
             batch_size = x.size(0)
             weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
-            dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
-            # برگرداندن final_decision به عنوان خروجی قطعی، اما avg_probs برای مصارف ROC
-            return final_decision, weights, dummy_memberships, stacked_logits, avg_probs
+            # ترتیب خروجی‌ها برای سازگاری با کدهای قبلی:
+            # 1. final_decision (خروجی اصلی)
+            # 2. weights (وزن‌ها -在这里是均匀的)
+            # 3. avg_probs (امتیاز برای ROC - جایگزین dummy_membership شده)
+            # 4. stacked_logits (لاجیت‌های تک تک مدل‌ها)
+            return final_decision, weights, avg_probs, stacked_logits
             
         return final_decision, hard_votes
 
@@ -223,9 +223,10 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
-        # خروجی اول final_decision است (0 یا 1)
-        outputs, weights, _, stacked_logits, _ = model(images, return_details=True)
+        # دریافت خروجی‌ها: final_decision, weights, avg_probs, stacked_logits
+        outputs, weights, _, stacked_logits = model(images, return_details=True)
         
+        # خروجی 'outputs' همان تصمیم نهایی Hard Voting است
         pred = outputs.squeeze(1).long()
         
         is_tp = ((pred == 1) & (labels.long() == 1)).sum()
@@ -329,8 +330,8 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
-            # خروجی‌ها: final_decision, weights, dummy, stacked_logits, avg_probs
-            decision, _, _, stacked_logits, avg_probs = model(image, return_details=True)
+            # خروجی‌ها: final_decision, weights, avg_probs, stacked_logits
+            decision, _, avg_probs, stacked_logits = model(image, return_details=True)
             
             # پیش‌بینی نهایی بر اساس Hard Voting
             pred_int = int(decision.squeeze().item())
