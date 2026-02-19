@@ -101,9 +101,8 @@ class MultiModelNormalization(nn.Module):
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
-# ================== MAJORITY VOTING ENSEMBLE CLASS ==================
+# ================== MAJORITY VOTING ENSEMBLE CLASS ( HARD VOTING ) ==================
 class MajorityVotingEnsemble(nn.Module):
-    # اصلاح شده: اضافه شدن پارامتر freeze_models
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
                  stds: List[Tuple[float]], freeze_models: bool = True):
         super().__init__()
@@ -129,19 +128,35 @@ class MajorityVotingEnsemble(nn.Module):
                     out = out[0]
             votes_logits.append(out)
 
-        stacked_logits = torch.cat(votes_logits, dim=1)
+        stacked_logits = torch.cat(votes_logits, dim=1) # [Batch, Num_Models]
         
-        # اصلاح شده: استفاده از Soft Voting برای محاسبه AUC صحیح
-        avg_logits = stacked_logits.mean(dim=1, keepdim=True)
+        # =================== پیاده‌سازی Hard Voting ===================
+        # تبدیل لاجیت‌ها به رأی قطعی (0 یا 1)
+        # فرض: لاجیت مثبت -> کلاس 1 (Real)، لاجیت منفی -> کلاس 0 (Fake)
+        hard_votes = (stacked_logits > 0).long() 
+        
+        # محاسبه رأی نهایی (اکثریت)
+        # مجموع آراء. اگر مجموع > نصف تعداد مدل‌ها باشد، یعنی اکثریت ۱ داده‌اند.
+        sum_votes = hard_votes.sum(dim=1, keepdim=True)
+        
+        # اگر تعداد مدل‌ها زوج باشد، تسطیح را به نفع کلاس 1 (Real) می‌شکنیم یا برعکس.
+        # در اینجا اگر >= نصف باشد، 1 در نظر گرفته می‌شود.
+        threshold = self.num_models / 2.0
+        final_decision = (sum_votes >= threshold).long().float()
+        
+        # برای محاسبه AUC/ROC ما به یک امتیاز (Score) نیاز داریم.
+        # در Hard Voting امتیاز وجود ندارد، اما برای نمودار از "میانگین احتمالات" استفاده می‌کنیم
+        # تا بتوانیم عملکرد را با نمودار ROC نمایش دهیم.
+        avg_probs = torch.sigmoid(stacked_logits).mean(dim=1, keepdim=True)
         
         if return_details:
             batch_size = x.size(0)
             weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
-            return avg_logits, weights, dummy_memberships, stacked_logits
+            # برگرداندن final_decision به عنوان خروجی قطعی، اما avg_probs برای مصارف ROC
+            return final_decision, weights, dummy_memberships, stacked_logits, avg_probs
             
-        hard_votes = (stacked_logits > 0).long()
-        return avg_logits, hard_votes
+        return final_decision, hard_votes
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
@@ -204,13 +219,14 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     vote_distribution = torch.zeros(len(model_names), 2, device=device)
     
     if loader is None: return 0.0, [], []
-    if is_main: print(f"\nEvaluating {name} set (Majority Voting)...")
+    if is_main: print(f"\nEvaluating {name} set (Majority Voting - Hard)...")
     
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
-        outputs, weights, _, stacked_logits = model(images, return_details=True)
+        # خروجی اول final_decision است (0 یا 1)
+        outputs, weights, _, stacked_logits, _ = model(images, return_details=True)
         
-        pred = (outputs.squeeze(1) > 0).long()
+        pred = outputs.squeeze(1).long()
         
         is_tp = ((pred == 1) & (labels.long() == 1)).sum()
         is_tn = ((pred == 0) & (labels.long() == 0)).sum()
@@ -246,7 +262,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         vote_dist_np = vote_distribution.cpu().numpy()
 
         print(f"\n{'='*70}")
-        print(f"{name.upper()} SET RESULTS (Majority Voting)")
+        print(f"{name.upper()} SET RESULTS (Majority Voting - Hard)")
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Precision: {precision:.4f}")
@@ -288,7 +304,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
 
     lines = []
     lines.append("="*100)
-    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (Hard Voting Logic):")
     lines.append("="*100)
     header = f"{'ID':<10} {'Filename':<60} {'True':<10} {'Pred':<10} {'Correct':<10}"
     lines.append(header)
@@ -297,8 +313,8 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     TP, TN, FP, FN = 0, 0, 0, 0
     
     all_y_true = []
-    all_y_score = []
-    all_y_pred = []
+    all_y_score = [] # برای ROC از Soft Probability استفاده می‌کنیم
+    all_y_pred = []  # برای Accuracy از Hard Voting استفاده می‌کنیم
     
     print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
     
@@ -313,14 +329,17 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
-            output, _, _, stacked_logits = model(image, return_details=True)
+            # خروجی‌ها: final_decision, weights, dummy, stacked_logits, avg_probs
+            decision, _, _, stacked_logits, avg_probs = model(image, return_details=True)
             
-            # محاسبه صحیح احتمال برای AUC
-            probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
-            pred_int = int(output.squeeze().item() > 0)
+            # پیش‌بینی نهایی بر اساس Hard Voting
+            pred_int = int(decision.squeeze().item())
+            
+            # امتیاز برای ROC (میانگین احتمالات)
+            score_for_roc = avg_probs.squeeze().item()
             
             all_y_true.append(label_int)
-            all_y_score.append(probs)
+            all_y_score.append(score_for_roc)
             all_y_pred.append(pred_int)
             
             if label_int == 1:
@@ -345,7 +364,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
 
     print(f"\n{'='*70}")
-    print("FINAL RESULTS")
+    print("FINAL RESULTS (HARD VOTING)")
     print(f"{'='*70}")
     print(f"Precision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
@@ -393,7 +412,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             "num_samples": int(total_samples),
             "positive_count": int(np.sum(y_true_np)),
             "negative_count": int(total_samples - np.sum(y_true_np)),
-            "model": "majority_voting_ensemble"
+            "model": "majority_voting_ensemble_HARD"
         },
         "y_true": y_true_np.tolist(),
         "y_score": y_score_np.tolist(),
@@ -442,7 +461,7 @@ def cleanup_distributed():
 
 # ================== MAIN FUNCTION ==================
 def main():
-    parser = argparse.ArgumentParser(description="Majority Voting Ensemble Evaluation")
+    parser = argparse.ArgumentParser(description="Majority Voting Ensemble Evaluation (HARD VOTING)")
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
@@ -464,7 +483,7 @@ def main():
 
     if is_main:
         print("="*70)
-        print(f"MAJORITY VOTING ENSEMBLE EVALUATION")
+        print(f"MAJORITY VOTING ENSEMBLE EVALUATION (HARD VOTING)")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
 
@@ -511,7 +530,7 @@ def main():
         os.makedirs(args.save_dir, exist_ok=True)
 
         print("\n" + "="*70)
-        print("FINAL ENSEMBLE EVALUATION (Unified)")
+        print("FINAL ENSEMBLE EVALUATION (Unified - Hard Voting)")
         print("="*70)
 
         _, _, test_loader_full = create_dataloaders(
@@ -527,7 +546,7 @@ def main():
         print("FINAL COMPARISON")
         print("="*70)
         print(f"Best Single Model: {best_single:.2f}%")
-        print(f"Ensemble Accuracy: {final_acc:.2f}%")
+        print(f"Ensemble Accuracy (Hard Voting): {final_acc:.2f}%")
         print(f"Improvement: {final_acc - best_single:+.2f}%")
         print("="*70)
 
@@ -535,7 +554,7 @@ def main():
 
         final_results = {
             'seed': args.seed,
-            'method': 'Majority Voting',
+            'method': 'Majority Voting (Hard)',
             'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
             'ensemble': {'test_accuracy': float(final_acc), 'vote_distribution': {name: {'fake': int(d[0]), 'real': int(d[1])} for name, d in zip(MODEL_NAMES, vote_dist)}},
             'improvement': float(final_acc - best_single)
