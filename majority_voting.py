@@ -103,17 +103,7 @@ class MultiModelNormalization(nn.Module):
 
 # ================== MAJORITY VOTING ENSEMBLE CLASS ==================
 class MajorityVotingEnsemble(nn.Module):
-    def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
-                 stds: List[Tuple[float]], freeze_models: bool = True):
-        super().__init__()
-        self.num_models = len(models)
-        self.models = nn.ModuleList(models)
-        self.normalizations = MultiModelNormalization(means, stds)
-        if freeze_models:
-            for model in self.models:
-                model.eval()
-                for p in model.parameters():
-                    p.requires_grad = False
+    # ... (بقیه متد __init__ بدون تغییر) ...
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         votes_logits = []
@@ -129,20 +119,21 @@ class MajorityVotingEnsemble(nn.Module):
             votes_logits.append(out)
 
         stacked_logits = torch.cat(votes_logits, dim=1)
-        # تبدیل logits به رأی باینری (0 یا 1)
-        hard_votes = (stacked_logits > 0).long()
         
-        # محاسبه رأی نهایی (Mode)
-        final_vote, _ = torch.mode(hard_votes, dim=1)
-        final_output = final_vote.float().unsqueeze(1)
-
+        avg_logits = stacked_logits.mean(dim=1, keepdim=True)
+        
+        # اگر به جزئیات رأی‌ها نیاز داریم
         if return_details:
             batch_size = x.size(0)
             weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
-            # برگرداندن stacked_logits برای محاسبه ROC Score
-            return final_output, weights, dummy_memberships, stacked_logits
-        return final_output, hard_votes
+            # برگرداندن avg_logits به عنوان خروجی اصلی
+            return avg_logits, weights, dummy_memberships, stacked_logits
+            
+        # خروجی پیش‌فرض برای توابع ارزیابی خارجی
+        # برگرداندن avg_logits (معادل احتمال) به جای final_vote (0 یا 1)
+        hard_votes = (stacked_logits > 0).long()
+        return avg_logits, hard_votes
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
