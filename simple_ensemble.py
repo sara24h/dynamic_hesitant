@@ -1,4 +1,4 @@
- ایا از نظر محاسبات roc  و مساحت درسته؟import torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
