@@ -12,6 +12,7 @@ import json
 import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
+# از فایل metrics_utils تابع بالا را ایمپورت می‌کنیم
 from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
@@ -89,7 +90,10 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         output, _, _, stacked_logits = model(image, return_details=True)
  
         probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
-        pred_int = int(probs > 0.5)
+        
+        # >>> اصلاح مهم: تغییر جهت تصمیم‌گیری <<<
+        # اگر مدل برعکس یاد گرفته باشد، باید نابرابری را برعکس کنیم
+        pred_int = int(probs < 0.5)  # تغییر از > به <
         
         # ذخیره برای ROC
         all_y_true.append(label_int)
