@@ -42,8 +42,8 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
             prob_real = torch.sigmoid(outputs).squeeze(-1).cpu().numpy()  # [B]
             prob_fake = 1.0 - prob_real
 
-            # پیش‌بینی (threshold روی logit خام)
-            pred = (outputs.squeeze(-1) > 0).long().cpu().numpy()
+   
+            pred = (outputs.squeeze(-1) < 0).long().cpu().numpy()
 
             all_labels.append(labels.cpu().numpy())
             all_prob_fake.append(prob_fake)
