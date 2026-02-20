@@ -13,7 +13,6 @@ import seaborn as sns
 from tqdm import tqdm
 import json
 
-
 def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, is_main=True):
     if not is_main:
         return None
@@ -38,18 +37,17 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
                 print(f"Forward pass error in batch {batch_idx}: {e}")
                 continue
 
-            # outputs شکل معمولاً [B, 1] است
+            # محاسبه احتمال
             prob_real = torch.sigmoid(outputs).squeeze(-1).cpu().numpy()  # [B]
             prob_fake = 1.0 - prob_real
 
-   
+            # اصلاح مهم: چون مدل برعکس یاد گرفته، خروجی کمتر از ۰ یعنی فیک
             pred = (outputs.squeeze(-1) < 0).long().cpu().numpy()
 
             all_labels.append(labels.cpu().numpy())
             all_prob_fake.append(prob_fake)
             all_preds.append(pred)
 
-            # دیباگ: چاپ میانگین احتمال‌ها (هر ۴ بچ یک بار)
             if batch_idx % 4 == 0:
                 print(f"Batch {batch_idx} - Mean prob_real (all): {prob_real.mean():.4f}")
                 print(f"  → When true label fake (0): {prob_real[labels.cpu().numpy()==0].mean():.4f}")
@@ -117,19 +115,17 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
     plt.close()
     print(f"Figure saved → {save_path}")
 
-    # Classification report
     print("\nClassification Report:")
     print(classification_report(y_true, y_pred,
                                 target_names=['Fake (0)', 'Real (1)'],
                                 digits=4, zero_division=0))
 
-    # ذخیره metrics (بدون خطا)
     metrics = {
         "roc_auc_fake": float(roc_auc),
         "pr_auc_fake": float(pr_auc),
         "f1_fake": float(f1),
         "precision_fake": float(prec_fake),
-        "recall_fake": float(rec_fake),          # ← اینجا درست شد
+        "recall_fake": float(rec_fake),
         "confusion_matrix": {
             "tn": int(tn), "fp": int(fp),
             "fn": int(fn), "tp": int(tp)
