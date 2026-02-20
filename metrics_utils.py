@@ -2,10 +2,10 @@ import torch
 import numpy as np
 import os
 from sklearn.metrics import (
-    roc_curve, auc, 
-    f1_score, confusion_matrix, 
-    classification_report, 
-    precision_recall_curve, 
+    roc_curve, auc,
+    f1_score, confusion_matrix,
+    classification_report,
+    precision_recall_curve,
     average_precision_score
 )
 import matplotlib.pyplot as plt
@@ -15,16 +15,7 @@ import json
 import torch.distributed as dist
 
 def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, is_main=True):
-    """
-    تابع رسم منحنی ROC و محاسبه F1-Score
-    
-    Args:
-        ensemble_model: مدل انسامبل (فازی یا Majority Voting)
-        test_loader: دیتالودر تست
-        device: دستگاه (cuda/cpu)
-        save_dir: مسیر ذخیره تصاویر
-        model_names: لیست نام مدل‌ها (برای نمایش در عنوان)
-    """
+   
     if not is_main:
         return
         
@@ -62,12 +53,12 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
             all_labels.append(labels.cpu().numpy())
             all_probs.append(probs)
             all_preds.append(pred)
-
+    
     # تبدیل لیست‌ها به آرایه‌های یک‌پارچه (Flat)
-    all_labels = np.concatenate(all_labels)
-    all_probs = np.concatenate(all_probs)
-    all_preds = np.concatenate(all_preds)
-
+    all_labels = np.concatenate(all_labels).ravel()
+    all_probs = np.concatenate(all_probs).ravel()
+    all_preds = np.concatenate(all_preds).ravel()
+    
     # 2. محاسبه ROC Curve
     # pos_label=1 برای تشخیص "Real"
     fpr, tpr, _ = roc_curve(all_labels, all_probs, pos_label=1)
@@ -99,8 +90,8 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
         print(f"Precision: {precision_val:.4f}")
         print(f"Recall: {recall_val:.4f}")
         print(f"Confusion Matrix:")
-        print(f"  TN={tn}, FP={fp}")
-        print(f"  FN={fn}, TP={tp}")
+        print(f" TN={tn}, FP={fp}")
+        print(f" FN={fn}, TP={tp}")
         print(f"{'='*70}")
         
         # 5. رسم نمودارها
@@ -133,13 +124,13 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
         plt.subplot(1, 3, 3)
         # ردیف‌ها: Real (1), Fake (0) - ستون‌ها: Real (1), Fake (0)
         # برای رسم تمیز، از لیبل‌های استاندارد استفاده می‌کنیم
-        cm_display = np.array([[tp, fn], [fp, tn]]) # Row: Actual Real, Fake | Col: Pred Real, Fake
+        cm_display = np.array([[tp, fn], [fp, tn]])  # Row: Actual Real, Fake | Col: Pred Real, Fake
         
         # استفاده از seaborn برای رسم Heatmap بهتر
         ax = plt.gca()
-        sns.heatmap(cm_display, annot=True, fmt='d', cmap='Blues', 
-                    xticklabels=['Real', 'Fake'], 
-                    yticklabels=['Real', 'Fake'], ax=ax)
+        sns.heatmap(cm_display, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=['Predicted Real', 'Predicted Fake'],
+                    yticklabels=['Actual Real', 'Actual Fake'], ax=ax)
         plt.title('Confusion Matrix')
         plt.ylabel('True Label')
         plt.xlabel('Predicted Label')
@@ -183,5 +174,4 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
         with open(metrics_path, 'w') as f:
             json.dump(metrics, f, indent=4)
         print(f"Metrics saved to: {metrics_path}")
-
         return metrics
