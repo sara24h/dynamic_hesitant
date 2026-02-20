@@ -61,16 +61,16 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
     
     # 2. محاسبه ROC Curve
     # pos_label=1 برای تشخیص "fake"
-    fpr, tpr, _ = roc_curve(all_labels, all_probs, pos_label=0)
+    fpr, tpr, _ = roc_curve(all_labels, all_probs, pos_label=1)
     roc_auc = auc(fpr, tpr)
     
     # 3. محاسبه Precision-Recall
-    precision, recall, _ = precision_recall_curve(all_labels, all_probs, pos_label=0)
-    pr_auc = average_precision_score(all_labels, all_probs, pos_label=0)
+    precision, recall, _ = precision_recall_curve(all_labels, all_probs, pos_label=1)
+    pr_auc = average_precision_score(all_labels, all_probs, pos_label=1)
     
     # 4. محاسبه متریک‌های دقیق
     # pos_label=1 برای تشخیص کلاس "Real"
-    f1 = f1_score(all_labels, all_preds, pos_label=0)
+    f1 = f1_score(all_labels, all_preds, pos_label=1)
     cm = confusion_matrix(all_labels, all_preds)
     
     # متریک‌های دقیق
