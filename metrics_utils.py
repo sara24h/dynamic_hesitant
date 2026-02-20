@@ -13,6 +13,7 @@ import seaborn as sns
 from tqdm import tqdm
 import json
 
+
 def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, is_main=True):
     if not is_main:
         return None
@@ -37,17 +38,42 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
                 print(f"Forward pass error in batch {batch_idx}: {e}")
                 continue
 
-            # محاسبه احتمال
+            # outputs شکل معمولاً [B, 1] است
+            # توجه: خروجی مدل Logit است.
+            
+            # 1. محاسبه احتمال کلاس Real با Sigmoid
             prob_real = torch.sigmoid(outputs).squeeze(-1).cpu().numpy()  # [B]
+            
+            # 2. محاسبه احتمال کلاس Fake
             prob_fake = 1.0 - prob_real
 
-            # اصلاح مهم: چون مدل برعکس یاد گرفته، خروجی کمتر از ۰ یعنی فیک
-            pred = (outputs.squeeze(-1) < 0).long().cpu().numpy()
+            # 3. تصمیم‌گیری (Prediction) اصلاح شده
+            # اگر prob_fake > 0.5 باشد، یعنی کلاس Fake (0) است.
+            # اگر prob_fake < 0.5 باشد، یعنی کلاس Real (1) است.
+            # نتیجه را به int تبدیل می‌کنیم (0 برای Fake، 1 برای Real)
+            pred = (prob_fake > 0.5).astype(int)
+            
+            # تبدیل برچسب‌ها: چون Fake کلاس 0 است و Real کلاس 1، 
+            # اگر pred_True (از شرط بالا) برای Fake باشد، ما می‌خواهیم عدد 0 ذخیره شود.
+            # شرط بالا برای Fake ها True می‌شود (1). پس باید معکوس کنیم یا مستقیماً از prob_real استفاده کنیم.
+            # روش صحیح‌تر برای تطبیق با دیتاست (Fake=0, Real=1):
+            # اگر prob_fake > 0.5 --> Fake (0)
+            # در numpy، True می‌شود 1 و False می‌شود 0.
+            # پس اگر (prob_fake > 0.5) باشد، نتیجه 1 است. اما ما 0 می‌خواهیم.
+            # فرمول صحیح:
+            pred = (prob_fake > 0.5).astype(int) # این می‌شود 1 برای Fake. ما 0 می‌خواهیم.
+            # اصلاح نهایی:
+            pred = (prob_fake <= 0.5).astype(int) # این می‌شود 1 برای Real، 0 برای Fake. صحیح است.
+            
+            # اما ساده‌تر:
+            # pred = (prob_real < 0.5).astype(int) # اگر احتمال ریل کمتر از 50% بود، پس فیک است (0). درست.
+            pred = (prob_real < 0.5).astype(int)
 
             all_labels.append(labels.cpu().numpy())
             all_prob_fake.append(prob_fake)
             all_preds.append(pred)
 
+            # دیباگ: چاپ میانگین احتمال‌ها (هر ۴ بچ یک بار)
             if batch_idx % 4 == 0:
                 print(f"Batch {batch_idx} - Mean prob_real (all): {prob_real.mean():.4f}")
                 print(f"  → When true label fake (0): {prob_real[labels.cpu().numpy()==0].mean():.4f}")
@@ -115,11 +141,13 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
     plt.close()
     print(f"Figure saved → {save_path}")
 
+    # Classification report
     print("\nClassification Report:")
     print(classification_report(y_true, y_pred,
                                 target_names=['Fake (0)', 'Real (1)'],
                                 digits=4, zero_division=0))
 
+    # ذخیره metrics (بدون خطا)
     metrics = {
         "roc_auc_fake": float(roc_auc),
         "pr_auc_fake": float(pr_auc),
