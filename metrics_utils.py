@@ -142,7 +142,7 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
         "pr_auc_fake": float(pr_auc),
         "f1_fake": float(f1),
         "precision_fake": float(prec_fake),
-        "recall_fake": float(rec_rec_fake),
+        'recall_fake': float(recall_val),
         "confusion_matrix": {
             "tn": int(tn), "fp": int(fp),
             "fn": int(fn), "tp": int(tp)
