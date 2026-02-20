@@ -86,9 +86,19 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         label_int = int(label)
         
         # پیش‌بینی مدل
+        # stacked_logits شامل خروجی‌های خام (Logits) تک‌تک مدل‌هاست
         output, _, _, stacked_logits = model(image, return_details=True)
  
-        probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
+        # ==========================================
+        # اصلاح مهم برای یکسان شدن AUC فایل و کنسول
+        # ==========================================
+        # 1. ابتدا میانگین Logits را محاسبه می‌کنیم (Average of Logits)
+        logits_mean = stacked_logits.mean(dim=1)
+        
+        # 2. سپس تابع Sigmoid را اعمال می‌کنیم
+        probs = torch.sigmoid(logits_mean).item()
+        
+        # پیش‌بینی نهایی بر اساس احتمال
         pred_int = int(probs > 0.5)
         
         # ذخیره برای ROC
@@ -174,7 +184,8 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
             "num_samples": int(total_samples),
             "positive_count": int(np.sum(y_true_np)),
             "negative_count": int(total_samples - np.sum(y_true_np)),
-            "model": "simple_averaging_ensemble"
+            "model": "simple_averaging_ensemble",
+            "note": "y_score calculated by Mean(Logits) -> Sigmoid"
         },
         "y_true": y_true_np.tolist(),
         "y_score": y_score_np.tolist(),
@@ -371,7 +382,7 @@ def main():
     ).to(device)
 
     if world_size > 1:
-        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
+        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank])
 
     if is_main:
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
