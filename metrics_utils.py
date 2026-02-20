@@ -28,34 +28,39 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
     print("=" * 70)
 
     with torch.no_grad():
-        for images, labels in tqdm(test_loader, desc="Predictions"):
+        for batch_idx, (images, labels) in enumerate(tqdm(test_loader, desc="Predictions")):
             images = images.to(device)
             labels = labels.to(device).float()
 
             try:
                 outputs, _, _, _ = ensemble_model(images, return_details=True)
             except Exception as e:
-                print(f"Forward pass error: {e}")
+                print(f"Forward pass error in batch {batch_idx}: {e}")
                 continue
 
-            # outputs → logits (معمولاً بالاتر از 0 → Real)
-            prob_real = torch.sigmoid(outputs).squeeze().cpu().numpy()
+            # outputs شکل معمولاً [B, 1] است
+            prob_real = torch.sigmoid(outputs).squeeze(-1).cpu().numpy()  # [B]
             prob_fake = 1.0 - prob_real
 
-            pred = (outputs.squeeze() > 0).long().cpu().numpy()
+            # پیش‌بینی (threshold روی logit خام)
+            pred = (outputs.squeeze(-1) > 0).long().cpu().numpy()
 
             all_labels.append(labels.cpu().numpy())
             all_prob_fake.append(prob_fake)
             all_preds.append(pred)
 
-    # flatten
+            # دیباگ: چاپ میانگین احتمال‌ها (هر ۴ بچ یک بار)
+            if batch_idx % 4 == 0:
+                print(f"Batch {batch_idx} - Mean prob_real (all): {prob_real.mean():.4f}")
+                print(f"  → When true label fake (0): {prob_real[labels.cpu().numpy()==0].mean():.4f}")
+                print(f"  → When true label real (1): {prob_real[labels.cpu().numpy()==1].mean():.4f}")
+
+    # flatten arrays
     y_true = np.concatenate(all_labels).ravel()
     y_score_fake = np.concatenate(all_prob_fake).ravel()
     y_pred = np.concatenate(all_preds).ravel()
 
-    # ────────────────────────────────────────────────
-    # محاسبه معیارها با فرض Fake = positive (pos_label=0)
-    # ────────────────────────────────────────────────
+    # محاسبات معیارها (Fake = pos_label=0)
     fpr, tpr, _ = roc_curve(y_true, y_score_fake, pos_label=0)
     roc_auc = auc(fpr, tpr)
 
@@ -64,14 +69,12 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
 
     f1 = f1_score(y_true, y_pred, pos_label=0)
     cm = confusion_matrix(y_true, y_pred)
-    tn, fp, fn, tp = cm.ravel()   # tn: Real→Real, fp: Real→Fake, fn: Fake→Real, tp: Fake→Fake
+    tn, fp, fn, tp = cm.ravel()
 
     prec_fake = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     rec_fake  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
-    # ────────────────────────────────────────────────
     # چاپ نتایج
-    # ────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("METRICS ─ Fake is positive class (label = 0)")
     print("=" * 70)
@@ -80,49 +83,33 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
     print(f"F1-score (Fake)    : {f1:.4f}")
     print(f"Precision (Fake)   : {prec_fake:.4f}")
     print(f"Recall    (Fake)   : {rec_fake:.4f}")
-    print()
-    print("Confusion Matrix:")
+    print("\nConfusion Matrix:")
     print("                Predicted")
     print("              Real     Fake")
     print(f"Actual Real   {tn:6d}   {fp:6d}")
     print(f"Actual Fake   {fn:6d}   {tp:6d}")
     print("=" * 70)
 
-    # ────────────────────────────────────────────────
-    # رسم
-    # ────────────────────────────────────────────────
+    # رسم شکل‌ها
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
-    # ROC
     axes[0].plot(fpr, tpr, color='darkorange', lw=2, label=f'AUC = {roc_auc:.4f}')
     axes[0].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    axes[0].set_xlim([0.0, 1.0])
-    axes[0].set_ylim([0.0, 1.05])
-    axes[0].set_xlabel('False Positive Rate')
-    axes[0].set_ylabel('True Positive Rate (Recall Fake)')
-    axes[0].set_title('ROC Curve – Fake positive')
+    axes[0].set(xlabel='False Positive Rate', ylabel='True Positive Rate (Fake)', title='ROC – Fake positive')
     axes[0].legend(loc="lower right")
     axes[0].grid(True, alpha=0.3)
 
-    # PR curve
     axes[1].plot(recall, precision, color='blue', lw=2, label=f'AP = {pr_auc:.4f}')
-    axes[1].set_xlim([0.0, 1.0])
-    axes[1].set_ylim([0.0, 1.05])
-    axes[1].set_xlabel('Recall (Fake)')
-    axes[1].set_ylabel('Precision')
-    axes[1].set_title('Precision-Recall Curve – Fake positive')
+    axes[1].set(xlabel='Recall (Fake)', ylabel='Precision', title='PR Curve – Fake positive')
     axes[1].legend(loc="lower left")
     axes[1].grid(True, alpha=0.3)
 
-    # Confusion Matrix
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[2],
                 xticklabels=['Pred Real', 'Pred Fake'],
                 yticklabels=['Actual Real', 'Actual Fake'])
-    axes[2].set_title('Confusion Matrix')
-    axes[2].set_ylabel('True label')
-    axes[2].set_xlabel('Predicted label')
+    axes[2].set(title='Confusion Matrix', ylabel='True label', xlabel='Predicted label')
 
-    fig.suptitle(f"Ensemble: {' + '.join(model_names)} – Fake as Positive Class", fontsize=16)
+    fig.suptitle(f"Ensemble: {' + '.join(model_names)} – Fake as Positive", fontsize=16)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     save_path = os.path.join(save_dir, 'roc_pr_cm_fake_positive.png')
@@ -136,13 +123,13 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
                                 target_names=['Fake (0)', 'Real (1)'],
                                 digits=4, zero_division=0))
 
-    # ذخیره json
+    # ذخیره metrics (بدون خطا)
     metrics = {
         "roc_auc_fake": float(roc_auc),
         "pr_auc_fake": float(pr_auc),
         "f1_fake": float(f1),
         "precision_fake": float(prec_fake),
-        'recall_fake': float(recall_val),
+        "recall_fake": float(rec_fake),          # ← اینجا درست شد
         "confusion_matrix": {
             "tn": int(tn), "fp": int(fp),
             "fn": int(fn), "tp": int(tp)
