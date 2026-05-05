@@ -263,15 +263,18 @@ class FuzzyHesitantEnsemble(nn.Module):
                 for p in model.parameters():
                     p.requires_grad = False
 
-     def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
+    def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
         batch_size = final_weights.size(0)
         sorted_weights, sorted_indices = torch.sort(final_weights, dim=1, descending=True)
-       
+        
         cum_weights = torch.cumsum(sorted_weights, dim=1)
-      
+        
         mask = (cum_weights <= self.cum_weight_threshold).float()
-      
-        mask[:, 0] = 1.0
+        mask[:, 0] = 1.0 
+        
+        final_mask = torch.zeros_like(final_weights)
+        final_mask.scatter_(1, sorted_indices, mask)
+        return final_mask
         
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
