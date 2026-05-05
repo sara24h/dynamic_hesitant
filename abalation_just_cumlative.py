@@ -175,7 +175,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             "num_samples": int(total_samples),
             "positive_count": int(np.sum(y_true_np)),
             "negative_count": int(total_samples - np.sum(y_true_np)),
-            "model": "fuzzy_hesitant_ensemble"
+            "model": "fuzzy_hesitant_ensemble_ablation_no_override" # نام تغییر کرد
         },
         "y_true": y_true_np.tolist(),
         "y_score": y_score_np.tolist(),
@@ -255,7 +255,7 @@ class FuzzyHesitantEnsemble(nn.Module):
         self.hesitant_fuzzy = HesitantFuzzyMembership(
             input_dim=128, num_models=self.num_models, num_memberships=num_memberships)
         self.cum_weight_threshold = cum_weight_threshold
-        self.hesitancy_threshold = hesitancy_threshold
+        self.hesitancy_threshold = hesitancy_threshold # حفظ شده برای لاگ‌گیری (بدون اثر اجرایی)
 
         if freeze_models:
             for model in self.models:
@@ -264,23 +264,40 @@ class FuzzyHesitantEnsemble(nn.Module):
                     p.requires_grad = False
 
     def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
+        """
+        اصلاح شده برای Ablation:
+        مکانیزم Override (فعال‌سازی همه مدل‌ها در صورت عدم قطعیت) حذف شده است.
+        تنها مکانیزم Cumulative Thresholding اعمال می‌شود.
+        """
         batch_size = final_weights.size(0)
         sorted_weights, sorted_indices = torch.sort(final_weights, dim=1, descending=True)
         
         cum_weights = torch.cumsum(sorted_weights, dim=1)
         
+        # --- مکانیزم ۲: Cumulative Thresholding ---
+        # انتخاب مدل‌ها تا زمانی که مجموع وزن‌ها به آستانه برسد
         mask = (cum_weights <= self.cum_weight_threshold).float()
-        mask[:, 0] = 1.0 
+        mask[:, 0] = 1.0  # تضمین انتخاب حداقل یک مدل
+        
+        # --- حذف مکانیزم ۱ (Hesitancy Override) ---
+        # کد زیر کامنت شده است تا اثر آن حذف گردد:
+        # high_hesitancy_mask = (avg_hesitancy > self.hesitancy_threshold).unsqueeze(1)
+        # mask = torch.where(high_hesitancy_mask, torch.ones_like(mask), mask)
+        # ------------------------------------------
         
         final_mask = torch.zeros_like(final_weights)
         final_mask.scatter_(1, sorted_indices, mask)
         return final_mask
-        
+
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
+        
+        # محاسبه هزیستنسی (فقط برای لاگ و تحلیل، بدون تاثیر در ماسک)
         hesitancy = all_memberships.var(dim=2)
         avg_hesitancy = hesitancy.mean(dim=1)
+        
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
+        
         final_weights = final_weights * mask
         final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
 
@@ -378,7 +395,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
 
     if is_main:
         print("="*70)
-        print("Training Fuzzy Hesitant Network")
+        print("Training Fuzzy Hesitant Network (ABLATION: No Override)")
         print("="*70)
         print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
         print(f"Epochs: {num_epochs} | Initial LR: {lr}")
@@ -501,7 +518,7 @@ def cleanup_distributed():
 
 # ================== MAIN FUNCTION ==================
 def main():
-    parser = argparse.ArgumentParser(description="Optimized Fuzzy Hesitant Ensemble Training")
+    parser = argparse.ArgumentParser(description="Ablation Study: No Hesitancy Override")
     # آرگومان‌های اصلی
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.0001)
@@ -516,7 +533,7 @@ def main():
     # آرگومان‌های مدل
     parser.add_argument('--num_memberships', type=int, default=3)
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
-    parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
+    parser.add_argument('--hesitancy_threshold', type=float, default=0.2) # حفظ شده برای سازگاری آرگومان‌ها
     
     # آرگومان‌های ویژوالایزیشن
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
@@ -534,7 +551,7 @@ def main():
 
     if is_main:
         print("="*70)
-        print(f"OPTIMIZED FUZZY HESITANT ENSEMBLE TRAINING")
+        print(f"ABLATION STUDY: TRAINING WITHOUT HESITANCY OVERRIDE")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
         print(f"Dataset: {args.dataset}")
@@ -606,7 +623,6 @@ def main():
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
     
-    # --- FIX: فقط GPU اصلی فایل را بخواند تا ارور PytorchStreamReader برطرف شود ---
     if is_main and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device)
         ensemble_module.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
@@ -614,7 +630,7 @@ def main():
 
     if is_main:
         print("\n" + "="*70)
-        print("FINAL ENSEMBLE EVALUATION")
+        print("FINAL ENSEMBLE EVALUATION (ABLATION: NO OVERRIDE)")
         print("="*70)
 
         # ساخت دیتالودر تست غیرتوزیع‌شده
@@ -639,7 +655,8 @@ def main():
         # ذخیره نتایج JSON
         final_results = {
             'seed': args.seed,
-            'method': 'Fuzzy_Hesitant',
+            'method': 'Fuzzy_Hesitant_No_Override', # تغییر نام متد
+            'ablation': 'Hesitancy Override Removed',
             'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
             'ensemble': {'test_accuracy': float(final_acc)},
             'improvement': float(final_acc - best_single)
