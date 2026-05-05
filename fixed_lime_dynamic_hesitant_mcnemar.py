@@ -215,7 +215,7 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 class HesitantFuzzyMembership(nn.Module):
-    def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, dropout: float = 0.3):
+    def __init__(self, input_dim: int, num_models: int, num_memberships: int = 5, dropout: float = 0.3):
         super().__init__()
         self.num_models = num_models
         self.num_memberships = num_memberships
