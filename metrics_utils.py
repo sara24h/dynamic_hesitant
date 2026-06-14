@@ -14,21 +14,23 @@ from tqdm import tqdm
 import json
 import torch.distributed as dist
 
-def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True, ensemble_type="Ensemble"):
+def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
     """
     رسم منحنی ROC و محاسبه F1-Score
     از داده‌های از پیش محاسبه‌شده استفاده می‌کند (نه اجرای مجدد مدل)
-    
-    Args:
-        y_true: لیبل‌های واقعی (array-like)
-        y_score: احتمال‌های پیش‌بینی (array-like)
-        save_dir: مسیر ذخیره تصاویر
-        model_names: لیست نام مدل‌ها
-        is_main: آیا پردازش اصلی است
-        ensemble_type: نوع انسامبل (مثلاً "Fuzzy Hesitant", "Simple Averaging", "Majority Voting" و غیره)
     """
     if not is_main:
         return
+    
+    # دیگه نیاز به اجرای مدل نیست! داده‌ها آماده‌ست
+    import numpy as np
+    from sklearn.metrics import (
+        roc_curve, auc, f1_score, confusion_matrix,
+        classification_report, precision_recall_curve, average_precision_score
+    )
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import json, os
 
     y_true = np.asarray(y_true).ravel()
     y_score = np.asarray(y_score).ravel()
@@ -48,6 +50,8 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True, ensemb
     tn, fp, fn, tp = cm.ravel()
     precision_val = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall_val = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+    # ... (بقیه کد رسم نمودار همونطور که هست)
     
     print(f"\n{'='*70}")
     print(f"METRICS (Pos Label=Real)")
