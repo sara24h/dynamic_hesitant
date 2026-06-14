@@ -48,13 +48,14 @@ def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, 
             # ما فقط logits (outputs) را می‌خواهیم
             try:
                 outputs, weights, _, _ = ensemble_model(images, return_details=True)
+
             except Exception as e:
                 print(f"Error in forward pass: {e}")
                 continue
             
             # outputs: (Batch, 1) -> Logits
             # probabilities: استفاده از Sigmoid برای تبدیل به 0 تا 1
-            probs = torch.sigmoid(outputs).cpu().numpy()
+            probs = outputs.cpu().numpy() # <-- 
             
             # تبدیل logits به پیش‌بینی (0 یا 1)
             pred = (outputs > 0).long().cpu().numpy()
