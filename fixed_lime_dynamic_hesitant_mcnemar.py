@@ -69,6 +69,8 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     all_y_true = []
     all_y_score = []
     all_y_pred = []
+
+    all_model_weights = []  # لیست وزن هر مدل برای هر نمونه
     
     print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
     
@@ -83,13 +85,16 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
+            # پیش‌بینی مدل
+                        # پیش‌بینی مدل با دریافت جزئیات وزن‌ها
             output, final_weights, _, _ = model(image, return_details=True)
-
-# سیگموید را حذف کنید چون خروجی مدل احتمالاً بین 0 و 1 است
-# prob = torch.sigmoid(output.squeeze()).item()  <-- خط قدیمی
-            prob = output.squeeze().item() # <-- خط جدید
-# -----------------
-
+            
+            # محاسبه احتمال (Score) و کلاس پیش‌بینی شده
+            prob = torch.sigmoid(output.squeeze()).item()
+            
+            # ذخیره وزن هر مدل
+            all_model_weights.append(final_weights.squeeze(0).cpu().numpy())
+            
             pred_int = int(prob > 0.5)
             
             # ذخیره برای ROC و JSON
@@ -132,11 +137,80 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"    Actual Real      {TP:<15} {FN:<15}")
     print(f"    Actual Fake      {FP:<15} {TN:<15}")
     print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
+    print(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
+    print("="*70)
+
+        print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
     print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     print("="*70)
 
+    # ════════════════════════════════════════════════════════════════
+    #        آمار فعال‌سازی هر مدل (درصد نمونه‌هایی که مدل فعال بوده)
+    # ════════════════════════════════════════════════════════════════
+    if len(all_model_weights) > 0:
+        weights_np = np.array(all_model_weights)
+        
+        print(f"\n{'='*70}")
+        print("MODEL ACTIVATION STATISTICS (Final Evaluation)")
+        print(f"{'='*70}")
+        
+        activation_threshold = 1e-4
+        active_mask = (weights_np > activation_threshold).astype(float)
+        
+        activation_rates = active_mask.mean(axis=0) * 100
+        avg_weights = weights_np.mean(axis=0)
+        max_weights = weights_np.max(axis=0)
+        
+        print(f"\n  {'Model':<35} {'Active %':>10} {'Avg Weight':>12} {'Max Weight':>12}")
+        print(f"  {'-'*70}")
+        for i, name in enumerate(model_names):
+            act_pct = activation_rates[i]
+            avg_w = avg_weights[i]
+            max_w = max_weights[i]
+            bar_length = int(act_pct / 2)
+            bar = '█' * bar_length + '░' * (50 - bar_length)
+            print(f"  {i+1:2d}. {name:<30}: {act_pct:6.2f}%  | {avg_w:.6f}  | {max_w:.6f}")
+            print(f"      [{bar}]")
+        
+        print(f"  {'-'*70}")
+        print(f"  {'Overall Average':<35} {activation_rates.mean():6.2f}%")
+        
+        active_per_sample = active_mask.sum(axis=1)
+        print(f"\n  Active Models Per Sample:")
+        print(f"    Min:    {int(active_per_sample.min())}")
+        print(f"    Max:    {int(active_per_sample.max())}")
+        print(f"    Mean:   {active_per_sample.mean():.2f}")
+        print(f"    Median: {np.median(active_per_sample):.1f}")
+        
+        unique_counts, count_freq = np.unique(active_per_sample.astype(int), return_counts=True)
+        print(f"\n  Distribution of Active Model Count:")
+        for count, freq in zip(unique_counts, count_freq):
+            pct = 100.0 * freq / len(all_model_weights)
+            bar = '█' * int(pct / 2)
+            print(f"    {count} model(s): {freq:5d} samples ({pct:5.2f}%) {bar}")
+        
+        print(f"{'='*70}\n")
+        
+        activation_stats = {
+            "activation_rates_pct": {name: float(activation_rates[i]) for i, name in enumerate(model_names)},
+            "average_weights": {name: float(avg_weights[i]) for i, name in enumerate(model_names)},
+            "max_weights": {name: float(max_weights[i]) for i, name in enumerate(model_names)},
+            "active_per_sample_stats": {
+                "min": int(active_per_sample.min()),
+                "max": int(active_per_sample.max()),
+                "mean": float(active_per_sample.mean()),
+                "median": float(np.median(active_per_sample))
+            },
+            "per_sample_weights": weights_np.tolist()
+        }
+        activation_json_path = os.path.join(save_dir, "model_activation_stats.json")
+        with open(activation_json_path, 'w', encoding='utf-8') as f:
+            json.dump(activation_stats, f, indent=2, ensure_ascii=False)
+        print(f"Model activation stats saved: {activation_json_path}")
+
     # ذخیره لاگ متنی (McNemar Format)
     output_str = []
+
     output_str.append("-" * 100)
     output_str.append("SUMMARY STATISTICS:")
     output_str.append("-" * 100)
