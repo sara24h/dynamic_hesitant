@@ -14,78 +14,37 @@ from tqdm import tqdm
 import json
 import torch.distributed as dist
 
-def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, is_main=True):
-    """
-    تابع رسم منحنی ROC و محاسبه F1-Score
-    
-    Args:
-        ensemble_model: مدل انسامبل (فازی یا Majority Voting)
-        test_loader: دیتالودر تست
-        device: دستگاه (cuda/cpu)
-        save_dir: مسیر ذخیره تصاویر
-        model_names: لیست نام مدل‌ها (برای نمایش در عنوان)
-    """
+def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
+
     if not is_main:
         return
-        
-    ensemble_model.eval()
-    all_labels = []
-    all_probs = []
-    all_preds = []
     
-    # 1. جمع‌آوری Probabilities و Labels
-    print("="*70)
-    print("Generating ROC and F1-Score Plots...")
-    print("="*70)
-    
-    with torch.no_grad():
-        for images, labels in tqdm(test_loader, desc="Collecting predictions"):
-            images, labels = images.to(device), labels.to(device).float()
-            
-            # دریافت خروجی با جزئیات
-            # برای Majority Voting: outputs, weights, dummy, votes
-            # برای Fuzzy Hesitant: outputs, weights, memberships, raw_outputs
-            # ما فقط logits (outputs) را می‌خواهیم
-            try:
-                outputs, weights, _, _ = ensemble_model(images, return_details=True)
-            except Exception as e:
-                print(f"Error in forward pass: {e}")
-                continue
-            
-            # outputs: (Batch, 1) -> Logits
-            # probabilities: استفاده از Sigmoid برای تبدیل به 0 تا 1
-            probs = torch.sigmoid(outputs).cpu().numpy()
-            
-            # تبدیل logits به پیش‌بینی (0 یا 1)
-            pred = (outputs > 0).long().cpu().numpy()
-            
-            all_labels.append(labels.cpu().numpy())
-            all_probs.append(probs)
-            all_preds.append(pred)
+    # دیگه نیاز به اجرای مدل نیست! داده‌ها آماده‌ست
+    import numpy as np
+    from sklearn.metrics import (
+        roc_curve, auc, f1_score, confusion_matrix,
+        classification_report, precision_recall_curve, average_precision_score
+    )
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import json, os
 
-    # تبدیل لیست‌ها به آرایه‌های یک‌پارچه (Flat)
-    all_labels = np.concatenate(all_labels)
-    all_probs = np.concatenate(all_probs)
-    all_preds = np.concatenate(all_preds)
+    y_true = np.asarray(y_true).ravel()
+    y_score = np.asarray(y_score).ravel()
+    y_pred = (y_score > 0.5).astype(int)
 
-    # 2. محاسبه ROC Curve
-    # pos_label=1 برای تشخیص "Real"
-    fpr, tpr, _ = roc_curve(all_labels, all_probs, pos_label=1)
+    # محاسبه ROC
+    fpr, tpr, _ = roc_curve(y_true, y_score, pos_label=1)
     roc_auc = auc(fpr, tpr)
-    
-    # 3. محاسبه Precision-Recall
-    precision, recall, _ = precision_recall_curve(all_labels, all_probs, pos_label=1)
-    pr_auc = average_precision_score(all_labels, all_probs, pos_label=1)
-    
-    # 4. محاسبه متریک‌های دقیق
-    # pos_label=1 برای تشخیص کلاس "Real"
-    f1 = f1_score(all_labels, all_preds, pos_label=1)
-    cm = confusion_matrix(all_labels, all_preds)
-    
-    # متریک‌های دقیق
+
+    # محاسبه PR
+    precision, recall, _ = precision_recall_curve(y_true, y_score, pos_label=1)
+    pr_auc = average_precision_score(y_true, y_score, pos_label=1)
+
+    # متریک‌ها
+    f1 = f1_score(y_true, y_pred, pos_label=1)
+    cm = confusion_matrix(y_true, y_pred)
     tn, fp, fn, tp = cm.ravel()
-    
-    # محاسبه Precision و Recall از CM (اختیاری، برای چاپ)
     precision_val = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall_val = tp / (tp + fn) if (tp + fn) > 0 else 0
     
