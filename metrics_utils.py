@@ -14,7 +14,10 @@ from tqdm import tqdm
 import json
 import torch.distributed as dist
 
-def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
+def plot_roc_and_f1(y_true, y_score, save_dir, model_names, ensemble_model=None, is_main=True):
+    """
+    افزودن پارامتر ensemble_model برای رفع خطای تعداد آرگومان‌ها
+    """
 
     if not is_main:
         return
@@ -89,9 +92,8 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
         plt.grid(True, alpha=0.3)
         
         # نمودار 3: Confusion Matrix (Heatmap)
-        plt.subplot(1, 3, 3)
+        plt_subplot(1, 3, 3)
         # ردیف‌ها: Real (1), Fake (0) - ستون‌ها: Real (1), Fake (0)
-        # برای رسم تمیز، از لیبل‌های استاندارد استفاده می‌کنیم
         cm_display = np.array([[tp, fn], [fp, tn]]) # Row: Actual Real, Fake | Col: Pred Real, Fake
         
         # استفاده از seaborn برای رسم Heatmap بهتر
@@ -105,7 +107,10 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
         
         # تنظیمات کلی نمودار
         model_name_str = " + ".join(model_names)
-        ensemble_type = "Fuzzy" if hasattr(ensemble_model, 'hesitant_fuzzy') else "Majority Voting"
+        
+        # بررسی برای نوع انسامبل با استفاده از آبجکت پاس داده شده
+        ensemble_type = "Fuzzy" if (ensemble_model and hasattr(ensemble_model, 'hesitant_fuzzy')) else "Majority Voting"
+        
         full_title = f"{ensemble_type} Ensemble Performance ({model_name_str})"
         plt.suptitle(full_title, fontsize=16, y=1.02)
         
@@ -121,8 +126,9 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
         # 6. چاپ گزارش متنی کلاس‌بندی
         print("\nClassification Report:")
         target_names = ['Fake', 'Real']
-        # دقت کلی برای هر کلاس
-        report = classification_report(all_labels, all_preds, target_names=target_names, digits=4, zero_division=0)
+        # اصلاح: متغیرهای all_labels و all_preds در این اسکوپ تعریف نشده‌اند. 
+        # باید از y_true و y_pred استفاده کرد.
+        report = classification_report(y_true, y_pred, target_names=target_names, digits=4, zero_division=0)
         print(report)
         
         # ذخیره متریک‌ها در فایل JSON
