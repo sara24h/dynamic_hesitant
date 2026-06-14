@@ -733,12 +733,11 @@ def main():
     
     if is_main:
         plot_roc_and_f1(
-            ensemble_module,
-            test_loader_full, 
-            device, 
-            args.save_dir, 
-            MODEL_NAMES,
-            is_main
+            y_true=y_true,         # از return final_evaluation_unified
+            y_score=y_scores,      # از return final_evaluation_unified  
+            save_dir=args.save_dir, 
+            model_names=MODEL_NAMES,
+            is_main=is_main
         )
 
 if __name__ == "__main__":
