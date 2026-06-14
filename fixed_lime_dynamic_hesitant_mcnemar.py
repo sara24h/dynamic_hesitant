@@ -732,7 +732,14 @@ def main():
     cleanup_distributed()
     
     if is_main:
-        plot_roc_and_f1(y_true, all_scores, save_dir, model_names, ensemble_type)
+        plot_roc_and_f1(
+            y_true=y_true, 
+            y_score=y_scores, 
+            save_dir=args.save_dir, 
+            model_names=MODEL_NAMES, 
+            ensemble_type=ensemble_type_str,
+            is_main=True
+        )
 
 if __name__ == "__main__":
     main()
