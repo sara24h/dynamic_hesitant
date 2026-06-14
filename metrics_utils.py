@@ -14,15 +14,15 @@ from tqdm import tqdm
 import json
 import torch.distributed as dist
 
-def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
+def plot_roc_and_f1(y_true, y_score, save_dir, model_names, ensemble_type="Simple", is_main=True):
     """
     رسم منحنی ROC و محاسبه F1-Score
-    از داده‌های از پیش محاسبه‌شده استفاده می‌کند (نه اجرای مجدد مدل)
+    اصلاح شده: آرگومان ensemble_type اضافه شد تا با فراخوانی اصلی هماهنگ باشد.
     """
     if not is_main:
         return
     
-    # دیگه نیاز به اجرای مدل نیست! داده‌ها آماده‌ست
+    # ایمپورت‌های مورد نیاز
     import numpy as np
     from sklearn.metrics import (
         roc_curve, auc, f1_score, confusion_matrix,
@@ -34,27 +34,38 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
 
     y_true = np.asarray(y_true).ravel()
     y_score = np.asarray(y_score).ravel()
+    
+    # اگر احتمالات خروجی مدل هستند، به لیبل باینری تبدیل می‌کنیم (Threshold = 0.5)
     y_pred = (y_score > 0.5).astype(int)
 
     # محاسبه ROC
     fpr, tpr, _ = roc_curve(y_true, y_score, pos_label=1)
     roc_auc = auc(fpr, tpr)
 
-    # محاسبه PR
+    # محاسبه Precision-Recall
     precision, recall, _ = precision_recall_curve(y_true, y_score, pos_label=1)
     pr_auc = average_precision_score(y_true, y_score, pos_label=1)
 
     # متریک‌ها
     f1 = f1_score(y_true, y_pred, pos_label=1)
     cm = confusion_matrix(y_true, y_pred)
-    tn, fp, fn, tp = cm.ravel()
+    
+    # مدیریت حالت‌های خاص ماتریس درهم‌ریختگی
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        # اگر کلاسی وجود نداشته باشد (مثلاً همه پیش‌بینی‌ها یکسان باشند)
+        tn, fp, fn, tp = 0, 0, 0, 0
+        if cm.shape == (1,):
+            if y_true[0] == 1: tp = len(y_true)
+            else: tn = len(y_true)
+
     precision_val = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall_val = tp / (tp + fn) if (tp + fn) > 0 else 0
 
-    # ... (بقیه کد رسم نمودار همونطور که هست)
-    
+    # چاپ متریک‌ها
     print(f"\n{'='*70}")
-    print(f"METRICS (Pos Label=Real)")
+    print(f"METRICS (Pos Label=Real) - {ensemble_type} Ensemble")
     print(f"{'='*70}")
     print(f"ROC AUC: {roc_auc:.4f}")
     print(f"PR AUC: {pr_auc:.4f}")
@@ -94,6 +105,7 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
     
     # نمودار 3: Confusion Matrix (Heatmap)
     plt.subplot(1, 3, 3)
+    # فرمت ماتریس برای نمایش زیباتر: [[TP, FN], [FP, TN]]
     cm_display = np.array([[tp, fn], [fp, tn]])
     
     ax = plt.gca()
@@ -105,7 +117,7 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
     plt.xlabel('Predicted Label')
     
     # تنظیمات کلی نمودار
-    model_name_str = " + ".join(model_names)
+    model_name_str = " + ".join(model_names) if isinstance(model_names, list) else str(model_names)
     full_title = f"{ensemble_type} Ensemble Performance ({model_name_str})"
     plt.suptitle(full_title, fontsize=16, y=1.02)
     
@@ -126,6 +138,7 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, is_main=True):
     
     # ذخیره متریک‌ها در فایل JSON
     metrics = {
+        'ensemble_type': ensemble_type,
         'roc_auc': float(roc_auc),
         'pr_auc': float(pr_auc),
         'f1_score': float(f1),
