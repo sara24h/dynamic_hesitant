@@ -15,16 +15,7 @@ import json
 import torch.distributed as dist
 
 def plot_roc_and_f1(ensemble_model, test_loader, device, save_dir, model_names, is_main=True):
-    """
-    تابع رسم منحنی ROC و محاسبه F1-Score
-    
-    Args:
-        ensemble_model: مدل انسامبل (فازی یا Majority Voting)
-        test_loader: دیتالودر تست
-        device: دستگاه (cuda/cpu)
-        save_dir: مسیر ذخیره تصاویر
-        model_names: لیست نام مدل‌ها (برای نمایش در عنوان)
-    """
+
     if not is_main:
         return
         
