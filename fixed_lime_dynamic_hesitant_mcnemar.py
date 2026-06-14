@@ -83,15 +83,11 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
-            # پیش‌بینی مدل
-            # داخل تابع final_evaluation_unified
-
-# پیش‌بینی مدل با دریافت جزئیات وزن‌ها
             output, final_weights, _, _ = model(image, return_details=True)
 
-# --- اصلاحیه ---
-# چون مدل خروجی لاجیت می‌دهد، باید فقط یک بار sigmoid زنیم (مشابه plot_roc_and_f1)
-            prob = torch.sigmoid(output.squeeze()).item()
+# سیگموید را حذف کنید چون خروجی مدل احتمالاً بین 0 و 1 است
+# prob = torch.sigmoid(output.squeeze()).item()  <-- خط قدیمی
+            prob = output.squeeze().item() # <-- خط جدید
 # -----------------
 
             pred_int = int(prob > 0.5)
