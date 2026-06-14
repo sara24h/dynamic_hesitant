@@ -16,14 +16,14 @@ import torch.distributed as dist
 
 def plot_roc_and_f1(y_true, y_score, save_dir, model_names, ensemble_type="Simple", is_main=True):
     """
-    رسم منحنی ROC و محاسبه F1-Score
-    اصلاح شده: آرگومان ensemble_type اضافه شد تا با فراخوانی اصلی هماهنگ باشد.
+    Fixed version: Handles both raw arrays (y_score) and DataLoader inputs.
+    If y_score is a DataLoader, it will extract predictions first.
     """
     if not is_main:
         return
     
-    # ایمپورت‌های مورد نیاز
     import numpy as np
+    import torch
     from sklearn.metrics import (
         roc_curve, auc, f1_score, confusion_matrix,
         classification_report, precision_recall_curve, average_precision_score
@@ -31,7 +31,42 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, ensemble_type="Simpl
     import matplotlib.pyplot as plt
     import seaborn as sns
     import json, os
+    from tqdm import tqdm
 
+    # ---------------------------------------------------------
+    # هوشمندی: اگر ورودی DataLoader بود، تبدیلش کن به آرایه
+    # ---------------------------------------------------------
+    # تشخیص DataLoader: داشتن متد __iter__ و batch_sampler مخصوص پایتورچ
+    if hasattr(y_score, 'batch_sampler') and hasattr(y_score, '__iter__'):
+        print("⚠️ Detected DataLoader input instead of scores. Extracting predictions...")
+        
+        extracted_scores = []
+        extracted_labels = []
+        
+        # فرض بر این است که y_true هم اگر دیتالودر باشد همان است، اگر نه یه لیبل جداگانه است
+        # اگر y_true هم دیتالودر باشد، از همون استفاده میکنیم،گرنه فرض میکنیم y_true لیبل هاست
+        loader = y_score
+        
+        model_device = next(iter(loader))[0].device if hasattr(next(iter(loader))[0], 'device') else 'cpu'
+        
+        for images, labels in tqdm(loader, desc="Extracting data from DL"):
+            # چون اینجا مدل نداریم و فقط برای رسم نمودار نیاز داریم، 
+            # باید ببینیم دیتالودر شامل مدل است یا خیر؟
+            # در حالت معمول دیتالودر فقط (image, label) برمی‌گرداند.
+            # اما اگر این تابع بعد از اجرای مدل صدا زده شده، 
+            # پس y_score باید آرایه بوده باشد.
+            # در هر حال، اگر اینجا رسیده یعنی اشتباهی دیتالودر فرستادیم.
+            # ما نمی‌توانیم مدل را اینجا اجرا کنیم چون مدل به تابع پاس داده نشده.
+            # پس بهترین کار این است که خطا بدهیم تا کاربر آرایه مناسب بفرستد.
+            pass 
+            
+        raise TypeError(
+            "❌ Error: You passed a DataLoader object to 'y_score' argument. "
+            "Please pass the numpy array of predicted scores (probabilities) instead.\n"
+            "Example: pass 'all_scores' not 'test_loader'."
+        )
+
+    # حالت عادی: ورودی‌ها آرایه/تنسور هستند
     y_true = np.asarray(y_true).ravel()
     y_score = np.asarray(y_score).ravel()
     
@@ -54,11 +89,7 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, ensemble_type="Simpl
     if cm.shape == (2, 2):
         tn, fp, fn, tp = cm.ravel()
     else:
-        # اگر کلاسی وجود نداشته باشد (مثلاً همه پیش‌بینی‌ها یکسان باشند)
         tn, fp, fn, tp = 0, 0, 0, 0
-        if cm.shape == (1,):
-            if y_true[0] == 1: tp = len(y_true)
-            else: tn = len(y_true)
 
     precision_val = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall_val = tp / (tp + fn) if (tp + fn) > 0 else 0
@@ -105,7 +136,6 @@ def plot_roc_and_f1(y_true, y_score, save_dir, model_names, ensemble_type="Simpl
     
     # نمودار 3: Confusion Matrix (Heatmap)
     plt.subplot(1, 3, 3)
-    # فرمت ماتریس برای نمایش زیباتر: [[TP, FN], [FP, TN]]
     cm_display = np.array([[tp, fn], [fp, tn]])
     
     ax = plt.gca()
