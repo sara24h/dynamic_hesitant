@@ -35,10 +35,8 @@ def set_seed(seed: int = 42):
 
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
-    """
-    ارزیابی نهایی یکپارچه برای اطمینان از یکسان بودن اعداد در کنسول و لاگ.
-    شامل ذخیره داده‌های McNemar و ROC (y_true, y_score, y_pred).
-    """
+
+
     if not is_main: return 0.0, None, None
 
     model.eval()
@@ -140,7 +138,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
     print("="*70)
 
-        print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
+    print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
     print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     print("="*70)
 
