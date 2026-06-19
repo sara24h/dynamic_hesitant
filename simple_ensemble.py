@@ -88,12 +88,11 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         # پیش‌بینی مدل
         output, _, _, _ = model(image, return_details=True)
         prob = torch.sigmoid(output.squeeze()).item()
-        pred_int = int(probs > 0.5)
+        pred_int = int(prob > 0.5) # ✅ درست: prob بدون s
         
         # ذخیره برای ROC
         all_y_true.append(label_int)
-        all_y_score.append(probs)
-        all_y_pred.append(pred_int)
+        all_y_score.append(prob) # ✅ درست: prob بدون s
         
         # محاسبه آمار
         is_correct = (pred_int == label_int)
