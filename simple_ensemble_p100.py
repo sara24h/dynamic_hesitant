@@ -78,12 +78,17 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
 
     for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
         try:
-            image_pil, label = base_dataset[global_idx]
+            image, label = base_dataset[global_idx]
             path, _ = get_sample_info(base_dataset, global_idx)
         except Exception as e:
             continue
 
-        image = eval_transform(image_pil).unsqueeze(0).to(device)
+            # --- اصلاح خطا: تبدیل PIL Image به Tensor ---
+        if not isinstance(image, torch.Tensor):
+                # تبدیل تصویر PIL به تنسور (مقادیر بین 0.0 تا 1.0)
+        image = T.ToTensor()(image)
+            
+        image = image.unsqueeze(0).to(device)
         label_int = int(label)
         
         output, _, _, stacked_logits = model(image, return_details=True)
