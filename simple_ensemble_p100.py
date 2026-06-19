@@ -86,7 +86,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
             # --- اصلاح خطا: تبدیل PIL Image به Tensor ---
         if not isinstance(image, torch.Tensor):
                 # تبدیل تصویر PIL به تنسور (مقادیر بین 0.0 تا 1.0)
-        image = T.ToTensor()(image)
+            image = T.ToTensor()(image)
             
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
