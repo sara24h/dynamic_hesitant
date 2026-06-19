@@ -92,12 +92,13 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         # 4. بقیه کدهایتان که قبلاً درست بود ...
         label_int = int(label)
         
-        output, _, _, stacked_logits = model(image, return_details=True)
-        probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
-        pred_int = int(probs > 0.5)
+                # کد قدیمی را پاک کنید و این را جایگزین کنید:
+        output, _, _, _ = model(image, return_details=True)
+        prob = torch.sigmoid(output.squeeze()).item()
+        pred_int = int(prob > 0.5)
         
         all_y_true.append(label_int)
-        all_y_score.append(probs)
+        all_y_score.append(prob) # حتماً بدون s بنویسید
         all_y_pred.append(pred_int)
         
         is_correct = (pred_int == label_int)
@@ -186,18 +187,19 @@ class SimpleAveragingEnsemble(nn.Module):
         self.normalizations = MultiModelNormalization(means, stds)
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
+        all_logits = []
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            with torch.no_grad():
-                out = self.models[i](x_n)
-                if isinstance(out, (tuple, list)): out = out[0]
-            outputs[:, i] = out
+            out = self.models[i](x_n)
+            if isinstance(out, (tuple, list)): out = out[0]
+            all_logits.append(out)
 
-        final_output = outputs.mean(dim=1)
+        stacked_logits = torch.stack(all_logits, dim=1)
+        final_output = stacked_logits.mean(dim=1)
+        
         if return_details:
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
-            return final_output, weights, None, outputs
+            return final_output, weights, None, stacked_logits
         return final_output, None
 
 
