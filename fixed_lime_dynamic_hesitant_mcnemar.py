@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,7 +35,7 @@ def set_seed(seed: int = 42):
 
 
 def is_dist():
-    """بررسی فعال بودن محیط توزیع‌شده"""
+   
     return dist.is_initialized()
 
 
@@ -195,11 +194,7 @@ def evaluate_single_model(model: nn.Module, loader: DataLoader,
                           mean: Tuple[float, float, float],
                           std: Tuple[float, float, float],
                           is_main: bool) -> float:
-    """
-    [اصلاح] ارزیابی غیرتوزیع‌شده برای مدل‌های منفرد.
-    فقط روی GPU اصلی با loader کامل (بدون DistributedSampler) اجرا می‌شود.
-    این تضمین می‌کند که هیچ نمونه تکراری (padding) در محاسبه دقت وجود ندارد.
-    """
+  
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
@@ -221,47 +216,31 @@ def evaluate_single_model(model: nn.Module, loader: DataLoader,
     return acc
 
 
+# ساده‌ترین و مطمئن‌ترین روش برای validation accuracy:
 @torch.no_grad()
-def evaluate_accuracy_ddp(model: nn.Module, loader: DataLoader,
-                          device: torch.device) -> float:
-    """
-    [اصلاح] ارزیابی DDP با شمارش صحیح total.
-
-    مشکل قبلی: از len(loader.dataset) به عنوان مخرج استفاده می‌شد
-    ولی DistributedSampler نمونه‌ها را pad می‌کند. بنابراین
-    all_reduce(correct) شامل نمونه‌های تکراری بود ولی مخرج
-    فقط تعداد واقعی بود → دقت نادرست.
-
-    اصلاح: local_total را هم شمارش و all_reduce می‌کنیم تا
-    صورت و مخرج سازگار باشند.
-    """
+def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
-    local_correct = 0
-    local_total = 0
+    local_correct = torch.tensor(0.0, device=device)
+    local_total = torch.tensor(0.0, device=device)
+    
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
-        local_correct += pred.eq(labels.long()).sum().item()
+        local_correct += pred.eq(labels.long()).sum()
         local_total += labels.size(0)
 
     if is_dist():
-        correct_t = torch.tensor(local_correct, dtype=torch.long, device=device)
-        total_t = torch.tensor(local_total, dtype=torch.long, device=device)
-        dist.all_reduce(correct_t, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_t, op=dist.ReduceOp.SUM)
-        return 100.0 * correct_t.item() / total_t.item()
-    else:
-        return 100.0 * local_correct / local_total if local_total > 0 else 0.0
+        dist.all_reduce(local_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_total, op=dist.ReduceOp.SUM)
+
+    return 100.0 * local_correct.item() / local_total.item()
 
 
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir,
                              model_names, args, is_main):
-    """
-    ارزیابی نهایی غیرتوزیع‌شده روی مجموعه تست کامل.
-    فقط روی GPU اصلی اجرا می‌شود → دقت کاملاً صحیح.
-    """
+  
     if not is_main:
         return 0.0, None, None
 
