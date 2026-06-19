@@ -85,15 +85,14 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
         
-        # پیش‌بینی مدل
-        output, _, _, stacked_logits = model(image, return_details=True)
- 
-        probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
-        pred_int = int(probs > 0.5)
+        # پیش‌بینی مدل (روش درست اصلاح شده)
+        output, _, _, _ = model(image, return_details=True)
+        prob = torch.sigmoid(output.squeeze()).item() # ✅ بدون s
+        pred_int = int(prob > 0.5) # ✅ اصلاح شد
         
         # ذخیره برای ROC
         all_y_true.append(label_int)
-        all_y_score.append(probs)
+        all_y_score.append(prob) # ✅ اصلاح شد
         all_y_pred.append(pred_int)
         
         # محاسبه آمار
@@ -206,6 +205,7 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
+# ✅ کلاس اصلاح شده برای انسمبل (بدون باگ DDP و با میانگین‌گیری اصولی)
 class SimpleAveragingEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
                  stds: List[Tuple[float]]):
@@ -215,21 +215,25 @@ class SimpleAveragingEnsemble(nn.Module):
         self.normalizations = MultiModelNormalization(means, stds)
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-        
+        all_logits = []
+    
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            with torch.no_grad():
+            with torch.no_grad():          # بهینه‌تر
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-            outputs[:, i] = out
+            all_logits.append(out)         # شکل [B, 1]
 
-        final_output = outputs.mean(dim=1)
-        
+    # torch.stack روی dim=1 → شکل [B, N, 1]
+        stacked_logits = torch.stack(all_logits, dim=1)
+    
+    # میانگین روی بعد مدل → شکل [B, 1]
+        final_output = stacked_logits.mean(dim=1)
+    
         if return_details:
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
-            return final_output, weights, None, outputs
+            return final_output, weights, None, stacked_logits
         return final_output, None
 
 
@@ -294,8 +298,12 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    
+    # ✅ اصلاح شد: جلوگیری از کرش روی سیستم‌های تک کارته
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        
     acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main:
         print(f" {name}: {acc:.2f}%")
