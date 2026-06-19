@@ -12,7 +12,7 @@ import json
 import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+from torchvision import transforms as T
 from metrics_utils import plot_roc_and_f1
 from dataset_utils_p100 import (
     UADFVDataset, CustomGenAIDataset, NewGenAIDataset,
@@ -71,20 +71,22 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     
     print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
     
+    eval_transform = T.Compose([
+        T.Resize(256),
+        T.CenterCrop(256),
+        T.ToTensor(),
+    ])
+
     with torch.no_grad():
         for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
             try:
-                image, label = base_dataset[global_idx]
+                image_pil, label = base_dataset[global_idx]
                 path, _ = get_sample_info(base_dataset, global_idx)
             except Exception as e:
                 continue
 
-            # اگر تصویر از نوع PIL Image است، آن را به تنسور تبدیل می‌کنیم
-            if not isinstance(image, torch.Tensor):
-                from torchvision import transforms as T
-                image = T.ToTensor()(image)
-
-            image = image.unsqueeze(0).to(device)
+            # اصلاحیه مهم: اعمال کامل ترنسفورم (شامل ریزایز و کراپ)
+            image = eval_transform(image_pil).unsqueeze(0).to(device)
             label_int = int(label)
             
             # پیش‌بینی مدل
