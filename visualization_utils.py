@@ -113,8 +113,29 @@ def generate_visualizations(ensemble, test_loader, device, vis_dir, model_names,
         return
 
     # انتخاب ایندکس‌ها
+        # انتخاب ایندکس‌ها
     vis_indices = random.sample(range(total_samples), vis_count)
-    vis_dataset = Subset(full_dataset, vis_indices)
+    
+    # کلاس Wrapper برای اطمینان از تبدیل PIL به Tensor
+    from torchvision import transforms
+    class VisSubset(torch.utils.data.Dataset):
+        def __init__(self, base_dataset, indices):
+            self.base_dataset = base_dataset
+            self.indices = indices
+            self.transform = transforms.ToTensor()
+            
+        def __len__(self):
+            return len(self.indices)
+            
+        def __getitem__(self, i):
+            global_idx = self.indices[i]
+            image, label = self.base_dataset[global_idx]
+            # اگر تصویر از نوع تنسور نبود، حتماً آن را به تنسور تبدیل می‌کنیم
+            if not isinstance(image, torch.Tensor):
+                image = self.transform(image)
+            return image, label
+
+    vis_dataset = VisSubset(full_dataset, vis_indices)
     
     # نکته مهم: num_workers را صفر بگذاریم تا شافل نشوند
     vis_loader = DataLoader(vis_dataset, batch_size=1, shuffle=False, num_workers=0)
