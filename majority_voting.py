@@ -15,7 +15,7 @@ import cv2
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 from metrics_utils import plot_roc_and_f1
-
+from torchvision import transforms as T
 warnings.filterwarnings("ignore")
 
 # =================== بخش ایمپورت دیتاست ===================
@@ -327,6 +327,11 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             except Exception as e:
                 continue
 
+            # --- اصلاح خطا: تبدیل PIL Image به Tensor ---
+            if not isinstance(image, torch.Tensor):
+                # تبدیل تصویر PIL به تنسور (مقادیر بین 0.0 تا 1.0)
+                image = T.ToTensor()(image)
+            
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
