@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -404,7 +403,10 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
  
 # ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
-
+    """
+    ساخت فایل txt دقیقاً بر اساس لیست‌های y_true و y_pred که از تست کنسول آمده‌اند.
+    این تابع تضمین می‌کند که اعداد با کنسول یکی باشند.
+    """
     total = len(y_true)
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
@@ -663,3 +665,4 @@ def main():
             )
  
 if __name__ == "__main__":
+    main()
