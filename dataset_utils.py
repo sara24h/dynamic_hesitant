@@ -400,7 +400,7 @@ if __name__ == '__main__':
         train_loader, val_loader, test_loader = create_dataloaders(
             base_dir=path_to_dataset,
             batch_size=32,
-            num_workers=0, # در ویندوز بهتر است 0 باشد، در لینوکس می‌توانید 2 یا 4 بگذارید
+            num_workers=4, # در ویندوز بهتر است 0 باشد، در لینوکس می‌توانید 2 یا 4 بگذارید
             dataset_type='real_and_fake_face',  # <--- نام جدید دیتاست
             is_distributed=False,
             seed=42
