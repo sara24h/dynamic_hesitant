@@ -258,19 +258,12 @@ def evaluate_ensemble_final(model, loader, device, name, model_names):
     return acc, vote_dist_np.tolist(), local_stats.cpu().tolist()
 
 # ================== UNIFIED FINAL EVALUATION ==================
+# ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args):
     model.eval()
     
-    base_dataset = test_loader_full.dataset
-    if hasattr(base_dataset, 'dataset'):
-        base_dataset = base_dataset.dataset
-    
-    if hasattr(test_loader_full, 'sampler') and hasattr(test_loader_full.sampler, 'indices'):
-        test_indices = test_loader_full.sampler.indices
-    elif hasattr(test_loader_full.dataset, 'indices'):
-        test_indices = test_loader_full.dataset.indices
-    else:
-        test_indices = list(range(len(base_dataset)))
+    # استفاده مستقیم از subset_dataset که دارای ترنسفورم‌های اعمال شده است
+    subset_dataset = test_loader_full.dataset 
 
     lines = []
     lines.append("="*100)
@@ -283,24 +276,34 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     TP, TN, FP, FN = 0, 0, 0, 0
     
     all_y_true = []
-    all_y_score = []
-    all_y_pred = []  
+    all_y_score = [] # برای ROC از Soft Probability استفاده می‌کنیم
+    all_y_pred = []  # برای Accuracy از Hard Voting استفاده می‌کنیم
     
-    print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
+    print(f"\nRunning Unified Final Evaluation on {len(subset_dataset)} samples...")
     
     with torch.no_grad():
-        for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
+        for i in tqdm(range(len(subset_dataset)), desc="Final Eval"):
             try:
-                image, label = base_dataset[global_idx]
-                path, _ = get_sample_info(base_dataset, global_idx)
+                # 1. دریافت تصویر ترنسفورم شده (تنسور) و لیبل از subset
+                image, label = subset_dataset[i]
+                
+                # 2. یافتن مسیر فایل از طریق ایندکس اصلی دیتاست بیس
+                original_idx = subset_dataset.indices[i]
+                path, _ = get_sample_info(subset_dataset, original_idx)
             except Exception as e:
                 continue
 
+            # حالا image یک تنسور است و دیگر ارور نمی‌دهد
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
+            # خروجی‌ها: final_decision, weights, avg_probs, stacked_logits
             decision, _, avg_probs, stacked_logits = model(image, return_details=True)
+            
+            # پیش‌بینی نهایی بر اساس Hard Voting
             pred_int = int(decision.squeeze().item())
+            
+            # امتیاز برای ROC (میانگین احتمالات)
             score_for_roc = avg_probs.squeeze().item()
             
             all_y_true.append(label_int)
