@@ -83,12 +83,13 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         except Exception as e:
             continue
 
-            # --- اصلاح خطا: تبدیل PIL Image به Tensor ---
+        # 3. اینجا دقیقاً جایگزین شود (دقت کنید تورفتگی هایش درست باشد)
         if not isinstance(image, torch.Tensor):
-                # تبدیل تصویر PIL به تنسور (مقادیر بین 0.0 تا 1.0)
-            image = T.ToTensor()(image)
+            image = eval_transform(image) 
             
         image = image.unsqueeze(0).to(device)
+        
+        # 4. بقیه کدهایتان که قبلاً درست بود ...
         label_int = int(label)
         
         output, _, _, stacked_logits = model(image, return_details=True)
