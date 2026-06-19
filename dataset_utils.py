@@ -220,28 +220,29 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
 
 
 def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
-   
+    
     # دیکشنری دیتاست‌ها: نام دیتاست -> لیست نام پوشه‌ها [fake_folder_name, real_folder_name]
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
         'deepflux': ['Fake', 'Real'],
         'real_fake_dataset': ['face_fake', 'face_real'], 
-        # اضافه شده: دیتاست جدید با پوشه‌های training_fake و training_real
         'deepfake_lab': ['training_fake', 'training_real'], 
     }
 
     print(f"\n[Dataset Loading] Processing: {dataset_type}")
 
+    # تغییر مهم: اینجا مقدار ترنسفورم اولیه را None می‌گذاریم تا تصویر به تنسور تبدیل نشود
+    temp_transform = None 
+
     if dataset_type == 'custom_genai':
         fake_folders = ['DALL-E', 'DeepFaceLab', 'Midjourney', 'StyleGAN']
         real_folder = 'Real'
-        temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = CustomGenAIDataset(
             base_dir, 
             fake_classes=fake_folders, 
             real_class=real_folder, 
-            transform=temp_transform
+            transform=temp_transform # None
         )
         print("[Dataset Loading] Custom GenAI (Old) Dataset loaded.")
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
@@ -249,8 +250,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         )
         
     elif dataset_type == 'custom_genai_v2':
-        temp_transform = transforms.Compose([transforms.ToTensor()])
-        full_dataset = NewGenAIDataset(base_dir, transform=temp_transform)
+        full_dataset = NewGenAIDataset(base_dir, transform=temp_transform) # None
         print("[Dataset Loading] NewGwnAI Dataset (custom_genai_v2) loaded.")
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
             full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
@@ -259,31 +259,20 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
     elif dataset_type == 'uadfV':
         if not os.path.exists(base_dir):
             raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
-        temp_transform = transforms.Compose([transforms.ToTensor()])
-        full_dataset = UADFVDataset(base_dir, transform=temp_transform)
+        full_dataset = UADFVDataset(base_dir, transform=temp_transform) # None
         train_indices, val_indices, test_indices = create_video_level_uadfV_split(full_dataset, seed=seed)
         
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
-        
-        # بررسی وجود فولدرها
-        # چک کردن مستقیم در base_dir
         dataset_dir = base_dir
         if not all(os.path.exists(os.path.join(dataset_dir, f)) for f in folders):
-            # اگر پیدا نشد، یک لایه پایین‌تر را هم چک می‌کنیم (ساختار رایج دیتاست‌ها)
-            # معمولا پوشه اصلی نام دیتاست است
             possible_sub_dir = os.path.join(base_dir, dataset_type)
             if all(os.path.exists(os.path.join(possible_sub_dir, f)) for f in folders):
                 dataset_dir = possible_sub_dir
             else:
-                # تلاش دیگر: نام پوشه بر اساس کلید ممکن است کمی متفاوت باشد (مثلا real_and_fake_face)
-                # اینجا فقط یک چک ساده می‌کنیم
-                raise FileNotFoundError(f"Could not find dataset folders {folders} in {base_dir} or {possible_sub_dir}")
+                raise FileNotFoundError(f"Could not find dataset folders {folders} in {base_dir}")
         
-        temp_transform = transforms.Compose([transforms.ToTensor()])
-        full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
-        
-        # استفاده از نسبت 70-15-15 برای این دیتاست‌ها
+        full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform) # None
         train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
