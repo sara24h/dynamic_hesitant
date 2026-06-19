@@ -13,7 +13,6 @@ import random
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# فرض بر این است که این فایل‌ها در مسیر شما موجود هستند
 from metrics_utils import plot_roc_and_f1
 from dataset_utils import (
     UADFVDataset, CustomGenAIDataset, NewGenAIDataset,
@@ -79,6 +78,11 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
                 path, _ = get_sample_info(base_dataset, global_idx)
             except Exception as e:
                 continue
+
+            # اگر تصویر از نوع PIL Image است، آن را به تنسور تبدیل می‌کنیم
+            if not isinstance(image, torch.Tensor):
+                from torchvision import transforms as T
+                image = T.ToTensor()(image)
 
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
