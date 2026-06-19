@@ -9,7 +9,7 @@ import warnings
 import argparse
 import json
 import random
-from torchvision import transforms as T  # برای اعمال ترنسفورم دستی اضافه شد
+from torchvision import transforms as T  
 
 from metrics_utils import plot_roc_and_f1
 from dataset_utils_p100 import (
@@ -33,33 +33,21 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 def get_device():
-    """تنها دستگاه موجود (کارت گرافیک یا CPU) را برمی‌گرداند"""
+
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-
 # ================== UNIFIED FINAL EVALUATION & REPORT ==================
+@torch.no_grad()
 @torch.no_grad()
 def final_evaluation_and_report(model, loader, device, save_dir, model_name, args):
     model.eval()
     
-    # استخراج دیتاست پایه و اندیس‌ها
-    base_dataset = loader.dataset
-    if hasattr(base_dataset, 'dataset'):
-        base_dataset = base_dataset.dataset
-        
-    if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'indices'):
-        test_indices = loader.sampler.indices
-    elif hasattr(loader.dataset, 'indices'):
-        test_indices = loader.dataset.indices
-    else:
-        test_indices = list(range(len(base_dataset)))
-
     all_y_true, all_y_score, all_y_pred = [], [], []
     lines = []
     lines.append("="*100)
     lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
     lines.append("="*100)
-    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
+    header = f"{'Batch_ID':<10} {'True_Labels':<20} {'Predicted_Labels':<20} {'Correct_Count':<10}"
     lines.append(header)
     lines.append("-"*100)
 
@@ -67,52 +55,40 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     correct_count = 0
     total_samples = 0
 
-    print(f"\nRunning Final Evaluation on {len(test_indices)} samples...")
-    
-    # اصلاحیه مهم: اعمال ترنسفورم به صورت دستی چون دیتاست بیس ترنسفورم ندارد
-    eval_transform = T.Compose([
-        T.Resize(256),
-        T.CenterCrop(256),
-        T.ToTensor(),
-    ])
+    print(f"\nRunning Final Evaluation using DataLoader batches...")
 
-    for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
-        try:
-            image, label = base_dataset[global_idx]
-            path, _ = get_sample_info(base_dataset, global_idx)
-        except Exception as e:
-            continue
-
-        # 3. اینجا دقیقاً جایگزین شود (دقت کنید تورفتگی هایش درست باشد)
-        if not isinstance(image, torch.Tensor):
-            image = eval_transform(image) 
+ 
+    for batch_idx, (images, labels) in enumerate(tqdm(loader, desc="Final Eval")):
+        images = images.to(device)
+        
+        output, _, _, _ = model(images, return_details=True)
+     
+        probs = torch.sigmoid(output.squeeze()).cpu().numpy()
+        preds = (probs > 0.5).astype(int)
+        
+        labels_np = labels.cpu().numpy().astype(int)
+        
+        for j in range(len(labels_np)):
+            label_int = labels_np[j]
+            prob = probs[j]
+            pred_int = preds[j]
             
-        image = image.unsqueeze(0).to(device)
-        
-        # 4. بقیه کدهایتان که قبلاً درست بود ...
-        label_int = int(label)
-        
-                # کد قدیمی را پاک کنید و این را جایگزین کنید:
-        output, _, _, _ = model(image, return_details=True)
-        prob = torch.sigmoid(output.squeeze()).item()
-        pred_int = int(prob > 0.5)
-        
-        all_y_true.append(label_int)
-        all_y_score.append(prob) # حتماً بدون s بنویسید
-        all_y_pred.append(pred_int)
-        
-        is_correct = (pred_int == label_int)
-        if is_correct: correct_count += 1
-        
-        if label_int == 1:
-            if pred_int == 1: TP += 1
-            else: FN += 1
-        else:
-            if pred_int == 1: FP += 1
-            else: TN += 1
+            all_y_true.append(label_int)
+            all_y_score.append(prob)
+            all_y_pred.append(pred_int)
             
-        total_samples += 1
-        
+            is_correct = (pred_int == label_int)
+            if is_correct: correct_count += 1
+            
+            if label_int == 1:
+                if pred_int == 1: TP += 1
+                else: FN += 1
+            else:
+                if pred_int == 1: FP += 1
+                else: TN += 1
+                
+            total_samples += 1
+            
         filename = os.path.basename(path)
         if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
         line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
