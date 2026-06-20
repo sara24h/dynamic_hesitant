@@ -16,7 +16,7 @@ from metrics_utils import plot_roc_and_f1
  
 warnings.filterwarnings("ignore")
  
-from dataset_utils import (
+from dataset_utils_p100 import (
     UADFVDataset,
     CustomGenAIDataset,
     create_dataloaders,
@@ -25,7 +25,7 @@ from dataset_utils import (
 )
  
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
- 
+
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -290,7 +290,15 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
  
-        ensemble_model.train()
+        # --- اصلاح باگ BatchNorm ---
+        # متا-لرنر به حالت train می‌رود (اگرچه Linear فرقی نمی‌کند، برای اصولی بودن)
+        meta_learner.train()
+        # مدل‌های پایه (frozen) حتماً در حالت eval می‌مانند تا آمار BatchNorm آپدیت نشود
+        base_models = ensemble_model.module.models if hasattr(ensemble_model, 'module') else ensemble_model.models
+        for model in base_models:
+            model.eval()
+        # ---------------------------
+            
         train_loss = 0.0
         train_correct = 0
         train_total = 0
