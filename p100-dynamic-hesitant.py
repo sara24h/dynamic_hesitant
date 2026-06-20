@@ -343,10 +343,23 @@ class FuzzyHesitantEnsemble(nn.Module):
         batch_size = final_weights.size(0)
         sorted_weights, sorted_indices = torch.sort(final_weights, dim=1, descending=True)
         cum_weights = torch.cumsum(sorted_weights, dim=1)
-        mask = (cum_weights <= self.cum_weight_threshold).float()
-        mask[:, 0] = 1.0
+        
+        # منطق جدید:
+        # مدل اول همیشه فعال است (mask[:, 0] = 1.0)
+        # برای مدل‌های بعدی، شرط می‌گذاریم: تا زمانی که مقدار قبلیِ تجمعی کمتر از حد آستانه بود، 
+        # مدل جدید را فعال کن (این یعنی مدلِ عبور دهنده هم فعال می‌ماند).
+        
+        # مقدار cum_weights را یک شیفت به راست می‌دهیم تا ببینیم 
+        # آیا "قبل از اضافه کردن این مدل" به آستانه رسیده بودیم یا نه
+        prev_cum_weights = torch.cat([torch.zeros(batch_size, 1, device=final_weights.device), 
+                                      cum_weights[:, :-1]], dim=1)
+        
+        mask = (prev_cum_weights < self.cum_weight_threshold).float()
+        
+        # تداخل با تردید (Hesitancy): اگر مدل شک داشت، همه را فعال نگه دار
         high_hesitancy_mask = (avg_hesitancy > self.hesitancy_threshold).unsqueeze(1)
         mask = torch.where(high_hesitancy_mask, torch.ones_like(mask), mask)
+        
         final_mask = torch.zeros_like(final_weights)
         final_mask.scatter_(1, sorted_indices, mask)
         return final_mask
