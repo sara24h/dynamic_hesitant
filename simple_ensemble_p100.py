@@ -38,16 +38,16 @@ def get_device():
 
 # ================== UNIFIED FINAL EVALUATION & REPORT ==================
 @torch.no_grad()
-@torch.no_grad()
+
 def final_evaluation_and_report(model, loader, device, save_dir, model_name, args):
     model.eval()
     
     all_y_true, all_y_score, all_y_pred = [], [], []
     lines = []
     lines.append("="*100)
-    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+    lines.append("BATCH-BY-BATCH PREDICTIONS (Ensemble Evaluation):")
     lines.append("="*100)
-    header = f"{'Batch_ID':<10} {'True_Labels':<20} {'Predicted_Labels':<20} {'Correct_Count':<10}"
+    header = f"{'Batch_ID':<10} {'True_Labels':<30} {'Predicted_Labels':<30} {'Batch_Acc':<10}"
     lines.append(header)
     lines.append("-"*100)
 
@@ -56,20 +56,33 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     total_samples = 0
 
     print(f"\nRunning Final Evaluation using DataLoader batches...")
-
- 
+    
+    # حرکت مستقیم روی بچ‌های دیتالودر (دقیقاً مثل مدل‌های تکی)
     for batch_idx, (images, labels) in enumerate(tqdm(loader, desc="Final Eval")):
         images = images.to(device)
+        # نرمالایز در داخل کلاس SimpleAveragingEnsemble انجام می‌شود
         
         output, _, _, _ = model(images, return_details=True)
-     
+        
+        # اعمال Sigmoid روی میانگین لاجیت‌ها
         probs = torch.sigmoid(output.squeeze()).cpu().numpy()
-        preds = (probs > 0.5).astype(int)
         
-        labels_np = labels.cpu().numpy().astype(int)
+        # اگر بچ سایز 1 باشد، probs اسکالر می‌شود، پس لیست می‌کنیم
+        if probs.ndim == 0:
+            probs = [probs.item()]
+        else:
+            probs = probs.tolist()
+            
+        preds = [1 if p > 0.5 else 0 for p in probs]
+        labels_list = labels.cpu().numpy().tolist()
         
-        for j in range(len(labels_np)):
-            label_int = labels_np[j]
+        # تبدیل به اینت در صورتی که لیست تک‌عددی نبود
+        if not isinstance(labels_list, list):
+            labels_list = [int(labels_list)]
+        labels_list = [int(l) for l in labels_list]
+
+        for j in range(len(labels_list)):
+            label_int = labels_list[j]
             prob = probs[j]
             pred_int = preds[j]
             
@@ -89,9 +102,10 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
                 
             total_samples += 1
             
-        filename = os.path.basename(path)
-        if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
-        line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
+        # ثبت اطلاعات بچ در لاگ
+        batch_correct = sum(p == l for p, l in zip(preds, labels_list))
+        batch_acc = batch_correct / len(labels_list) * 100 if len(labels_list) > 0 else 0
+        line = f"{batch_idx+1:<10} {str(labels_list):<30} {str(preds):<30} {batch_acc:.1f}%"
         lines.append(line)
 
     total = TP + TN + FP + FN
