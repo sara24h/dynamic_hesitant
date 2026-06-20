@@ -160,16 +160,17 @@ def evaluate_ensemble_final(model, loader, device, name, model_names):
     all_y_score = []
     all_y_pred = []
     
-    last_weights = None
+    # اصلاح نکته 2: وزن‌ها یک پارامتر Global هستند و به ورودی وابسته نیستند.
+    # بنابراین فقط یک‌بار قبل از حلقه محاسبه می‌شوند (جلوگیری از گمراهی و سربار محاسباتی)
+    learned_weights = F.softmax(model.weights, dim=0).detach().cpu()
 
     print(f"\nEvaluating {name} set (Weighted Average)...")
         
     for images, labels in tqdm(loader, desc=f"Evaluating {name}"):
         images, labels = images.to(device), labels.to(device)
-        outputs, weights, _, _ = model(images, return_details=True)
         
-        if last_weights is None:
-            last_weights = weights.detach().cpu()
+        # چون وزن‌ها را از قبل داریم، return_details=False کافی است
+        outputs, _ = model(images, return_details=False)
             
         probs = torch.sigmoid(outputs.squeeze(1))
         pred_int = (probs > 0.5).long()
@@ -182,7 +183,7 @@ def evaluate_ensemble_final(model, loader, device, name, model_names):
         total_samples += labels.size(0)
 
     acc = 100. * total_correct / total_samples if total_samples > 0 else 0.0
-    final_weights = last_weights.numpy() if last_weights is not None else np.zeros(len(model_names))
+    final_weights = learned_weights.numpy()
 
     print(f"\n{'='*70}")
     print(f"{name.upper()} SET RESULTS (Weighted Average)")
@@ -200,7 +201,6 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
                         device, save_dir, model_names):
     os.makedirs(save_dir, exist_ok=True)
     
-    # دسترسی مستقیم به وزن‌ها بدون دغدغه DDP (module)
     weights_param = ensemble_model.weights
         
     optimizer = torch.optim.AdamW([weights_param], lr=lr, weight_decay=1e-4)
@@ -215,9 +215,10 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
     print("="*70)
 
     for epoch in range(num_epochs):
-        # حذف sampler.set_epoch مربوط به DDP
+        # اصلاح باگ BatchNorm: خط ensemble_model.train() کاملاً حذف شد.
+        # چون فقط یک nn.Parameter خام trainable داریم، نیازی به تنظیم مد نداریم
+        # و مدل‌های فریز شده در حالت eval() می‌مانند تا BatchNorm آن‌ها درست کار کند.
         
-        ensemble_model.train()
         train_loss = 0.0
         train_correct = 0
         train_total = 0
@@ -354,7 +355,6 @@ def main():
 
     set_seed(args.seed)
     
-    # تنظیم دستگاه به صورت مستقیم روی یک GPU
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
@@ -381,8 +381,6 @@ def main():
         freeze_models=True
     ).to(device)
 
-    # غیرفعال کردن DDP و ارسال به یک GPU
-    # is_distributed=False به دیتالودر پاس داده می‌شود
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=False, seed=args.seed, is_main=True)
@@ -407,11 +405,9 @@ def main():
     ckpt_path = os.path.join(args.save_dir, 'best_weighted_ensemble.pt')
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        # دسترسی مستقیم چون DDP حذف شده است
         ensemble.weights.data.copy_(ckpt['weights'])
         print("Best model weights loaded.\n")
 
-    # دریافت خروجی‌ها برای JSON و Log
     ensemble_test_acc, ensemble_weights, predictions_data = evaluate_ensemble_final(
         ensemble, test_loader, device, "Test", MODEL_NAMES)
 
@@ -423,14 +419,11 @@ def main():
     print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
     print("="*70)
 
-    # استخراج لیست‌ها
     y_true, y_score, y_pred = predictions_data
     
-    # 1. ذخیره JSON
     json_path = os.path.join(args.save_dir, 'test_predictions.json')
     save_predictions_json(y_true, y_score, y_pred, json_path, args.seed, args.dataset)
 
-    # 2. ذخیره فایل txt دقیقاً مطابق با کنسول
     log_path = os.path.join(args.save_dir, 'prediction_log.txt')
     save_accuracy_log_from_results(y_true, y_pred, log_path, "Weighted Ensemble")
 
