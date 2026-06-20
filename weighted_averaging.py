@@ -65,24 +65,23 @@ class WeightedAverageEnsemble(nn.Module):
                 for p in model.parameters():
                     p.requires_grad = False
 
-    def forward(self, x: torch.Tensor, return_details: bool = False):
+    # ✅ درست
+    def forward(self, x, return_details=False):
         norm_weights = F.softmax(self.weights, dim=0)
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-        
+    
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            with torch.no_grad():
-                out = self.models[i](x_n)
-                if isinstance(out, (tuple, list)):
-                    out = out[0]
-            outputs[:, i] = out
+            out = self.models[i](x_n)
+            if isinstance(out, (tuple, list)):
+                out = out[0]
+            outputs[:, i] = out.view(x.size(0), 1)
 
         final_output = (outputs * norm_weights.view(1, -1, 1)).sum(dim=1)
-        
+
         if return_details:
             return final_output, norm_weights, None, outputs
         return final_output, norm_weights
-
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
@@ -144,13 +143,14 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
 
 @torch.no_grad()
+
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
     total = 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
-        outputs, _ = model(images)
+        outputs, _ = model(images)          # ← از model استفاده کن، نه ensemble_model
         pred = (outputs.squeeze(1) > 0).long()
         total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
@@ -445,7 +445,7 @@ def main():
     ).to(device)
 
     if world_size > 1:
-        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
+        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank,find_unused_parameters=True )
 
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
@@ -470,17 +470,23 @@ def main():
         args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
     ckpt_path = os.path.join(args.save_dir, 'best_weighted_ensemble.pt')
-    if is_main and os.path.exists(ckpt_path):
+    if os.path.exists(ckpt_path):
+    # barrier تا مطمئن شویم فایل نوشته شده
+        if dist.is_initialized():
+            dist.barrier()
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        if hasattr(ensemble, 'module'): ensemble.module.weights.data.copy_(ckpt['weights'])
-        else: ensemble.weights.data.copy_(ckpt['weights'])
-        print("Best model weights loaded.\n")
+        if hasattr(ensemble, 'module'):
+            ensemble.module.weights.data.copy_(ckpt['weights'])
+        else:
+            ensemble.weights.data.copy_(ckpt['weights'])
+        if is_main:
+            print("Best model weights loaded.\n")
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
     # دریافت خروجی‌ها برای JSON و Log
     ensemble_test_acc, ensemble_weights, predictions_data = evaluate_ensemble_final_ddp(
-        ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
+        ensemble, test_loader, device, "Test", MODEL_NAMES, is_main)
 
     if is_main:
         print("\n" + "="*70)
@@ -531,7 +537,7 @@ def main():
             args.num_grad_cam_samples, args.num_lime_samples,
             args.dataset, is_main)
 
-    cleanup_distributed()
+   
     
     if is_main:
         plot_roc_and_f1(
@@ -542,6 +548,7 @@ def main():
             MODEL_NAMES,
             is_main
         )
+    cleanup_distributed()
 
 if __name__ == "__main__":
     main()
