@@ -332,26 +332,12 @@ class FuzzyHesitantEnsemble(nn.Module):
             input_dim=128, num_models=self.num_models, num_memberships=num_memberships)
         self.cum_weight_threshold = cum_weight_threshold
         self.hesitancy_threshold = hesitancy_threshold
-        
-        # ذخیره وضعیت فریز بودن مدل‌ها
-        self.freeze_models = freeze_models
 
-        if self.freeze_models:
+        if freeze_models:
             for model in self.models:
                 model.eval()
                 for p in model.parameters():
                     p.requires_grad = False
-
-    def train(self, mode: bool = True):
-        """
-        اورراید کردن متد train برای جلوگیری از قرار گرفتن مدل‌های فریز شده در حالت train.
-        این کار از آپدیت شدن BatchNorm مدل‌های پایه جلوگیری می‌کند.
-        """
-        super().train(mode)
-        if self.freeze_models:
-            for model in self.models:
-                model.eval() # نگه داشتن مدل‌های فریز شده در حالت ارزیابی
-        return self
 
     def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
         batch_size = final_weights.size(0)
@@ -367,11 +353,8 @@ class FuzzyHesitantEnsemble(nn.Module):
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
-        
-        # محاسبه واریانس به صورت unbiased=False (دقیقا مطابق فرمول مقاله)
-        hesitancy = all_memberships.var(dim=2, unbiased=False)
+        hesitancy = all_memberships.var(dim=2)
         avg_hesitancy = hesitancy.mean(dim=1)
-        
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
         final_weights = final_weights * mask
         final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
@@ -507,7 +490,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
             
-            per_model_hesitancy = memberships.var(dim=2,unbiased=False)
+            per_model_hesitancy = memberships.var(dim=2)
             sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
             
             active_mask = (weights > 1e-4).float()
