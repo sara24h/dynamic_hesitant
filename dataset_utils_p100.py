@@ -368,22 +368,30 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         sampler_test = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
 
-        # نکته: برای جلوگیری از خطا در برخی سیستم‌عامل‌ها (مثل ویندوز) هنگام استفاده از چندین worker،
-        # num_workers را می‌توانید 0 بگذارید. در لینوکس می‌توانید افزایش دهید.
-        # اینجا همان مقدار ورودی تابع استفاده می‌شود.
-        
+        # محاسبه تعداد نمونه‌های باقی‌مانده در آخرین batch
+        remainder = len(train_dataset) % batch_size
+
+# فقط اگر آخرین batch دقیقا 1 نمونه داشت، drop_last را True کن تا BatchNorm کرش نکند
+# در غیر این صورت (مثلا اگر 5 نمونه باقی مانده)، نیازی به حذف نیست و BatchNorm با 5 نمونه مشکلی ندارد
+        train_drop_last = (remainder == 1)
+
         train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                                 shuffle=(train_sampler is None), sampler=train_sampler,
-                                 num_workers=num_workers, pin_memory=True, drop_last=False,
-                                 worker_init_fn=worker_init_fn)
+                         shuffle=(train_sampler is None), sampler=train_sampler,
+                         num_workers=num_workers, pin_memory=True,
+                         drop_last=train_drop_last,  # ← استفاده از شرط هوشمند
+                         worker_init_fn=worker_init_fn)
+
         val_loader = DataLoader(val_dataset, batch_size=batch_size,
-                               shuffle=False, sampler=val_sampler,
-                               num_workers=num_workers, pin_memory=True, drop_last=False,
-                               worker_init_fn=worker_init_fn)
+                       shuffle=False, sampler=val_sampler,
+                       num_workers=num_workers, pin_memory=True,
+                       drop_last=False,  # val همیشه False
+                       worker_init_fn=worker_init_fn)
+
         test_loader = DataLoader(test_dataset, batch_size=batch_size,
-                                shuffle=False, sampler=sampler_test,
-                                num_workers=num_workers, pin_memory=True, drop_last=False,
-                                worker_init_fn=worker_init_fn)
+                        shuffle=False, sampler=sampler_test,
+                        num_workers=num_workers, pin_memory=True,
+                        drop_last=False, # test همیشه False
+                        worker_init_fn=worker_init_fn)
 
     if is_main:
         print(f"DataLoaders ready! Batch size: {batch_size}")
