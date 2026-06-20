@@ -177,23 +177,24 @@ class SimpleAveragingEnsemble(nn.Module):
         self.normalizations = MultiModelNormalization(means, stds)
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        all_logits = []
+        # ✅✅✅ تغییر اصلی: ساخت خروجی به همان شکل کد دوم
+        outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
+        
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            
-            # ✅✅✅ فقط این دو خط را اضافه کنید تا مشکل حافظه و BatchNorm حل شود ✅✅✅
             with torch.no_grad():
                 out = self.models[i](x_n)
-                
-            if isinstance(out, (tuple, list)): out = out[0]
-            all_logits.append(out)
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+            # ✅✅✅ قرار دادن خروجی در ماتریس (دقیقاً مشابه کد دوم شما)
+            outputs[:, i] = out
 
-        stacked_logits = torch.stack(all_logits, dim=1)
-        final_output = stacked_logits.mean(dim=1)
+        # ✅✅✅ میانگین گیری روی محور مدل‌ها
+        final_output = outputs.mean(dim=1)
         
         if return_details:
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
-            return final_output, weights, None, stacked_logits
+            return final_output, weights, None, outputs
         return final_output, None
 
 # ================== MODEL LOADING ==================
