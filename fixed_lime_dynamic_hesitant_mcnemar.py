@@ -218,23 +218,29 @@ def evaluate_single_model(model: nn.Module, loader: DataLoader,
 
 # ساده‌ترین و مطمئن‌ترین روش برای validation accuracy:
 @torch.no_grad()
-def evaluate_accuracy_ddp(model, loader, device):
+def evaluate_accuracy_ddp(model, loader, device, is_main=False):
+    # ارزیابی فقط روی GPU اصلی انجام شود تا از مشکل تکرار عکس‌ها (Padding) در DDP جلوگیری شود
+    if not is_main:
+        return 0.0 
+        
     model.eval()
-    local_correct = torch.tensor(0.0, device=device)
-    local_total = torch.tensor(0.0, device=device)
+    local_correct = 0
+    local_total = 0
     
-    for images, labels in loader:
+    # ساخت یک لودر موقت روی کل دیتاست برای GPU اصلی (بدون توزیع و بدون تکرار)
+    from torch.utils.data import SequentialSampler
+    temp_loader = DataLoader(loader.dataset, batch_size=loader.batch_size, 
+                             sampler=SequentialSampler(range(len(loader.dataset))),
+                             num_workers=loader.num_workers, pin_memory=True)
+
+    for images, labels in temp_loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
-        local_correct += pred.eq(labels.long()).sum()
+        local_correct += pred.eq(labels.long()).sum().item()
         local_total += labels.size(0)
 
-    if is_dist():
-        dist.all_reduce(local_correct, op=dist.ReduceOp.SUM)
-        dist.all_reduce(local_total, op=dist.ReduceOp.SUM)
-
-    return 100.0 * local_correct.item() / local_total.item()
+    return 100.0 * local_correct / local_total if local_total > 0 else 0.0
 
 
 # ================== UNIFIED FINAL EVALUATION ==================
