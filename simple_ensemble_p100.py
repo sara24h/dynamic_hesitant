@@ -62,96 +62,86 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         for yt, yp in zip(labels_int.tolist(), preds.tolist()):
             if yt == 1:
                 if yp == 1: TP += 1
-                else: FN += 1
+                else:       FN += 1
             else:
                 if yp == 1: FP += 1
-                else: TN += 1
-    # بقیه کد محاسبه metrics و ذخیره همانند قبل ...
-            
-        total_samples += 1
-        
-        # آماده‌سازی خط لاگ
-        filename = os.path.basename(path)
-        if len(filename) >55: filename = filename[:25] + "..." + filename[-27:]
-        line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
-        lines.append(line)
+                else:       TN += 1
 
-    # محاسبه معیارهای نهایی
     total = TP + TN + FP + FN
-    acc = (TP + TN) / total if total > 0 else 0
-    prec = TP / (TP + FP) if (TP + FP) > 0 else 0
-    rec = TP / (TP + FN) if (TP + FN) > 0 else 0
-    spec = TN / (TN + FP) if (TN + FP) > 0 else 0
-
+    correct_count = TP + TN
+    acc   = correct_count / total if total > 0 else 0
+    prec  = TP / (TP + FP) if (TP + FP) > 0 else 0
+    rec   = TP / (TP + FN) if (TP + FN) > 0 else 0
+    spec  = TN / (TN + FP) if (TN + FP) > 0 else 0
 
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
-    print(f"Precision: {prec:.4f}")
-    print(f"Recall: {rec:.4f}")
+    print(f"Accuracy:    {acc*100:.2f}%")
+    print(f"Precision:   {prec:.4f}")
+    print(f"Recall:      {rec:.4f}")
     print(f"Specificity: {spec:.4f}")
     print(f"\nConfusion Matrix:")
     print(f"                 Predicted Real  Predicted Fake")
     print(f"    Actual Real      {TP:<15} {FN:<15}")
     print(f"    Actual Fake      {FP:<15} {TN:<15}")
-    print(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
-    print(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
+    print(f"\nCorrect:   {correct_count} ({acc*100:.2f}%)")
+    print(f"Incorrect: {total - correct_count} ({(1-acc)*100:.2f}%)")
     print("="*70)
 
-    output_str = []
-    output_str.append("-" * 100)
-    output_str.append("SUMMARY STATISTICS:")
-    output_str.append("-" * 100)
-    output_str.append(f"Accuracy: {acc*100:.2f}%")
-    output_str.append(f"Precision: {prec:.4f}")
-    output_str.append(f"Recall: {rec:.4f}")
-    output_str.append(f"Specificity: {spec:.4f}")
-    output_str.append("\nConfusion Matrix:")
-    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
-    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
-    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
-    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
-    output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
-    output_str.extend(lines)
+    os.makedirs(save_dir, exist_ok=True)
+
+    # ذخیره log
+    output_str = [
+        "-"*100, "SUMMARY STATISTICS:", "-"*100,
+        f"Accuracy: {acc*100:.2f}%",
+        f"Precision: {prec:.4f}",
+        f"Recall: {rec:.4f}",
+        f"Specificity: {spec:.4f}",
+        "\nConfusion Matrix:",
+        f"                 {'Predicted Real':<15} {'Predicted Fake':<15}",
+        f"    Actual Real   {TP:<15} {FN:<15}",
+        f"    Actual Fake   {FP:<15} {TN:<15}",
+        f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)",
+        f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)",
+        "", "-"*100, "SAMPLE-BY-SAMPLE PREDICTIONS:",
+        f"{'ID':<10} {'True':<10} {'Pred':<10} {'Status':<10}", "-"*100,
+    ]
+    for i, (yt, yp) in enumerate(zip(all_y_true, all_y_pred)):
+        output_str.append(f"{i+1:<10} {yt:<10} {yp:<10} {'Correct' if yt==yp else 'Wrong':<10}")
 
     log_path = os.path.join(save_dir, 'prediction_log.txt')
     with open(log_path, 'w') as f:
         f.write("\n".join(output_str))
-    print(f"✅ Prediction log saved to: {log_path}")
+    print(f"✅ Prediction log saved: {log_path}")
 
-
-    print("\nCollecting ROC data (y_true & y_score) ...")
-    
-    y_true_np = np.array(all_y_true)
+    # ذخیره JSON و TXT
+    y_true_np  = np.array(all_y_true)
     y_score_np = np.array(all_y_score)
-    y_pred_np = np.array(all_y_pred)
+    y_pred_np  = np.array(all_y_pred)
 
-    # ذخیره در JSON
     roc_json_path = os.path.join(save_dir, "roc_data_test.json")
-    roc_data_json = {
-        "metadata": {
-            "seed": args.seed,
-            "dataset": args.dataset,
-            "num_samples": int(total_samples),
-            "positive_count": int(np.sum(y_true_np)),
-            "negative_count": int(total_samples - np.sum(y_true_np)),
-            "model": "simple_averaging_ensemble"
-        },
-        "y_true": y_true_np.tolist(),
-        "y_score": y_score_np.tolist(),
-        "y_pred": y_pred_np.tolist()
-    }
     with open(roc_json_path, 'w', encoding='utf-8') as f:
-        json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
-    print(f"ROC data saved (JSON): {roc_json_path}")
+        json.dump({
+            "metadata": {
+                "seed": args.seed, "dataset": args.dataset,
+                "num_samples": total,
+                "positive_count": int(np.sum(y_true_np)),
+                "negative_count": int(total - np.sum(y_true_np)),
+                "model": model_name
+            },
+            "y_true": y_true_np.tolist(),
+            "y_score": y_score_np.tolist(),
+            "y_pred": y_pred_np.tolist()
+        }, f, indent=2, ensure_ascii=False)
+    print(f"✅ ROC JSON saved: {roc_json_path}")
 
-    # ذخیره در TXT
     roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
     with open(roc_txt_path, 'w', encoding='utf-8') as f:
         f.write("y_true\ty_score\ty_pred\n")
         for t, s, p in zip(y_true_np, y_score_np, y_pred_np):
             f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
-    print(f"ROC data saved (TXT):  {roc_txt_path}")
+    print(f"✅ ROC TXT saved: {roc_txt_path}")
 
     return acc * 100, y_true_np, y_score_np
 
@@ -180,10 +170,9 @@ class SimpleAveragingEnsemble(nn.Module):
         
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-     
             out = self.models[i](x_n)
-                if isinstance(out, (tuple, list)):
-                    out = out[0]
+            if isinstance(out, (tuple, list)):
+                out = out[0]
             outputs[:, i] = out.view(x.size(0), 1)
 
         final_output = outputs.mean(dim=1)
