@@ -35,80 +35,38 @@ def set_seed(seed: int = 42):
 
 
 # ================== UNIFIED FINAL EVALUATION & REPORT ==================
+
+from torchvision import transforms  # ← بالای فایل
+
 @torch.no_grad()
 def final_evaluation_and_report(model, loader, device, save_dir, model_name, args, is_main):
-   
-    if not is_main or loader is None: return 0.0, None, None
+    if not is_main or loader is None:
+        return 0.0, None, None
 
     model.eval()
-    
-    # استخراج دیتاست پایه و اندیس‌ها
-    base_dataset = loader.dataset
-    if hasattr(base_dataset, 'dataset'):
-        base_dataset = base_dataset.dataset
-        
-    if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'indices'):
-        test_indices = loader.sampler.indices
-    elif hasattr(loader.dataset, 'indices'):
-        test_indices = loader.dataset.indices
-    else:
-        test_indices = list(range(len(base_dataset)))
-
-    # لیست‌های برای ذخیره داده‌ها
-    all_y_true = []
-    all_y_score = []
-    all_y_pred = []
-    lines = []
-
-    lines.append("="*100)
-    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
-    lines.append("="*100)
-    header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
-    lines.append(header)
-    lines.append("-"*100)
-
+    all_y_true, all_y_score, all_y_pred = [], [], []
     TP, TN, FP, FN = 0, 0, 0, 0
-    correct_count = 0
-    total_samples = 0
 
-    print(f"\nRunning Final Evaluation on {len(test_indices)} samples...")
-    
-    for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
-        try:
-            image, label = base_dataset[global_idx]
-            path, _ = get_sample_info(base_dataset, global_idx)
-        except Exception as e:
-            continue
+    for images, labels in tqdm(loader, desc="Final Eval"):
+        images = images.to(device)
+        labels_int = labels.long()
 
-        from torchvision import transforms
+        outputs, _, _, _ = model(images, return_details=True)
+        probs = torch.sigmoid(outputs.squeeze(1)).cpu()
+        preds = (probs > 0.5).long()
 
-# اگر تصویر PIL بود، اول به تنسور تبدیلش کن
-        if not isinstance(image, torch.Tensor):
-            image = transforms.ToTensor()(image)
+        all_y_true.extend(labels_int.tolist())
+        all_y_score.extend(probs.tolist())
+        all_y_pred.extend(preds.tolist())
 
-        image = image.unsqueeze(0).to(device)
-        label_int = int(label)
-        
-        # پیش‌بینی مدل
-        output, _, _, _ = model(image, return_details=True)
-        prob = torch.sigmoid(output.squeeze()).item()
-        pred_int = int(prob > 0.5) # ✅ درست: prob بدون s
-        
-        # ذخیره برای ROC
-        all_y_true.append(label_int)
-        all_y_score.append(prob) # ✅ درست: prob بدون s
-        all_y_pred.append(pred_int)
-        
-        # محاسبه آمار
-        is_correct = (pred_int == label_int)
-        if is_correct: correct_count += 1
-        
-        if label_int == 1:
-            if pred_int == 1: TP += 1
-            else: FN += 1
-        else:
-            if pred_int == 1: FP += 1
-            else: TN += 1
+        for yt, yp in zip(labels_int.tolist(), preds.tolist()):
+            if yt == 1:
+                if yp == 1: TP += 1
+                else: FN += 1
+            else:
+                if yp == 1: FP += 1
+                else: TN += 1
+    # بقیه کد محاسبه metrics و ذخیره همانند قبل ...
             
         total_samples += 1
         
@@ -222,11 +180,11 @@ class SimpleAveragingEnsemble(nn.Module):
         
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            with torch.no_grad():
-                out = self.models[i](x_n)
+     
+            out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-            outputs[:, i] = out
+            outputs[:, i] = out.view(x.size(0), 1)
 
         final_output = outputs.mean(dim=1)
         
