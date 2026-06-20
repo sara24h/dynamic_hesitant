@@ -93,6 +93,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         # ذخیره برای ROC
         all_y_true.append(label_int)
         all_y_score.append(prob) # ✅ درست: prob بدون s
+        all_y_pred.append(pred_int)
         
         # محاسبه آمار
         is_correct = (pred_int == label_int)
@@ -221,7 +222,7 @@ class SimpleAveragingEnsemble(nn.Module):
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-            outputs[:, i] = out
+            outputs[:, i] = out.view(x.size(0), 1)
 
         final_output = outputs.mean(dim=1)
         
@@ -292,8 +293,9 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main:
         print(f" {name}: {acc:.2f}%")
@@ -369,7 +371,12 @@ def main():
     ).to(device)
 
     if world_size > 1:
-        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
+        ensemble = DDP(
+            ensemble,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True  # چون هیچ پارامتری trainable نیست
+        )
 
     if is_main:
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
@@ -465,17 +472,18 @@ def main():
             args.num_grad_cam_samples, args.num_lime_samples,
             args.dataset, is_main)
 
-    cleanup_distributed()
-    
-    if is_main:
         plot_roc_and_f1(
-            ensemble_module,
-            test_loader_full, 
-            device, 
-            args.save_dir, 
-            MODEL_NAMES,
-            is_main
-        )
+                ensemble_module,
+                test_loader_full, 
+                device, 
+                args.save_dir, 
+                MODEL_NAMES,
+                is_main
+            )
+
+    cleanup_distributed()
+
+        
 
 if __name__ == "__main__":
     main()
