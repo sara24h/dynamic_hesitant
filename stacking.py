@@ -511,6 +511,15 @@ def main():
             args.data_dir, args.batch_size, dataset_type=args.dataset,
             is_distributed=(world_size > 1), seed=current_seed, is_main=is_main)
 
+        # ==========================================
+        # FIX BUG 3: جلوگیری از تکرار نمونه‌ها در ارزیابی
+        # ==========================================
+        if world_size > 1:
+            if hasattr(val_loader.sampler, 'drop_last'):
+                val_loader.sampler.drop_last = True
+            if hasattr(test_loader.sampler, 'drop_last'):
+                test_loader.sampler.drop_last = True
+
         if is_main:
             print("\n" + "="*70)
             print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
@@ -570,7 +579,7 @@ def main():
             json_path = os.path.join(current_save_dir, 'test_predictions.json')
             save_predictions_json(y_true, y_score, y_pred, json_path, current_seed, args.dataset)
 
-            # 2. ذخیره فایل txt دقیقاً مطابق با کنسول (جایگزین save_prediction_log قبلی)
+            # 2. ذخیره فایل txt دقیقاً مطابق با کنسول
             log_path_ensemble = os.path.join(current_save_dir, 'prediction_log_stacking.txt')
             save_accuracy_log_from_results(y_true, y_pred, log_path_ensemble, "Stacking Ensemble")
 
@@ -607,53 +616,71 @@ def main():
             }, final_model_path)
             print(f"Model saved: {final_model_path}")
 
-            # ==========================================
-            # Save Best Single Model Log (بازسازی لیست برای مدل تکی)
-            # ==========================================
-            # نکته: برای مدل تکی باید دوباره تست انجام دهیم تا لیست y_pred را داشته باشیم
-            # چون در evaluate_single_model_ddp قبلی لیست را برنمی‌گرداندیم.
-            # برای جلوگیری از اتلاف وقت، می‌توانیم یک دور مدل تکی را اجرا کنیم یا اینکه
-            # همان فایل JSON انسمبل را ملاک قرار دهیم.
-            # اما برای تکمیل کد، تابعی می‌نویسیم که لیست مدل تکی را هم بسازد:
+        # ==========================================
+        # FIX BUG 1: Save Best Single Model Log (با all_gather_object درست انجام شود)
+        # ==========================================
+        single_model = base_models[best_idx]
+        single_model.eval()
+        single_y_true_local = []
+        single_y_pred_local = []
+        single_normalizer = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
+        
+        # تمام GPU ها باید این حلقه را بزنند
+        for images, labels in tqdm(test_loader, desc="Eval Single for Log", disable=not is_main):
+            images, labels = images.to(device), labels.to(device)
+            images = single_normalizer(images, 0)
+            with torch.no_grad():
+                out = single_model(images)
+                if isinstance(out, (tuple, list)): out = out[0]
+                pred = (out.squeeze(1) > 0).long()
+                
+            single_y_true_local.extend(labels.cpu().numpy().tolist())
+            single_y_pred_local.extend(pred.cpu().numpy().tolist())
+        
+        # جمع‌آوری نتایج از تمام GPU ها
+        if world_size > 1:
+            gathered_true = [None for _ in range(world_size)]
+            gathered_pred = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered_true, single_y_true_local)
+            dist.all_gather_object(gathered_pred, single_y_pred_local)
             
-            print("\nGenerating Single Best Model Log...")
-            single_model = base_models[best_idx]
-            single_model.eval()
-            single_y_true = []
-            single_y_pred = []
-            single_normalizer = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
-            
-            for images, labels in tqdm(test_loader, desc="Eval Single for Log"):
-                images, labels = images.to(device), labels.to(device)
-                images = single_normalizer(images, 0)
-                with torch.no_grad():
-                    out = single_model(images)
-                    if isinstance(out, (tuple, list)): out = out[0]
-                    pred = (out.squeeze(1) > 0).long()
-                    
-                single_y_true.extend(labels.cpu().numpy().tolist())
-                single_y_pred.extend(pred.cpu().numpy().tolist())
-            
+            if is_main:
+                single_y_true = [item for sublist in gathered_true for item in sublist]
+                single_y_pred = [item for sublist in gathered_pred for item in sublist]
+        else:
+            if is_main:
+                single_y_true = single_y_true_local
+                single_y_pred = single_y_pred_local
+
+        # فقط رنک ۰ لاگ را ذخیره می‌کند (با دیتای کامل شده)
+        if is_main:
             log_path_single = os.path.join(current_save_dir, 'prediction_log_best_single.txt')
             save_accuracy_log_from_results(single_y_true, single_y_pred, log_path_single, MODEL_NAMES[best_idx])
 
+            # ==========================================
+            # Visualization
+            # ==========================================
             vis_dir = os.path.join(current_save_dir, 'visualizations')
             generate_visualizations(
                 ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
                 args.num_grad_cam_samples, args.num_lime_samples,
                 args.dataset, is_main)
 
-        cleanup_distributed()
-        
-        if is_main:
+            # ==========================================
+            # FIX BUG 2: plot_roc_and_f1 قبل از cleanup و با داده‌های کامل
+            # ==========================================
             plot_roc_and_f1(
-                ensemble_module,
-                test_loader, 
-                device, 
-                current_save_dir, 
-                MODEL_NAMES,
-                is_main
+                y_true=y_true,
+                y_score=y_score,
+                save_dir=current_save_dir, 
+                model_names=MODEL_NAMES,
+                is_main=is_main
             )
+
+        # ==========================================
+        # در نهایت پاکسازی DDP انجام شود
+        # ==========================================
+        cleanup_distributed()
 
 if __name__ == "__main__":
     main()
