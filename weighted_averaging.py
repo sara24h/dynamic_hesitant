@@ -470,17 +470,24 @@ def main():
         args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
     ckpt_path = os.path.join(args.save_dir, 'best_weighted_ensemble.pt')
+    
+    # ۱. ابتدا رنک صفر فایل را ذخیره می‌کند
+    if is_main and os.path.exists(ckpt_path):
+        pass # فایل قبلاً در آخرین эпох ذخیره شده است
+
+    # ۲. تمام GPUها اینجا منتظر می‌مانند تا ذخیره شدن قطعی شود
+    if dist.is_initialized():
+        dist.barrier()
+
+    # ۳. حالا همه با خیال راحت فایل را لود می‌کنند
     if os.path.exists(ckpt_path):
-    # barrier تا مطمئن شویم فایل نوشته شده
-        if dist.is_initialized():
-            dist.barrier()
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         if hasattr(ensemble, 'module'):
             ensemble.module.weights.data.copy_(ckpt['weights'])
         else:
             ensemble.weights.data.copy_(ckpt['weights'])
         if is_main:
-            print("Best model weights loaded.\n")
+            print("Best model weights loaded on all GPUs.\n")
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
