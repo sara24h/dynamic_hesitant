@@ -242,7 +242,9 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
                         device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
     
-    weights_param = ensemble_model.module.weights if hasattr(ensemble_model, 'module') else ensemble_model.weights
+    # استخراج پارامتر وزن‌ها (با توجه به اینکه ممکن است DDP wrapping شده باشد)
+    actual_module = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
+    weights_param = actual_module.weights
         
     optimizer = torch.optim.AdamW([weights_param], lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
@@ -253,7 +255,7 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
 
     if is_main:
         print("="*70)
-        print("Training Weighted Average Ensemble")
+        print("Training Weighted Average Ensemble (Multi-GPU)")
         print("="*70)
 
     for epoch in range(num_epochs):
@@ -261,6 +263,11 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
             train_loader.sampler.set_epoch(epoch)
         
         ensemble_model.train()
+        
+        # ✅ اصلاح باگ بسیار مهم: جلوگیری از تغییر آمار BatchNorm مدل‌های فریز شده
+        for model in actual_module.models:
+            model.eval() 
+
         train_loss = 0.0
         train_correct = 0
         train_total = 0
@@ -276,7 +283,10 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
 
             batch_size = images.size(0)
             train_loss += loss.item() * batch_size
-            pred = (outputs.squeeze(1) > 0).long()
+            
+            # ✅ محاسبه دقت با تبدیل لاجیت به احتمال
+            probs = torch.sigmoid(outputs.squeeze(1))
+            pred = (probs > 0.5).long()
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
 
@@ -284,6 +294,8 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         train_loss = train_loss / train_total
         
         current_weights = F.softmax(weights_param, dim=0).detach().cpu()
+        
+        # ارزیابی روی ولیدیشن (دقت شده با DDP)
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         scheduler.step()
 
