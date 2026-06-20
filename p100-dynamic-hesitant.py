@@ -465,6 +465,9 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
         ensemble_model.train()
+        base_models = ensemble_model.module.models if hasattr(ensemble_model, 'module') else ensemble_model.models
+        for m in base_models:
+            m.eval()
         
         train_loss = 0.0
         train_correct = 0
