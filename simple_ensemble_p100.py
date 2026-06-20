@@ -180,7 +180,11 @@ class SimpleAveragingEnsemble(nn.Module):
         all_logits = []
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            out = self.models[i](x_n)
+            
+            # ✅✅✅ فقط این دو خط را اضافه کنید تا مشکل حافظه و BatchNorm حل شود ✅✅✅
+            with torch.no_grad():
+                out = self.models[i](x_n)
+                
             if isinstance(out, (tuple, list)): out = out[0]
             all_logits.append(out)
 
@@ -191,7 +195,6 @@ class SimpleAveragingEnsemble(nn.Module):
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
             return final_output, weights, None, stacked_logits
         return final_output, None
-
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.Module]:
