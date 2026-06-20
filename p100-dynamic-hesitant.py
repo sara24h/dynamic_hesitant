@@ -291,7 +291,7 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 class HesitantFuzzyMembership(nn.Module):
-    def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3):
+    def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, dropout: float = 0.3):
         super().__init__()
         self.num_models = num_models
         self.num_memberships = num_memberships
@@ -305,7 +305,7 @@ class HesitantFuzzyMembership(nn.Module):
             nn.AdaptiveAvgPool2d(1)
         )
         self.membership_generator = nn.Sequential(
-            nn.Linear(128, 128), nn.ReLU(inplace=True),
+            nn.Linear(128, 128), nn.ReLU(inplace=True), nn.Dropout(dropout),
             nn.Linear(128, num_models * num_memberships)
         )
         self.aggregation_weights = nn.Parameter(torch.ones(num_memberships) / num_memberships)
