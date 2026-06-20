@@ -353,7 +353,7 @@ class FuzzyHesitantEnsemble(nn.Module):
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
-        hesitancy = all_memberships.var(dim=2)
+        hesitancy = all_memberships.var(dim=2,unbiased=False)
         avg_hesitancy = hesitancy.mean(dim=1)
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
         final_weights = final_weights * mask
@@ -493,7 +493,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
             
-            per_model_hesitancy = memberships.var(dim=2)
+            per_model_hesitancy = memberships.var(dim=2,unbiased=False)
             sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
             
             active_mask = (weights > 1e-4).float()
