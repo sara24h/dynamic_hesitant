@@ -187,6 +187,7 @@ def evaluate_ensemble_final(model, loader, device, name, model_names):
 
 
 # ================== TRAINING FUNCTION ==================
+# ================== TRAINING FUNCTION ==================
 def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, model_names):
     os.makedirs(save_dir, exist_ok=True)
@@ -204,7 +205,12 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
     print("="*70)
 
     for epoch in range(num_epochs):
+        # ✅ اصلاح باگ: فقط پارامتر وزن‌ها را در حالت Train قرار دهید
+        # تا BatchNorm های مدل‌های فریز شده خراب نشوند
         ensemble_model.train()
+        for model in ensemble_model.models:
+            model.eval() 
+
         train_loss = 0.0
         train_correct = 0
         train_total = 0
@@ -220,7 +226,10 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
 
             batch_size = images.size(0)
             train_loss += loss.item() * batch_size
-            pred = (outputs.squeeze(1) > 0).long()
+            
+            # ✅ اصلاح خوانایی: تبدیل لاجیت به احتمال برای محاسبه دقت
+            probs = torch.sigmoid(outputs.squeeze(1))
+            pred = (probs > 0.5).long()
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
 
@@ -228,6 +237,8 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         train_loss = train_loss / train_total
         
         current_weights = F.softmax(weights_param, dim=0).detach().cpu()
+        
+        # ✅ ارزیابی روی ولیدیشن (مدل به طور کامل در حالت eval است)
         val_acc = evaluate_accuracy(ensemble_model, val_loader, device)
         scheduler.step()
 
