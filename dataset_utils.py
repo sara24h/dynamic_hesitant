@@ -328,16 +328,17 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
             print(f" Class → Index: {datasets_dict['train'].class_to_idx}\n")
 
         train_sampler = DistributedSampler(datasets_dict['train'], shuffle=True) if is_distributed else None
+        # اصلاح شد: drop_last=True را از این خط حذف کردم تا هیچ عکسی در ولیدیشن دور نریزد
         val_sampler = DistributedSampler(datasets_dict['valid'], shuffle=False) if is_distributed else None
         test_sampler = DistributedSampler(datasets_dict['test'], shuffle=False) if is_distributed else None
 
         train_loader = DataLoader(datasets_dict['train'], batch_size=batch_size,
                                  shuffle=(train_sampler is None), sampler=train_sampler,
-                                 num_workers=num_workers, pin_memory=True, drop_last=True,
+                                 num_workers=num_workers, pin_memory=True, drop_last=True, # برای آموزش درسته
                                  worker_init_fn=worker_init_fn)
         val_loader = DataLoader(datasets_dict['valid'], batch_size=batch_size,
                                shuffle=False, sampler=val_sampler,
-                               num_workers=num_workers, pin_memory=True, drop_last=False,
+                               num_workers=num_workers, pin_memory=True, drop_last=False, # باید False باشد
                                worker_init_fn=worker_init_fn)
         test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size,
                                 shuffle=False, sampler=test_sampler,
