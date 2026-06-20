@@ -216,14 +216,16 @@ def evaluate_single_model(model: nn.Module, loader: DataLoader,
     return acc
 
 
-# ساده‌ترین و مطمئن‌ترین روش برای validation accuracy:
 @torch.no_grad()
 def evaluate_accuracy_ddp(model, loader, device, is_main=False):
-    # ارزیابی فقط روی GPU اصلی انجام شود تا از مشکل تکرار عکس‌ها (Padding) در DDP جلوگیری شود
+    # اگر GPU اصلی نیستیم، کاری نکن تا از محاسبات تکراری و Hang جلوگیری شود
     if not is_main:
         return 0.0 
         
-    model.eval()
+    # استخراج مدل اصلی از داخل پوشش DDP (جلوگیری از Deadlock در Broadcast)
+    base_model = model.module if hasattr(model, 'module') else model
+    base_model.eval()
+    
     local_correct = 0
     local_total = 0
     
@@ -235,7 +237,8 @@ def evaluate_accuracy_ddp(model, loader, device, is_main=False):
 
     for images, labels in temp_loader:
         images, labels = images.to(device), labels.to(device).float()
-        outputs, _ = model(images)
+        # حتماً از base_model استفاده شود نه model
+        outputs, _ = base_model(images)
         pred = (outputs.squeeze(1) > 0).long()
         local_correct += pred.eq(labels.long()).sum().item()
         local_total += labels.size(0)
@@ -614,7 +617,13 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader,
             avg_activation = (local_active / local_total) * 100
 
         overall_mean_hes = avg_hesitancy.mean().item()
-        val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
+        val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device, is_main)
+    
+    # ---------- این دو خط را اضافه کنید ----------
+        if is_dist():
+            dist.barrier()
+    # ---------------------------------------------
+
         scheduler.step()
 
         if is_main:
