@@ -80,6 +80,12 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         except Exception as e:
             continue
 
+        from torchvision import transforms
+
+# اگر تصویر PIL بود، اول به تنسور تبدیلش کن
+        if not isinstance(image, torch.Tensor):
+            image = transforms.ToTensor()(image)
+
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
         
