@@ -332,42 +332,46 @@ class FuzzyHesitantEnsemble(nn.Module):
             input_dim=128, num_models=self.num_models, num_memberships=num_memberships)
         self.cum_weight_threshold = cum_weight_threshold
         self.hesitancy_threshold = hesitancy_threshold
+        
+        # ذخیره وضعیت فریز بودن مدل‌ها
+        self.freeze_models = freeze_models
 
-        if freeze_models:
+        if self.freeze_models:
             for model in self.models:
                 model.eval()
                 for p in model.parameters():
                     p.requires_grad = False
 
+    def train(self, mode: bool = True):
+        """
+        اورراید کردن متد train برای جلوگیری از قرار گرفتن مدل‌های فریز شده در حالت train.
+        این کار از آپدیت شدن BatchNorm مدل‌های پایه جلوگیری می‌کند.
+        """
+        super().train(mode)
+        if self.freeze_models:
+            for model in self.models:
+                model.eval() # نگه داشتن مدل‌های فریز شده در حالت ارزیابی
+        return self
+
     def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
         batch_size = final_weights.size(0)
         sorted_weights, sorted_indices = torch.sort(final_weights, dim=1, descending=True)
         cum_weights = torch.cumsum(sorted_weights, dim=1)
-        
-        # منطق جدید:
-        # مدل اول همیشه فعال است (mask[:, 0] = 1.0)
-        # برای مدل‌های بعدی، شرط می‌گذاریم: تا زمانی که مقدار قبلیِ تجمعی کمتر از حد آستانه بود، 
-        # مدل جدید را فعال کن (این یعنی مدلِ عبور دهنده هم فعال می‌ماند).
-        
-        # مقدار cum_weights را یک شیفت به راست می‌دهیم تا ببینیم 
-        # آیا "قبل از اضافه کردن این مدل" به آستانه رسیده بودیم یا نه
-        prev_cum_weights = torch.cat([torch.zeros(batch_size, 1, device=final_weights.device), 
-                                      cum_weights[:, :-1]], dim=1)
-        
-        mask = (prev_cum_weights < self.cum_weight_threshold).float()
-        
-        # تداخل با تردید (Hesitancy): اگر مدل شک داشت، همه را فعال نگه دار
+        mask = (cum_weights <= self.cum_weight_threshold).float()
+        mask[:, 0] = 1.0
         high_hesitancy_mask = (avg_hesitancy > self.hesitancy_threshold).unsqueeze(1)
         mask = torch.where(high_hesitancy_mask, torch.ones_like(mask), mask)
-        
         final_mask = torch.zeros_like(final_weights)
         final_mask.scatter_(1, sorted_indices, mask)
         return final_mask
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
+        
+        # محاسبه واریانس به صورت unbiased=False (دقیقا مطابق فرمول مقاله)
         hesitancy = all_memberships.var(dim=2, unbiased=False)
         avg_hesitancy = hesitancy.mean(dim=1)
+        
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
         final_weights = final_weights * mask
         final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
@@ -477,10 +481,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
 
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
-     
-        ensemble_model.hesitant_fuzzy.train() 
-        for model in ensemble_model.models:
-            model.eval()
+        ensemble_model.train()
         
         train_loss = 0.0
         train_correct = 0
@@ -506,7 +507,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
             
-            per_model_hesitancy = memberships.var(dim=2, unbiased=False)
+            per_model_hesitancy = memberships.var(dim=2,unbiased=False)
             sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
             
             active_mask = (weights > 1e-4).float()
