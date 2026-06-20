@@ -295,12 +295,14 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
         print("="*70)
 
     train_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.RandomCrop(256),
+        transforms.Resize((256, 256)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(10),
-        transforms.ColorJitter(0.2, 0.2),
+        transforms.RandomRotation(20), # افزایش از 10 به 20
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3), # افزایش تنوع رنگ
+        transforms.RandomGrayscale(p=0.1), # اضافه کردن برای مقابله با فیلترهای رنگی
+        transforms.GaussianBlur(kernel_size=3), # اضافه کردن برای شبیه‌سازی تاری در تصاویر فیک
         transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # نرمال‌سازی ضروری است
     ])
 
     val_test_transform = transforms.Compose([
