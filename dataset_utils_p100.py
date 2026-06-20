@@ -302,7 +302,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
         transforms.RandomGrayscale(p=0.1), # اضافه کردن برای مقابله با فیلترهای رنگی
         transforms.GaussianBlur(kernel_size=3), # اضافه کردن برای شبیه‌سازی تاری در تصاویر فیک
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # نرمال‌سازی ضروری است
+
     ])
 
     val_test_transform = transforms.Compose([
