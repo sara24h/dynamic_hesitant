@@ -50,40 +50,106 @@ class MultiModelNormalization(nn.Module):
 
 # ================== BATCHNORM ADAPTATION (AdaBN) ==================
 @torch.no_grad()
-def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True):
+# =====================================================================
+# ================== DISTRIBUTED BATCHNORM ADAPTATION ==================
+# =====================================================================
+@torch.no_grad()
+def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True, is_distributed=False):
     """
-    اعمال AdaBN با دیتالودر بدون augmentation.
-    فقط آمار BN آپدیت می‌شود، نه وزن‌ها.
+    اعمال AdaBN به صورت موازی روی چندین GPU.
+    اگر is_distributed=True باشد، از فرمول محاسبه واریانس موازی (Parallel Variance) استفاده می‌کند.
     """
     if is_main:
         print("\n" + "="*70)
-        print("STARTING BATCHNORM ADAPTATION (AdaBN) - CLEAN DATA")
+        print(f"STARTING BATCHNORM ADAPTATION (AdaBN) - Mode: {'Distributed' if is_distributed else 'Single GPU'}")
         print("="*70)
         
     normalizer = MultiModelNormalization(means, stds).to(device)
     
-    for model in models:
-        model.eval()
-        for m in model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.reset_running_stats()
-                m.momentum = None
-                m.train()
-                
-    for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
-        images = images.to(device)
-        for i, model in enumerate(models):
-            x_n = normalizer(images, i)
-            model(x_n)
-            
-    for model in models:
-        for m in model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.momentum = 0.1
-        model.eval()
+    if is_distributed:
+        # =================== منطق چند GPU ===================
+        accumulators = [{} for _ in models]
+        hooks = []
         
-    if is_main:
-        print("✅ BatchNorm Adaptation Completed!\n")
+        for i, model in enumerate(models):
+            model.eval() # مدل در حالت eval میماند تا dropout خاموش شود
+            for name, m in model.named_modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    accumulators[i][name] = {
+                        'n': torch.tensor(0.0, device=device),
+                        'sum_mean': torch.zeros(m.num_features, device=device),
+                        'sum_x2': torch.zeros(m.num_features, device=device)
+                    }
+                    
+                    def get_hook(model_idx, layer_name):
+                        def hook(module, inp, out):
+                            x = inp[0]
+                            n = x.numel() / x.size(1) 
+                            mean = x.mean(dim=[0, 2, 3])
+                            var = x.var(dim=[0, 2, 3], unbiased=False) 
+                            
+                            accumulators[model_idx][layer_name]['n'] += n
+                            accumulators[model_idx][layer_name]['sum_mean'] += mean * n
+                            accumulators[model_idx][layer_name]['sum_x2'] += (var * n) + (mean ** 2 * n)
+                        return hook
+                    hooks.append(m.register_forward_hook(get_hook(i, name)))
+
+        if hasattr(adabn_loader.sampler, 'set_epoch'):
+            adabn_loader.sampler.set_epoch(0)
+
+        for images, _ in tqdm(adabn_loader, desc="Adapting BN (Dist)", disable=not is_main):
+            images = images.to(device)
+            for i, model in enumerate(models):
+                x_n = normalizer(images, i)
+                model(x_n)
+
+        for h in hooks: h.remove()
+
+        if is_main: print("Synchronizing BN statistics across GPUs...")
+        
+        for i, model in enumerate(models):
+            for name, m in model.named_modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    acc = accumulators[i][name]
+                    
+                    dist.all_reduce(acc['n'], op=dist.ReduceOp.SUM)
+                    dist.all_reduce(acc['sum_mean'], op=dist.ReduceOp.SUM)
+                    dist.all_reduce(acc['sum_x2'], op=dist.ReduceOp.SUM)
+                    
+                    global_mean = acc['sum_mean'] / acc['n']
+                    global_var = (acc['sum_x2'] / acc['n']) - (global_mean ** 2)
+                    global_var = torch.clamp(global_var, min=1e-5)
+                    
+                    m.running_mean.copy_(global_mean)
+                    m.running_var.copy_(global_var)
+                    m.num_batches_tracked.copy_(torch.tensor(1, dtype=torch.long, device=device))
+        
+        if is_main: print("✅ Distributed BatchNorm Adaptation Completed!\n")
+
+    else:
+        # =================== منطق تک GPU (کد قبلی) ===================
+        for model in models:
+            model.eval()  
+            for m in model.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    m.reset_running_stats()
+                    m.momentum = None  
+                    m.train()          
+                    
+        for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
+            images = images.to(device)
+            for i, model in enumerate(models):
+                x_n = normalizer(images, i)
+                model(x_n) 
+                
+        for model in models:
+            for m in model.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    m.momentum = 0.1
+            model.eval()
+            
+        if is_main: print("✅ BatchNorm Adaptation Completed!\n")
+# =====================================================================
 # =====================================================================
 
 
@@ -533,20 +599,22 @@ def main():
 
         # =================== فراخوانی و اعمال AdaBN ===================
         # استفاده از تعداد کلاستر 4 برای جلوگیری از تداخل DistributedSampler
+                # =================== فراخوانی و اعمال AdaBN ===================
         adabn_train_loader, _, _ = create_dataloaders(
-            args.data_dir, args.batch_size * 4, dataset_type=args.dataset,
-            is_distributed=False, seed=current_seed, is_main=is_main)
+            args.data_dir, args.batch_size, dataset_type=args.dataset,
+            is_distributed=is_distributed, 
+            seed=current_seed, is_main=is_main
+        )
+        adabn_loader = adabn_train_loader
         
-        # انتخاب یک زیرمجموعه 1000 تایی (یا کل دیتا اگر کمتر باشد) برای تطبیق سریع‌تر BN
-        num_samples = min(1000, len(adabn_train_loader.dataset))
-        indices = list(range(num_samples))
-        adabn_subset = Subset(adabn_train_loader.dataset, indices)
-        adabn_loader = DataLoader(adabn_subset, batch_size=args.batch_size * 4, shuffle=False, num_workers=4)
-        
-        adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main=is_main)
+        adapt_batchnorm_for_new_dataset(
+            base_models, MEANS, STDS, adabn_loader, device, is_main=is_main,
+            is_distributed=is_distributed
+        )
         
         del adabn_train_loader, adabn_loader
         torch.cuda.empty_cache()
+        # ===============================================================
         # ===============================================================
 
         ensemble = StackingEnsemble(
