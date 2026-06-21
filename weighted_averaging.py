@@ -18,7 +18,8 @@ warnings.filterwarnings("ignore")
 
 from dataset_utils import (
     UADFVDataset, 
-    create_dataloaders, 
+    create_dataloaders,
+    create_adabn_dataloader,  # <-- ایمپورت تابع لودر AdaBN اضافه شد
     get_sample_info, 
     worker_init_fn
 )
@@ -47,6 +48,48 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
+# ================== ADABN FUNCTION (اضافه شده) ==================
+@torch.no_grad()
+def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main, is_distributed=False):
+    if is_main:
+        print("\n" + "="*70)
+        print("STARTING BATCHNORM ADAPTATION (AdaBN) - CLEAN DATA (NO AUGMENTATION)")
+        print("="*70)
+        
+    normalizer = MultiModelNormalization(means, stds).to(device)
+    
+    for model in models:
+        model.eval()  
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.reset_running_stats()
+                m.num_batches_tracked.zero_()  
+                m.train()          
+                
+    for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
+        images = images.to(device)
+        for i, model in enumerate(models):
+            x_n = normalizer(images, i)
+            model(x_n)  
+
+    # سینک کردن آمارها در صورت استفاده از چند گرافیک
+    if is_distributed and dist.is_initialized():
+        for model in models:
+            for m in model.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    dist.all_reduce(m.running_mean, op=dist.ReduceOp.SUM)
+                    m.running_mean /= dist.get_world_size()
+                    dist.all_reduce(m.running_var, op=dist.ReduceOp.SUM)
+                    m.running_var /= dist.get_world_size()
+            
+    for model in models:
+        model.eval() 
+        
+    if is_main:
+        print("✅ BatchNorm Adaptation Completed!\n")
+# ========================================================================
+
+
 # ================== WEIGHTED AVERAGING ENSEMBLE ==================
 class WeightedAverageEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
@@ -65,7 +108,6 @@ class WeightedAverageEnsemble(nn.Module):
                 for p in model.parameters():
                     p.requires_grad = False
 
-    # ✅ درست
     def forward(self, x, return_details=False):
         norm_weights = F.softmax(self.weights, dim=0)
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
@@ -143,14 +185,13 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
 
 @torch.no_grad()
-
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
     total = 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
-        outputs, _ = model(images)          # ← از model استفاده کن، نه ensemble_model
+        outputs, _ = model(images)          
         pred = (outputs.squeeze(1) > 0).long()
         total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
@@ -242,7 +283,6 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
                         device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
     
-    # استخراج پارامتر وزن‌ها (با توجه به اینکه ممکن است DDP wrapping شده باشد)
     actual_module = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
     weights_param = actual_module.weights
         
@@ -264,7 +304,7 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         
         ensemble_model.train()
         
-        # ✅ اصلاح باگ بسیار مهم: جلوگیری از تغییر آمار BatchNorm مدل‌های فریز شده
+        # جلوگیری از تغییر آمار BatchNorm مدل‌های فریز شده (که الان توسط AdaBN تنظیم شده‌اند)
         for model in actual_module.models:
             model.eval() 
 
@@ -284,7 +324,6 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
             batch_size = images.size(0)
             train_loss += loss.item() * batch_size
             
-            # ✅ محاسبه دقت با تبدیل لاجیت به احتمال
             probs = torch.sigmoid(outputs.squeeze(1))
             pred = (probs > 0.5).long()
             train_correct += pred.eq(labels.long()).sum().item()
@@ -295,7 +334,6 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         
         current_weights = F.softmax(weights_param, dim=0).detach().cpu()
         
-        # ارزیابی روی ولیدیشن (دقت شده با DDP)
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         scheduler.step()
 
@@ -338,14 +376,10 @@ def cleanup_distributed():
 
 # ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
-    """
-    ساخت فایل txt دقیقاً بر اساس لیست‌های y_true و y_pred که از تست کنسول آمده‌اند.
-    """
     total = len(y_true)
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
     
-    # محاسبه ماتریس آشفتگی
     TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
     TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
     FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
@@ -423,6 +457,10 @@ def main():
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
     parser.add_argument('--seed', type=int, default=42)
+    
+    # اضافه شدن پرچم فعال‌سازی AdaBN
+    parser.add_argument('--apply_adabn', action='store_true', help="Apply AdaBN before training weights")
+    
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
@@ -431,6 +469,7 @@ def main():
     set_seed(args.seed)
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
+    is_distributed = world_size > 1
 
     if is_main:
         print("="*70)
@@ -451,20 +490,44 @@ def main():
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
+    # =================== بخش اعمال AdaBN ===================
+    if args.apply_adabn:
+        # ساختن دیتالودر بدون Data Augmentation
+        adabn_loader = create_adabn_dataloader(
+            args.data_dir, args.batch_size, num_workers=0, # معمولا عدد ورکر را اینجا 0 میگذارند تا اختلالی ایجاد نکند
+            dataset_type=args.dataset, seed=args.seed, is_main=is_main,
+            is_distributed=is_distributed
+        )
+        
+        # اعمال AdaBN روی مدل‌های پایه
+        adapt_batchnorm_for_new_dataset(
+            models=base_models, 
+            means=MEANS, 
+            stds=STDS, 
+            adabn_loader=adabn_loader, 
+            device=device, 
+            is_main=is_main,
+            is_distributed=is_distributed
+        )
+    # =========================================================
+
+    # ساخت انسامبل (مدل‌ها در اینجا آمارهای آپدیت شده AdaBN را دارند)
     ensemble = WeightedAverageEnsemble(
         base_models, MEANS, STDS,
         freeze_models=True
     ).to(device)
 
-    if world_size > 1:
-        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank,find_unused_parameters=True )
+    if is_distributed:
+        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
+        is_distributed=is_distributed, seed=args.seed, is_main=is_main)
 
     if is_main:
-        print("\n" + "="*70); print("INDIVIDUAL MODEL PERFORMANCE"); print("="*70)
+        print("\n" + "="*70)
+        print(f"INDIVIDUAL MODEL PERFORMANCE {'(After AdaBN)' if args.apply_adabn else ''}")
+        print("="*70)
 
     individual_accs = []
     for i, model in enumerate(base_models):
@@ -477,21 +540,19 @@ def main():
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
 
+    # آموزش وزن‌ها (با توجه به کد شما، آمار BN در اینجا تغییری نمی‌کند)
     best_val_acc, history = train_weighted_ensemble(
         ensemble, train_loader, val_loader,
         args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
     ckpt_path = os.path.join(args.save_dir, 'best_weighted_ensemble.pt')
     
-    # ۱. ابتدا رنک صفر فایل را ذخیره می‌کند
     if is_main and os.path.exists(ckpt_path):
-        pass # فایل قبلاً در آخرین эпох ذخیره شده است
+        pass 
 
-    # ۲. تمام GPUها اینجا منتظر می‌مانند تا ذخیره شدن قطعی شود
     if dist.is_initialized():
         dist.barrier()
 
-    # ۳. حالا همه با خیال راحت فایل را لود می‌کنند
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         if hasattr(ensemble, 'module'):
@@ -503,7 +564,6 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    # دریافت خروجی‌ها برای JSON و Log
     ensemble_test_acc, ensemble_weights, predictions_data = evaluate_ensemble_final_ddp(
         ensemble, test_loader, device, "Test", MODEL_NAMES, is_main)
 
@@ -516,20 +576,18 @@ def main():
         print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
 
-        # استخراج لیست‌ها
         y_true, y_score, y_pred = predictions_data
         
-        # 1. ذخیره JSON
         json_path = os.path.join(args.save_dir, 'test_predictions.json')
         save_predictions_json(y_true, y_score, y_pred, json_path, args.seed, args.dataset)
 
-        # 2. ذخیره فایل txt دقیقاً مطابق با کنسول
         log_path = os.path.join(args.save_dir, 'prediction_log.txt')
         save_accuracy_log_from_results(y_true, y_pred, log_path, "Weighted Ensemble")
 
         final_results = {
             'seed': args.seed,
             'method': 'Weighted_Average',
+            'adabn_applied': args.apply_adabn, # ثبت اینکه آیا ادابان استفاده شده یا خیر
             'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
             'ensemble': {'test_accuracy': float(ensemble_test_acc), 'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)}},
             'improvement': float(ensemble_test_acc - best_single),
@@ -556,8 +614,6 @@ def main():
             args.num_grad_cam_samples, args.num_lime_samples,
             args.dataset, is_main)
 
-   
-    
     if is_main:
         plot_roc_and_f1(
             ensemble_module,
@@ -567,6 +623,7 @@ def main():
             MODEL_NAMES,
             is_main
         )
+        
     cleanup_distributed()
 
 if __name__ == "__main__":
