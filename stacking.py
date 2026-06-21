@@ -48,6 +48,45 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
+# ================== BATCHNORM ADAPTATION (AdaBN) ==================
+@torch.no_grad()
+def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True):
+    """
+    اعمال AdaBN با دیتالودر بدون augmentation.
+    فقط آمار BN آپدیت می‌شود، نه وزن‌ها.
+    """
+    if is_main:
+        print("\n" + "="*70)
+        print("STARTING BATCHNORM ADAPTATION (AdaBN) - CLEAN DATA")
+        print("="*70)
+        
+    normalizer = MultiModelNormalization(means, stds).to(device)
+    
+    for model in models:
+        model.eval()
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.reset_running_stats()
+                m.momentum = None
+                m.train()
+                
+    for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
+        images = images.to(device)
+        for i, model in enumerate(models):
+            x_n = normalizer(images, i)
+            model(x_n)
+            
+    for model in models:
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.momentum = 0.1
+        model.eval()
+        
+    if is_main:
+        print("✅ BatchNorm Adaptation Completed!\n")
+# =====================================================================
+
+
 # ================== STACKING META LEARNER (Logistic Regression) ==================
 class StackingMetaLearner(nn.Module):
     def __init__(self, num_models: int):
@@ -157,8 +196,9 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main:
         print(f" {name}: {acc:.2f}%")
@@ -179,8 +219,9 @@ def evaluate_accuracy_ddp(model, loader, device):
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     acc = 100. * correct_tensor.item() / total_tensor.item()
     return acc
 
@@ -215,7 +256,8 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_samples += labels.size(0)
 
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
-    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    if dist.is_initialized():
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
     if ws > 1:
         gathered_true = [None for _ in range(ws)]
@@ -236,7 +278,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_samples = stats[1].item()
         acc = 100. * total_correct / total_samples
         
-        meta_learner = model.meta_learner
+        meta_learner = model.meta_learner if not hasattr(model, 'module') else model.module.meta_learner
         weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
         bias = meta_learner.linear.bias.data.cpu().item()
 
@@ -390,15 +432,10 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
 
 # ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
-    """
-    ساخت فایل txt دقیقاً بر اساس لیست‌های y_true و y_pred که از تست کنسول آمده‌اند.
-    این تابع تضمین می‌کند که اعداد با کنسول یکی باشند.
-    """
     total = len(y_true)
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
     
-    # محاسبه ماتریس آشفتگی
     TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
     TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
     FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
@@ -494,6 +531,24 @@ def main():
         base_models = load_pruned_models(args.model_paths, device, is_main)
         MODEL_NAMES = args.model_names[:len(base_models)]
 
+        # =================== فراخوانی و اعمال AdaBN ===================
+        # استفاده از تعداد کلاستر 4 برای جلوگیری از تداخل DistributedSampler
+        adabn_train_loader, _, _ = create_dataloaders(
+            args.data_dir, args.batch_size * 4, dataset_type=args.dataset,
+            is_distributed=False, seed=current_seed, is_main=is_main)
+        
+        # انتخاب یک زیرمجموعه 1000 تایی (یا کل دیتا اگر کمتر باشد) برای تطبیق سریع‌تر BN
+        num_samples = min(1000, len(adabn_train_loader.dataset))
+        indices = list(range(num_samples))
+        adabn_subset = Subset(adabn_train_loader.dataset, indices)
+        adabn_loader = DataLoader(adabn_subset, batch_size=args.batch_size * 4, shuffle=False, num_workers=4)
+        
+        adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main=is_main)
+        
+        del adabn_train_loader, adabn_loader
+        torch.cuda.empty_cache()
+        # ===============================================================
+
         ensemble = StackingEnsemble(
             base_models, MEANS, STDS,
             freeze_models=True
@@ -522,10 +577,14 @@ def main():
 
         if is_main:
             print("\n" + "="*70)
-            print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
+            print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
             print("="*70)
 
         individual_accs = []
+        # برای ارور ندادن DistributedSampler در حلقه برای تست، یک دوره (Epoch) تنظیم می‌کنیم
+        if hasattr(test_loader.sampler, 'set_epoch'):
+            test_loader.sampler.set_epoch(0)
+
         for i, model in enumerate(base_models):
             acc = evaluate_single_model_ddp(
                 model, test_loader, device,
@@ -559,6 +618,9 @@ def main():
 
         ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
         
+        if hasattr(test_loader.sampler, 'set_epoch'):
+            test_loader.sampler.set_epoch(1)
+
         # دریافت خروجی‌ها برای JSON و Log
         ensemble_test_acc, learned_weights, learned_bias, predictions_data = evaluate_ensemble_final_ddp(
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
@@ -625,6 +687,9 @@ def main():
         single_y_pred_local = []
         single_normalizer = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
         
+        if hasattr(test_loader.sampler, 'set_epoch'):
+            test_loader.sampler.set_epoch(2)
+
         # تمام GPU ها باید این حلقه را بزنند
         for images, labels in tqdm(test_loader, desc="Eval Single for Log", disable=not is_main):
             images, labels = images.to(device), labels.to(device)
