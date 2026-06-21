@@ -12,6 +12,8 @@ import json
 import random
 import matplotlib.pyplot as plt
 import cv2
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from metrics_utils import plot_roc_and_f1
 
@@ -54,9 +56,30 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
+def is_dist():
+    return dist.is_initialized()
+
+def setup_distributed():
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f'cuda:{local_rank}')
+        if rank == 0:
+            print(f"Distributed: rank {rank}/{world_size}, local_rank {local_rank}")
+        return device, local_rank, rank, world_size
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        return device, 0, 0, 1
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
 def save_ensemble_checkpoint(save_path: str, ensemble_model: nn.Module, model_paths: List[str], 
                              model_names: List[str], accuracy: float, means: List, stds: List):
-    # وقتی از DataParallel استفاده می‌کنیم، باید state_dict خودِ مدل اصلی را ذخیره کنیم
     model_to_save = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
     
     checkpoint = {
@@ -106,42 +129,107 @@ class MultiModelNormalization(nn.Module):
 
 
 # =====================================================================
-# ================== BATCHNORM ADAPTATION (AdaBN) ====================
+# ================== DISTRIBUTED BATCHNORM ADAPTATION ==================
 # =====================================================================
 @torch.no_grad()
-def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True):
+def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True, is_distributed=False):
+    """
+    اعمال AdaBN به صورت موازی روی چندین GPU.
+    اگر is_distributed=True باشد، از فرمول محاسبه واریانس موازی (Parallel Variance) استفاده می‌کند.
+    """
     if is_main:
         print("\n" + "="*70)
-        print("STARTING BATCHNORM ADAPTATION (AdaBN) - CLEAN DATA (NO AUGMENTATION)")
+        print(f"STARTING BATCHNORM ADAPTATION (AdaBN) - Mode: {'Distributed' if is_distributed else 'Single GPU'}")
         print("="*70)
         
     normalizer = MultiModelNormalization(means, stds).to(device)
     
-    for model in models:
-        # اگر مدل با DataParallel پوشانده شده باشد، باید به مدل درونی دسترسی پیدا کنیم
-        actual_model = model.module if hasattr(model, 'module') else model
-        actual_model.eval()
-        for m in actual_model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.reset_running_stats()
-                m.momentum = None
-                m.train()
-                
-    for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
-        images = images.to(device)
-        for i, model in enumerate(models):
-            x_n = normalizer(images, i)
-            model(x_n)
-            
-    for model in models:
-        actual_model = model.module if hasattr(model, 'module') else model
-        for m in actual_model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.momentum = 0.1
-        actual_model.eval()
+    if is_distributed:
+        # =================== منطق چند GPU ===================
+        accumulators = [{} for _ in models]
+        hooks = []
         
-    if is_main:
-        print("✅ BatchNorm Adaptation Completed!\n")
+        for i, model in enumerate(models):
+            model.eval() # مدل در حالت eval میماند تا dropout خاموش شود
+            for name, m in model.named_modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    accumulators[i][name] = {
+                        'n': torch.tensor(0.0, device=device),
+                        'sum_mean': torch.zeros(m.num_features, device=device),
+                        'sum_x2': torch.zeros(m.num_features, device=device)
+                    }
+                    
+                    def get_hook(model_idx, layer_name):
+                        def hook(module, inp, out):
+                            x = inp[0]
+                            n = x.numel() / x.size(1) 
+                            
+                            mean = x.mean(dim=[0, 2, 3])
+                            var = x.var(dim=[0, 2, 3], unbiased=False) 
+                            
+                            accumulators[model_idx][layer_name]['n'] += n
+                            accumulators[model_idx][layer_name]['sum_mean'] += mean * n
+                            accumulators[model_idx][layer_name]['sum_x2'] += (var * n) + (mean ** 2 * n)
+                        return hook
+                    hooks.append(m.register_forward_hook(get_hook(i, name)))
+
+        if hasattr(adabn_loader.sampler, 'set_epoch'):
+            adabn_loader.sampler.set_epoch(0)
+
+        for images, _ in tqdm(adabn_loader, desc="Adapting BN (Dist)", disable=not is_main):
+            images = images.to(device)
+            for i, model in enumerate(models):
+                x_n = normalizer(images, i)
+                model(x_n) 
+
+        for h in hooks: h.remove()
+
+        if is_main: print("Synchronizing BN statistics across GPUs...")
+        
+        for i, model in enumerate(models):
+            for name, m in model.named_modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    acc = accumulators[i][name]
+                    
+                    dist.all_reduce(acc['n'], op=dist.ReduceOp.SUM)
+                    dist.all_reduce(acc['sum_mean'], op=dist.ReduceOp.SUM)
+                    dist.all_reduce(acc['sum_x2'], op=dist.ReduceOp.SUM)
+                    
+                    global_mean = acc['sum_mean'] / acc['n']
+                    global_var = (acc['sum_x2'] / acc['n']) - (global_mean ** 2)
+                    global_var = torch.clamp(global_var, min=1e-5) 
+                    
+                    m.running_mean.copy_(global_mean)
+                    m.running_var.copy_(global_var)
+                    m.num_batches_tracked.copy_(torch.tensor(1, dtype=torch.long, device=device))
+        
+        if is_main: print("✅ Distributed BatchNorm Adaptation Completed!\n")
+
+    else:
+        # =================== منطق تک GPU ===================
+        for model in models:
+            actual_model = model.module if hasattr(model, 'module') else model
+            actual_model.eval()  
+            for m in actual_model.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    m.reset_running_stats()
+                    m.momentum = None  
+                    m.train()          
+                    
+        for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
+            images = images.to(device)
+            for i, model in enumerate(models):
+                x_n = normalizer(images, i)
+                model(x_n) 
+                
+        for model in models:
+            actual_model = model.module if hasattr(model, 'module') else model
+            for m in actual_model.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    m.momentum = 0.1
+            actual_model.eval()
+            
+        if is_main: print("✅ BatchNorm Adaptation Completed!\n")
 # =====================================================================
 
 
@@ -162,7 +250,6 @@ class MajorityVotingEnsemble(nn.Module):
     def forward(self, x: torch.Tensor, return_details: bool = False):
         votes_logits = []
         for i in range(self.num_models):
-            # برای جلوگیری از ارور در DataParallel، مستقیما از خودِ کلاس می‌خوانیم
             current_std = getattr(self.normalizations, f'std_{i}')
             x_n = x
             if not torch.all(current_std == 0):
@@ -190,46 +277,42 @@ class MajorityVotingEnsemble(nn.Module):
         return final_decision, hard_votes
 
 # ================== MODEL LOADING ==================
-def load_pruned_models(model_paths: List[str], device: torch.device, world_size: int) -> List[nn.Module]:
+def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     try:
         from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     except ImportError:
         raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal.")
     models = []
-    print(f"Loading {len(model_paths)} pruned models on {device}...")
+    if is_main:
+        print(f"Loading {len(model_paths)} pruned models on {device}...")
     for i, path in enumerate(model_paths):
         if not os.path.exists(path):
-            print(f" [WARNING] File not found: {path}")
+            if is_main: print(f" [WARNING] File not found: {path}")
             continue
-        print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
+        if is_main: print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
         try:
             ckpt = torch.load(path, map_location='cpu', weights_only=False)
             model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
             model.load_state_dict(ckpt['model_state_dict'])
             model = model.to(device).eval()
-            
-            # 🔴 پوشاندن مدل با DataParallel برای 2 GPU
-            if world_size > 1:
-                model = nn.DataParallel(model)
-                
             models.append(model)
         except Exception as e:
-            print(f" [ERROR] Failed to load {path}: {e}")
+            if is_main: print(f" [ERROR] Failed to load {path}: {e}")
     if len(models) == 0: raise ValueError("No models loaded!")
-    print(f"All {len(models)} models loaded!\n")
+    if is_main: print(f"All {len(models)} models loaded!\n")
     return models
 
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
 def evaluate_single_model(model: nn.Module, loader: DataLoader, device: torch.device,
                           name: str, mean: Tuple[float, float, float],
-                          std: Tuple[float, float, float]) -> float:
+                          std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
     total = 0
     if loader is None: return 0.0
-    for images, labels in tqdm(loader, desc=f"Evaluating {name}"):
+    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
         out = model(images)
@@ -239,19 +322,19 @@ def evaluate_single_model(model: nn.Module, loader: DataLoader, device: torch.de
         correct += pred.eq(labels.long()).sum().item()
         
     acc = 100. * correct / total if total > 0 else 0.0
-    print(f" {name}: {acc:.2f}%")
+    if is_main: print(f" {name}: {acc:.2f}%")
     return acc
 
 @torch.no_grad()
-def evaluate_ensemble_final(model, loader, device, name, model_names):
+def evaluate_ensemble_final(model, loader, device, name, model_names, is_main):
     model.eval()
     local_stats = torch.zeros(5, device=device)
     vote_distribution = torch.zeros(len(model_names), 2, device=device)
     
     if loader is None: return 0.0, [], []
-    print(f"\nEvaluating {name} set (Majority Voting - Hard)...")
+    if is_main: print(f"\nEvaluating {name} set (Majority Voting - Hard)...")
     
-    for images, labels in tqdm(loader, desc=f"Evaluating {name}"):
+    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
         outputs, weights, _, stacked_logits = model(images, return_details=True)
         
@@ -285,25 +368,30 @@ def evaluate_ensemble_final(model, loader, device, name, model_names):
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
     vote_dist_np = vote_distribution.cpu().numpy()
 
-    print(f"\n{'='*70}")
-    print(f"{name.upper()} SET RESULTS (Majority Voting - Hard)")
-    print(f"{'='*70}")
-    print(f" → Accuracy: {acc:.3f}%")
-    print(f" → Precision: {precision:.4f}")
-    print(f" → Recall: {recall:.4f}")
-    print(f" → Specificity: {specificity:.4f}")
-    print(f"\nConfusion Matrix:")
-    print(f"                 Predicted Real  Predicted Fake")
-    print(f"    Actual Real      {int(tp):<15} {int(fn):<15}")
-    print(f"    Actual Fake      {int(fp):<15} {int(tn):<15}")
-    print(f"\nVote Distribution (Fake / Real):")
-    for i, mname in enumerate(model_names):
-        print(f"  {i+1:2d}. {mname:<25}: {int(vote_dist_np[i,0]):<6} / {int(vote_dist_np[i,1]):<6}")
-    print(f"{'='*70}")
+    if is_main:
+        print(f"\n{'='*70}")
+        print(f"{name.upper()} SET RESULTS (Majority Voting - Hard)")
+        print(f"{'='*70}")
+        print(f" → Accuracy: {acc:.3f}%")
+        print(f" → Precision: {precision:.4f}")
+        print(f" → Recall: {recall:.4f}")
+        print(f" → Specificity: {specificity:.4f}")
+        print(f"\nConfusion Matrix:")
+        print(f"                 Predicted Real  Predicted Fake")
+        print(f"    Actual Real      {int(tp):<15} {int(fn):<15}")
+        print(f"    Actual Fake      {int(fp):<15} {int(tn):<15}")
+        print(f"\nVote Distribution (Fake / Real):")
+        for i, mname in enumerate(model_names):
+            print(f"  {i+1:2d}. {mname:<25}: {int(vote_dist_np[i,0]):<6} / {int(vote_dist_np[i,1]):<6}")
+        print(f"{'='*70}")
+    
     return acc, vote_dist_np.tolist(), local_stats.cpu().tolist()
 
 # ================== UNIFIED FINAL EVALUATION ==================
-def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args):
+def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
+    if not is_main:
+        return 0.0, None, None
+
     model.eval()
     subset_dataset = test_loader_full.dataset 
 
@@ -442,7 +530,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
 
 # ================== MAIN FUNCTION ==================
 def main():
-    parser = argparse.ArgumentParser(description="Majority Voting Ensemble Evaluation (HARD VOTING) - Multi GPU + AdaBN")
+    parser = argparse.ArgumentParser(description="Majority Voting Ensemble Evaluation (HARD VOTING) - DDP + AdaBN")
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
@@ -459,123 +547,125 @@ def main():
         raise ValueError("Number of model_names must match model_paths")
 
     set_seed(args.seed)
-    
-    if not torch.cuda.is_available():
-        raise RuntimeError("GPU is not available! Please run this code on a machine with a GPU.")
-    
-    # 🔴 تشخیص تعداد GPU های موجود
-    world_size = torch.cuda.device_count()
-    if world_size < 2:
-        print(f"Warning: {world_size} GPU(s) detected. For full performance, 2 or more GPUs are recommended.")
-    
-    # استفاده از همه GPU های موجود
-    device_ids = list(range(world_size))
-    device = torch.device(f'cuda:{device_ids[0]}')  # cuda:0 به عنوان دستگاه اصلی
-    
-    print(f"Using {world_size} GPU(s): {device_ids}")
-    for idx in device_ids:
-        print(f" - GPU {idx}: {torch.cuda.get_device_name(idx)}")
+    device, local_rank, rank, world_size = setup_distributed()
+    is_main = (rank == 0)
+    is_distributed = (world_size > 1)
 
-    print("="*70)
-    print(f"MAJORITY VOTING ENSEMBLE EVALUATION (HARD VOTING) - Multi GPU")
-    print(f"Seed: {args.seed}")
-    print("="*70)
+    if is_main:
+        print("="*70)
+        print(f"MAJORITY VOTING ENSEMBLE EVALUATION (HARD VOTING) - DDP")
+        print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
+        print("="*70)
 
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
 
-    # ارسال world_size برای پوشاندن مدل‌ها با DataParallel
-    base_models = load_pruned_models(args.model_paths, device, world_size)
+    base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
     MEANS = MEANS[:len(base_models)]
     STDS = STDS[:len(base_models)]
 
-    # =================== فراخوانی دقیق تابع AdaBN ===================
+    # =================== فراخوانی AdaBN به صورت موازی ===================
     adabn_loader = create_adabn_dataloader(
-        args.data_dir, args.batch_size * world_size, num_workers=4 * world_size, # ضرب در تعداد GPU برای استفاده بهینه
-        dataset_type=args.dataset, seed=args.seed, is_main=True
+        args.data_dir, args.batch_size, num_workers=4,
+        dataset_type=args.dataset, seed=args.seed, is_main=is_main,
+        is_distributed=is_distributed
     )
-    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main=True)
+    adapt_batchnorm_for_new_dataset(
+        base_models, MEANS, STDS, adabn_loader, device, is_main,
+        is_distributed=is_distributed
+    )
     
     del adabn_loader
-    torch.cuda.empty_cache()
-    # ===============================================================
+    if is_main: torch.cuda.empty_cache()
+    # ====================================================================
 
     # ساخت انسامبل
     ensemble = MajorityVotingEnsemble(base_models, MEANS, STDS, freeze_models=True).to(device)
 
-    # 🔴 پوشاندن مدل انسامبل با DataParallel
-    if world_size > 1:
-        ensemble = nn.DataParallel(ensemble, device_ids=device_ids)
-
-    try:
-        train_loader, val_loader, test_loader = create_dataloaders(
-            args.data_dir, args.batch_size * world_size, dataset_type=args.dataset,
-            is_distributed=False, seed=args.seed, is_main=True)
-    except FileNotFoundError as e:
-        print(f"\n[ERROR] Dataset loading failed: {e}")
-        return
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        return
-
-    print("\n" + "="*70)
-    print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
-    print("="*70)
+    # ارزیابی مدل‌های منفرد فقط روی GPU اصلی
     individual_accs = []
-    for i, model in enumerate(base_models):
-        acc = evaluate_single_model(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i])
-        individual_accs.append(acc)
+    best_single = 0.0
+    best_idx = 0
+    test_loader = None
 
-    best_single = max(individual_accs) if individual_accs else 0.0
-    best_idx = individual_accs.index(best_single) if individual_accs else 0
-    print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+    if is_main:
+        print("\n" + "="*70)
+        print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
+        print("="*70)
+        
+        _, _, test_loader = create_dataloaders(
+            args.data_dir, args.batch_size, dataset_type=args.dataset,
+            is_distributed=False, seed=args.seed, is_main=True
+        )
 
-    ensemble_test_acc, vote_dist, stats = evaluate_ensemble_final(ensemble, test_loader, device, "Test", MODEL_NAMES)
+        for i, model in enumerate(base_models):
+            acc = evaluate_single_model(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i], is_main)
+            individual_accs.append(acc)
 
-    os.makedirs(args.save_dir, exist_ok=True)
+        best_single = max(individual_accs) if individual_accs else 0.0
+        best_idx = individual_accs.index(best_single) if individual_accs else 0
+        print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
 
-    print("\n" + "="*70)
-    print("FINAL ENSEMBLE EVALUATION (Unified - Hard Voting)")
-    print("="*70)
+    # همگام‌سازی قبل از ادامه
+    if is_dist():
+        dist.barrier()
 
-    _, _, test_loader_full = create_dataloaders(
-        args.data_dir, args.batch_size * world_size, dataset_type=args.dataset,
-        is_distributed=False, seed=args.seed, is_main=True
-    )
+    # ارزیابی انسامبل نهایی (فقط روی GPU اصلی)
+    if is_main:
+        ensemble_test_acc, vote_dist, stats = evaluate_ensemble_final(ensemble, test_loader, device, "Test", MODEL_NAMES, is_main)
 
-    final_acc, y_true, y_scores = final_evaluation_unified(
-        ensemble, test_loader_full, device, args.save_dir, MODEL_NAMES, args
-    )
+        os.makedirs(args.save_dir, exist_ok=True)
 
-    print("\n" + "="*70)
-    print("FINAL COMPARISON")
-    print("="*70)
-    print(f"Best Single Model: {best_single:.2f}%")
-    print(f"Ensemble Accuracy (Hard Voting): {final_acc:.2f}%")
-    print(f"Improvement: {final_acc - best_single:+.2f}%")
-    print("="*70)
+        print("\n" + "="*70)
+        print("FINAL ENSEMBLE EVALUATION (Unified - Hard Voting)")
+        print("="*70)
 
-    save_ensemble_checkpoint(os.path.join(args.save_dir, 'best_ensemble_model.pt'), ensemble, args.model_paths, MODEL_NAMES, final_acc, MEANS, STDS)
+        _, _, test_loader_full = create_dataloaders(
+            args.data_dir, args.batch_size, dataset_type=args.dataset,
+            is_distributed=False, seed=args.seed, is_main=True
+        )
 
-    final_results = {
-        'seed': args.seed,
-        'method': 'Majority Voting (Hard) + AdaBN',
-        'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
-        'ensemble': {'test_accuracy': float(final_acc), 'vote_distribution': {name: {'fake': int(d[0]), 'real': int(d[1])} for name, d in zip(MODEL_NAMES, vote_dist)}},
-        'improvement': float(final_acc - best_single)
-    }
-    with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
-        json.dump(final_results, f, indent=4)
+        final_acc, y_true, y_scores = final_evaluation_unified(
+            ensemble, test_loader_full, device, args.save_dir, MODEL_NAMES, args, is_main
+        )
 
-    plot_roc_and_f1(
-        ensemble,
-        test_loader_full, 
-        device, 
-        args.save_dir, 
-        MODEL_NAMES,
-        is_main=True
-    )
+        print("\n" + "="*70)
+        print("FINAL COMPARISON")
+        print("="*70)
+        print(f"Best Single Model: {best_single:.2f}%")
+        print(f"Ensemble Accuracy (Hard Voting): {final_acc:.2f}%")
+        print(f"Improvement: {final_acc - best_single:+.2f}%")
+        print("="*70)
+
+        save_ensemble_checkpoint(os.path.join(args.save_dir, 'best_ensemble_model.pt'), ensemble, args.model_paths, MODEL_NAMES, final_acc, MEANS, STDS)
+
+        final_results = {
+            'seed': args.seed,
+            'method': 'Majority Voting (Hard) + Distributed AdaBN',
+            'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
+            'ensemble': {'test_accuracy': float(final_acc), 'vote_distribution': {name: {'fake': int(d[0]), 'real': int(d[1])} for name, d in zip(MODEL_NAMES, vote_dist)}},
+            'improvement': float(final_acc - best_single)
+        }
+        with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
+            json.dump(final_results, f, indent=4)
+
+    # همگام‌سازی قبل از پاکسازی محیط توزیع‌شده
+    if is_dist():
+        dist.barrier()
+
+    cleanup_distributed()
+
+    # رسم ROC (فقط روی GPU اصلی)
+    if is_main:
+        plot_roc_and_f1(
+            ensemble,
+            test_loader_full, 
+            device, 
+            args.save_dir, 
+            MODEL_NAMES,
+            is_main=True
+        )
 
 if __name__ == "__main__":
     main()
