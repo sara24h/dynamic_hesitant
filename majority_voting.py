@@ -243,8 +243,9 @@ class MajorityVotingEnsemble(nn.Module):
             current_std = getattr(self.normalizations, f'std_{i}')
             x_n = x
             if not torch.all(current_std == 0):
-                x_n = self.normalization(x, i)
+                x_n = self.normalizations(x, i)  
             with torch.no_grad():
+
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
