@@ -14,9 +14,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import transforms as T
 from metrics_utils import plot_roc_and_f1
+# ایمپورت تابع جدید AdaBN
 from dataset_utils_p100 import (
     UADFVDataset, CustomGenAIDataset, NewGenAIDataset,
-    create_dataloaders, get_sample_info
+    create_dataloaders, create_adabn_dataloader, get_sample_info
 )
 from visualization_utils import generate_visualizations
 
@@ -34,7 +35,9 @@ def set_seed(seed: int = 42):
 
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
+
     if not is_main: return 0.0, None, None
+
     model.eval()
     
     base_dataset = test_loader_full.dataset
@@ -104,6 +107,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     total_samples = len(all_y_true)
     correct_count = TP + TN
     acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
+    
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
@@ -127,6 +131,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
         print(f"\n{'='*70}")
         print("MODEL ACTIVATION STATISTICS (Final Evaluation)")
         print(f"{'='*70}")
+        
         activation_threshold = 1e-4
         active_mask = (weights_np > activation_threshold).astype(float)
         activation_rates = active_mask.mean(axis=0) * 100
@@ -139,62 +144,60 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             act_pct = activation_rates[i]
             avg_w = avg_weights[i]
             max_w = max_weights[i]
-            bar_length = int(act_pct / 2)
-            bar = '█' * bar_length + '░' * (50 - bar_length)
             print(f"  {i+1:2d}. {name:<30}: {act_pct:6.2f}%  | {avg_w:.6f}  | {max_w:.6f}")
-            print(f"      [{bar}]")
-        
-        print(f"  {'-'*70}")
-        print(f"  {'Overall Average':<35} {activation_rates.mean():6.2f}%")
-        active_per_sample = active_mask.sum(axis=1)
-        print(f"\n  Active Models Per Sample:")
-        print(f"    Min:    {int(active_per_sample.min())}")
-        print(f"    Max:    {int(active_per_sample.max())}")
-        print(f"    Mean:   {active_per_sample.mean():.2f}")
-        print(f"    Median: {np.median(active_per_sample):.1f}")
-        
-        unique_counts, count_freq = np.unique(active_per_sample.astype(int), return_counts=True)
-        print(f"\n  Distribution of Active Model Count:")
-        for count, freq in zip(unique_counts, count_freq):
-            pct = 100.0 * freq / len(all_model_weights)
-            bar = '█' * int(pct / 2)
-            print(f"    {count} model(s): {freq:5d} samples ({pct:5.2f}%) {bar}")
-        print(f"{'='*70}\n")
         
         activation_stats = {
             "activation_rates_pct": {name: float(activation_rates[i]) for i, name in enumerate(model_names)},
             "average_weights": {name: float(avg_weights[i]) for i, name in enumerate(model_names)},
             "max_weights": {name: float(max_weights[i]) for i, name in enumerate(model_names)},
-            "active_per_sample_stats": {
-                "min": int(active_per_sample.min()), "max": int(active_per_sample.max()),
-                "mean": float(active_per_sample.mean()), "median": float(np.median(active_per_sample))
-            },
             "per_sample_weights": weights_np.tolist()
         }
         activation_json_path = os.path.join(save_dir, "model_activation_stats.json")
         with open(activation_json_path, 'w', encoding='utf-8') as f:
             json.dump(activation_stats, f, indent=2, ensure_ascii=False)
 
-    output_str = ["-" * 100, "SUMMARY STATISTICS:", "-" * 100, f"Accuracy: {acc:.2f}%", f"Precision: {precision:.4f}", f"Recall: {recall:.4f}", f"Specificity: {specificity:.4f}", "\nConfusion Matrix:", f"                 {'Predicted Real':<15} {'Predicted Fake':<15}", f"    Actual Real   {TP:<15} {FN:<15}", f"    Actual Fake   {FP:<15} {TN:<15}", f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)", f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)"]
+    output_str = []
+    output_str.append("-" * 100)
+    output_str.append("SUMMARY STATISTICS:")
+    output_str.append("-" * 100)
+    output_str.append(f"Accuracy: {acc:.2f}%")
+    output_str.append(f"Precision: {precision:.4f}")
+    output_str.append(f"Recall: {recall:.4f}")
+    output_str.append(f"Specificity: {specificity:.4f}")
+    output_str.append("\nConfusion Matrix:")
+    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
+    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
+    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
     output_str.extend(lines)
+    
     log_path = os.path.join(save_dir, 'prediction_log.txt')
-    with open(log_path, 'w') as f: f.write("\n".join(output_str))
+    with open(log_path, 'w') as f:
+        f.write("\n".join(output_str))
 
     y_true_np = np.array(all_y_true)
     y_score_np = np.array(all_y_score)
     y_pred_np = np.array(all_y_pred)
-    roc_json_path = os.path.join(save_dir, "roc_data_test.json")
-    with open(roc_json_path, 'w', encoding='utf-8') as f:
-        json.dump({"metadata": {"seed": args.seed, "dataset": args.dataset, "num_samples": int(total_samples), "positive_count": int(np.sum(y_true_np)), "negative_count": int(total_samples - np.sum(y_true_np)), "model": "fuzzy_hesitant_ensemble"}, "y_true": y_true_np.tolist(), "y_score": y_score_np.tolist(), "y_pred": y_pred_np.tolist()}, f, indent=2, ensure_ascii=False)
 
-    roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
-    with open(roc_txt_path, 'w', encoding='utf-8') as f:
-        f.write("y_true\ty_score\ty_pred\n")
-        for t, s, p in zip(y_true_np, y_score_np, y_pred_np): f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
+    roc_json_path = os.path.join(save_dir, "roc_data_test.json")
+    roc_data_json = {
+        "metadata": {
+            "seed": args.seed, "dataset": args.dataset, "num_samples": int(total_samples),
+            "positive_count": int(np.sum(y_true_np)), "negative_count": int(total_samples - np.sum(y_true_np)),
+            "model": "fuzzy_hesitant_ensemble"
+        },
+        "y_true": y_true_np.tolist(), "y_score": y_score_np.tolist(), "y_pred": y_pred_np.tolist()
+    }
+    with open(roc_json_path, 'w', encoding='utf-8') as f:
+        json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
 
     vis_dir = os.path.join(save_dir, 'visualizations')
-    generate_visualizations(model, test_loader_full, device, vis_dir, model_names, args.num_grad_cam_samples, args.num_lime_samples, args.dataset, is_main)
+    generate_visualizations(
+        model, test_loader_full, device, vis_dir, model_names,
+        args.num_grad_cam_samples, args.num_lime_samples,
+        args.dataset, is_main)
+
     return acc, y_true_np, y_score_np
+
 
 # ================== MODEL CLASSES ==================
 class MultiModelNormalization(nn.Module):
@@ -203,6 +206,7 @@ class MultiModelNormalization(nn.Module):
         for i, (m, s) in enumerate(zip(means, stds)):
             self.register_buffer(f'mean_{i}', torch.tensor(m).view(1, 3, 1, 1))
             self.register_buffer(f'std_{i}', torch.tensor(s).view(1, 3, 1, 1))
+
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
@@ -212,9 +216,12 @@ class HesitantFuzzyMembership(nn.Module):
         self.num_models = num_models
         self.num_memberships = num_memberships
         self.feature_net = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False), nn.BatchNorm2d(32), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1)
         )
         self.membership_generator = nn.Sequential(
@@ -241,15 +248,19 @@ class FuzzyHesitantEnsemble(nn.Module):
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
-        self.hesitant_fuzzy = HesitantFuzzyMembership(input_dim=128, num_models=self.num_models, num_memberships=num_memberships)
+        self.hesitant_fuzzy = HesitantFuzzyMembership(
+            input_dim=128, num_models=self.num_models, num_memberships=num_memberships)
         self.cum_weight_threshold = cum_weight_threshold
         self.hesitancy_threshold = hesitancy_threshold
+
         if freeze_models:
             for model in self.models:
                 model.eval()
-                for p in model.parameters(): p.requires_grad = False
+                for p in model.parameters():
+                    p.requires_grad = False
 
     def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
+        batch_size = final_weights.size(0)
         sorted_weights, sorted_indices = torch.sort(final_weights, dim=1, descending=True)
         cum_weights = torch.cumsum(sorted_weights, dim=1)
         mask = (cum_weights <= self.cum_weight_threshold).float()
@@ -270,16 +281,20 @@ class FuzzyHesitantEnsemble(nn.Module):
 
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
         active_models = torch.any(final_weights > 0, dim=0).nonzero(as_tuple=True)[0]
+
         for i in active_models:
             x_n = self.normalizations(x, i.item())
             with torch.no_grad():
                 out = self.models[i](x_n)
-                if isinstance(out, (tuple, list)): out = out[0]
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
             outputs[:, i] = out
 
         final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
-        if return_details: return final_output, final_weights, all_memberships, outputs
+        if return_details:
+            return final_output, final_weights, all_memberships, outputs
         return final_output, final_weights
+
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
@@ -287,10 +302,14 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
         from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     except ImportError:
         raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
+
     models = []
     if is_main: print(f"Loading {len(model_paths)} pruned models...")
     for i, path in enumerate(model_paths):
-        if not os.path.exists(path): continue
+        if not os.path.exists(path):
+            if is_main: print(f" [WARNING] File not found: {path}")
+            continue
+        if is_main: print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
         try:
             ckpt = torch.load(path, map_location='cpu', weights_only=False)
             model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
@@ -302,9 +321,12 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
     if len(models) == 0: raise ValueError("No models loaded!")
     return models
 
+
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
-def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType, name: str, mean: Tuple[float, float, float], std: Tuple[float, float, float], is_main: bool) -> float:
+def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
+                              name: str, mean: Tuple[float, float, float],
+                              std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
@@ -315,9 +337,11 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
+
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     real_total = len(loader.dataset)
-    if dist.is_initialized(): dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    if dist.is_initialized():             
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     acc = 100. * correct_tensor.item() / real_total
     if is_main: print(f" {name}: {acc:.2f}%")
     return acc
@@ -331,13 +355,17 @@ def evaluate_accuracy_ddp(model, loader, device):
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
+    
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     real_total = len(loader.dataset)
-    if dist.is_initialized(): dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    if dist.is_initialized():            
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     return 100. * correct_tensor.item() / real_total
 
+
 # ================== TRAINING ==================
-def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr, device, save_dir, is_main, model_names):
+def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
+                        device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -345,14 +373,23 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     criterion = nn.BCEWithLogitsLoss()
     best_val_acc = 0.0
 
+    if is_main:
+        print("="*70)
+        print("Training Fuzzy Hesitant Network")
+        print("="*70)
+        print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
+        print(f"Epochs: {num_epochs} | Initial LR: {lr}")
+        print(f"Hesitant memberships per model: {hesitant_net.num_memberships}")
+        print(f"Number of models: {len(model_names)}\n")
+
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
         
-        # --- اصلاح باگ BatchNorm ---
         hesitant_net.train()
+        
         base_models = ensemble_model.module.models if hasattr(ensemble_model, 'module') else ensemble_model.models
-        for m in base_models: m.eval()
-        # ---------------------------
+        for m in base_models:
+            m.eval()
             
         train_loss = 0.0
         train_correct = 0
@@ -362,7 +399,8 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         for images, labels in pbar:
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
-            outputs, _, _, _ = ensemble_model(images, return_details=True)
+            
+            outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
             optimizer.step()
@@ -374,38 +412,21 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             train_total += batch_size
 
         train_acc = 100. * train_correct / train_total
+        train_loss = train_loss / train_total
+        
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         scheduler.step()
 
         if is_main:
-            print(f"\nEpoch {epoch+1}/{num_epochs} | Train Loss: {train_loss/train_total:.4f} | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
+            print(f"\nEpoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
 
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save({'hesitant_state_dict': hesitant_net.state_dict()}, os.path.join(save_dir, 'best_hesitant_fuzzy.pt'))
-            print(f"✓ Best model saved → {val_acc:.2f}%")
+            save_path = os.path.join(save_dir, 'best_hesitant_fuzzy.pt')
+            torch.save({'hesitant_state_dict': hesitant_net.state_dict()}, save_path)
+            print(f"✓ Best model saved → {val_acc:.2f}%\n")
 
     return best_val_acc
-
-# ================== BATCHNORM ADAPTATION (AdaBN) ==================
-@torch.no_grad()
-def adapt_batchnorm_for_new_dataset(models, means, stds, train_loader_clean, device, is_main):
-    if is_main:
-        print("\n" + "="*70)
-        print("STARTING BATCHNORM ADAPTATION (AdaBN) ON CLEAN DATA")
-        print("="*70)
-        
-    normalizer = MultiModelNormalization(means, stds).to(device)
-    for model in models: model.train() 
-        
-    for images, _ in tqdm(train_loader_clean, desc="Adapting BN", disable=not is_main):
-        images = images.to(device)
-        for i, model in enumerate(models):
-            x_n = normalizer(images, i)
-            model(x_n) 
-            
-    for model in models: model.eval()
-    if is_main: print("✅ BatchNorm Adaptation Completed!\n")
 
 
 # ================== DISTRIBUTED SETUP ==================
@@ -427,16 +448,50 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-# ================== BATCHNORM ADAPTATION (AdaBN) ==================
-# (تابع AdaBN اینجا قرار دارد)
-
-
-
+# ================== FIXED: BATCHNORM ADAPTATION (AdaBN) ==================
+@torch.no_grad()
+def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main):
+    """
+    اعمال AdaBN با دیتالودر بدون augmentation.
+    فقط آمار BN آپدیت می‌شود، نه وزن‌ها.
+    """
+    if is_main:
+        print("\n" + "="*70)
+        print("STARTING BATCHNORM ADAPTATION (AdaBN) - CLEAN DATA (NO AUGMENTATION)")
+        print("="*70)
+        
+    normalizer = MultiModelNormalization(means, stds).to(device)
+    
+    for model in models:
+        model.eval()  # قطع شدن Dropout و لایه‌های غیرقطعی
+        # ریست کردن آمار قبلی و تنظیم برای محاسبه آمار تجمعی (Cumulative)
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.reset_running_stats()
+                m.momentum = None  # محاسبه میانگین/واریانس گلبال
+                m.train()          # فقط BN در حالت train باشد
+                
+    for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
+        images = images.to(device)
+        for i, model in enumerate(models):
+            x_n = normalizer(images, i)
+            model(x_n)  # فقط یک forward pass برای آپدیت آمار BN
+            
+    # برگرداندن momentum به حالت پیش‌فرض و مدل به حالت eval
+    for model in models:
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.momentum = 0.1
+        model.eval()
+        
+    if is_main:
+        print("✅ BatchNorm Adaptation Completed!\n")
 
 
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Optimized Fuzzy Hesitant Ensemble Training")
+  
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -446,54 +501,159 @@ def main():
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
     parser.add_argument('--seed', type=int, default=42)
+    
     parser.add_argument('--num_memberships', type=int, default=3)
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
+    
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
+    
     args = parser.parse_args()
 
+    if len(args.model_names) != len(args.model_paths):
+        raise ValueError("Number of model_names must match model_paths")
+
     set_seed(args.seed)
+    
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
 
-    MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)][:len(args.model_paths)]
-    STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)][:len(args.model_paths)]
+    if is_main:
+        print("="*70)
+        print(f"OPTIMIZED FUZZY HESITANT ENSEMBLE TRAINING")
+        print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
+        print("="*70 + "\n")
+
+    DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
+    DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+    
+    num_models = len(args.model_paths)
+    if num_models > len(DEFAULT_MEANS):
+        MEANS = DEFAULT_MEANS + [DEFAULT_MEANS[-1]] * (num_models - len(DEFAULT_MEANS))
+        STDS = DEFAULT_STDS + [DEFAULT_STDS[-1]] * (num_models - len(DEFAULT_STDS))
+    else:
+        MEANS = DEFAULT_MEANS[:num_models]
+        STDS = DEFAULT_STDS[:num_models]
 
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    ensemble = FuzzyHesitantEnsemble(base_models, MEANS, STDS, num_memberships=args.num_memberships, freeze_models=True, cum_weight_threshold=args.cum_weight_threshold, hesitancy_threshold=args.hesitancy_threshold).to(device)
-    if world_size > 1: ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
+    # ===== 1. ساخت دیتالودر مخصوص AdaBN (بدون Augmentation) =====
+    # برای جلوگیری از تداخل در DDP، is_distributed=False می‌گذاریم تا هر پردازش تمام داده‌ها را ببیند
+    adabn_loader = create_adabn_dataloader(
+        args.data_dir, args.batch_size, num_workers=4,
+        dataset_type=args.dataset, seed=args.seed, is_main=is_main
+    )
 
-    # دریافت 4 خروجی (شامل دیتالودر تمیز)
-    train_loader, val_loader, test_loader, train_loader_clean = create_dataloaders(args.data_dir, args.batch_size, dataset_type=args.dataset, is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
+    # ===== 2. اعمال AdaBN قبل از ساخت Ensemble =====
+    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main)
 
-    # ===== اعمال AdaBN روی داده‌های تمیز =====
-    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, train_loader_clean, device, is_main)
-    # =======================================
+    # ===== 3. ساخت Ensemble با مدل‌های تطبیق‌یافته =====
+    ensemble = FuzzyHesitantEnsemble(
+        base_models, MEANS, STDS,
+        num_memberships=args.num_memberships, 
+        freeze_models=True,
+        cum_weight_threshold=args.cum_weight_threshold,
+        hesitancy_threshold=args.hesitancy_threshold
+    ).to(device)
+
+    if world_size > 1:
+        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
+
+    if is_main:
+        trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in ensemble.parameters())
+        print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
+
+    # ===== 4. دیتالودرهای اصلی (با Augmentation برای آموزش شبکه فازی) =====
+    train_loader, val_loader, test_loader = create_dataloaders(
+        args.data_dir, args.batch_size, dataset_type=args.dataset,
+        is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
+
+    if is_main:
+        print("\n" + "="*70)
+        print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
+        print("="*70)
 
     individual_accs = []
     for i, model in enumerate(base_models):
-        acc = evaluate_single_model_ddp(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i], is_main)
+        acc = evaluate_single_model_ddp(
+            model, test_loader, device,
+            f"Model {i+1} ({MODEL_NAMES[i]})",
+            MEANS[i], STDS[i], is_main)
         individual_accs.append(acc)
+
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
 
-    train_hesitant_fuzzy(ensemble, train_loader, val_loader, args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
+    if is_main:
+        print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+        print("="*70)
+
+    best_val_acc = train_hesitant_fuzzy(
+        ensemble, train_loader, val_loader,
+        args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
+    
     if is_main and os.path.exists(ckpt_path):
-        ensemble_module.hesitant_fuzzy.load_state_dict(torch.load(ckpt_path, map_location=device)['hesitant_state_dict'])
+        ckpt = torch.load(ckpt_path, map_location=device)
+        ensemble_module.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
+        print("Best model loaded.\n")
 
     if is_main:
-        _, _, test_loader_full, _ = create_dataloaders(args.data_dir, args.batch_size, dataset_type=args.dataset, is_distributed=False, seed=args.seed, is_main=True)
-        final_acc, _, _ = final_evaluation_unified(ensemble_module, test_loader_full, device, args.save_dir, MODEL_NAMES, args, is_main)
-        
-        torch.save({'ensemble_state_dict': ensemble_module.state_dict(), 'model_names': MODEL_NAMES, 'means': MEANS, 'stds': STDS, 'seed': args.seed}, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
-        
-        plot_roc_and_f1(ensemble_module, test_loader_full, device, args.save_dir, MODEL_NAMES, is_main)
+        print("\n" + "="*70)
+        print("FINAL ENSEMBLE EVALUATION")
+        print("="*70)
+
+        _, _, test_loader_full = create_dataloaders(
+            args.data_dir, args.batch_size, dataset_type=args.dataset,
+            is_distributed=False, seed=args.seed, is_main=True
+        )
+
+        final_acc, y_true, y_scores = final_evaluation_unified(
+            ensemble_module, test_loader_full, device, args.save_dir, MODEL_NAMES, args, is_main
+        )
+
+        print("\n" + "="*70)
+        print("FINAL COMPARISON")
+        print("="*70)
+        print(f"Best Single Model: {best_single:.2f}%")
+        print(f"Ensemble Accuracy: {final_acc:.2f}%")
+        print(f"Improvement: {final_acc - best_single:+.2f}%")
+        print("="*70)
+
+        final_results = {
+            'seed': args.seed,
+            'method': 'Fuzzy_Hesitant',
+            'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
+            'ensemble': {'test_accuracy': float(final_acc)},
+            'improvement': float(final_acc - best_single)
+        }
+        with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
+            json.dump(final_results, f, indent=4)
+
+        torch.save({
+            'ensemble_state_dict': ensemble_module.state_dict(),
+            'model_names': MODEL_NAMES,
+            'means': MEANS,
+            'stds': STDS,
+            'seed': args.seed
+        }, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
+
+    cleanup_distributed()
+    
+    if is_main:
+        plot_roc_and_f1(
+            ensemble_module,
+            test_loader_full, 
+            device, 
+            args.save_dir, 
+            MODEL_NAMES,
+            is_main
+        )
 
 if __name__ == "__main__":
     main()
