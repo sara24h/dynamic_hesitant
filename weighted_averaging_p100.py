@@ -12,7 +12,16 @@ import json
 import random
 
 from metrics_utils import plot_roc_and_f1
-from dataset_utils import create_dataloaders
+
+# =================== اصلاح ایمپورت برای پشتیبانی از AdaBN ===================
+try:
+    from dataset_utils import create_dataloaders, create_adabn_dataloader
+except ImportError:
+    from dataset_utils import create_dataloaders
+    create_adabn_dataloader = None
+    print("[Warning] 'create_adabn_dataloader' not found in dataset_utils. AdaBN will be skipped.")
+# ============================================================================
+
 from visualization_utils import generate_visualizations
 
 warnings.filterwarnings("ignore")
@@ -37,6 +46,50 @@ class MultiModelNormalization(nn.Module):
 
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
+
+
+# =====================================================================
+# ================== BATCHNORM ADAPTATION (AdaBN) ====================
+# =====================================================================
+# تابع دقیقاً مشابه کد Fuzzy
+@torch.no_grad()
+def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True):
+    """
+    اعمال AdaBN با دیتالودر بدون augmentation.
+    فقط آمار BN آپدیت می‌شود، نه وزن‌ها.
+    """
+    if is_main:
+        print("\n" + "="*70)
+        print("STARTING BATCHNORM ADAPTATION (AdaBN) - CLEAN DATA (NO AUGMENTATION)")
+        print("="*70)
+        
+    normalizer = MultiModelNormalization(means, stds).to(device)
+    
+    for model in models:
+        model.eval()  # قطع شدن Dropout و لایه‌های غیرقطعی
+        # ریست کردن آمار قبلی و تنظیم برای محاسبه آمار تجمعی (Cumulative)
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.reset_running_stats()
+                m.momentum = None  # محاسبه میانگین/واریانس گلبال
+                m.train()          # فقط BN در حالت train باشد
+                
+    for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
+        images = images.to(device)
+        for i, model in enumerate(models):
+            x_n = normalizer(images, i)
+            model(x_n)  # فقط یک forward pass برای آپدیت آمار BN
+            
+    # برگرداندن momentum به حالت پیش‌فرض و مدل به حالت eval
+    for model in models:
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.momentum = 0.1
+        model.eval()
+        
+    if is_main:
+        print("✅ BatchNorm Adaptation Completed!\n")
+# =====================================================================
 
 
 # ================== WEIGHTED AVERAGING ENSEMBLE ==================
@@ -187,7 +240,6 @@ def evaluate_ensemble_final(model, loader, device, name, model_names):
 
 
 # ================== TRAINING FUNCTION ==================
-# ================== TRAINING FUNCTION ==================
 def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, model_names):
     os.makedirs(save_dir, exist_ok=True)
@@ -205,8 +257,6 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
     print("="*70)
 
     for epoch in range(num_epochs):
-        # ✅ اصلاح باگ: فقط پارامتر وزن‌ها را در حالت Train قرار دهید
-        # تا BatchNorm های مدل‌های فریز شده خراب نشوند
         ensemble_model.train()
         for model in ensemble_model.models:
             model.eval() 
@@ -227,7 +277,6 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
             batch_size = images.size(0)
             train_loss += loss.item() * batch_size
             
-            # ✅ اصلاح خوانایی: تبدیل لاجیت به احتمال برای محاسبه دقت
             probs = torch.sigmoid(outputs.squeeze(1))
             pred = (probs > 0.5).long()
             train_correct += pred.eq(labels.long()).sum().item()
@@ -238,7 +287,6 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         
         current_weights = F.softmax(weights_param, dim=0).detach().cpu()
         
-        # ✅ ارزیابی روی ولیدیشن (مدل به طور کامل در حالت eval است)
         val_acc = evaluate_accuracy(ensemble_model, val_loader, device)
         scheduler.step()
 
@@ -311,7 +359,6 @@ def main():
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
     
-    # فقط دیتاست‌های غیر از wild مجاز هستند
     parser.add_argument('--dataset', type=str, required=True,
                        choices=['deepfake_lab', 'hard_fake_real', 'real_fake_dataset', 'uadfV', 
                                 'custom_genai', 'custom_genai_v2', 'real_fake', 'deepflux'])
@@ -327,7 +374,6 @@ def main():
 
     set_seed(args.seed)
     
-    # تنظیمات تک GPU
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
@@ -339,7 +385,6 @@ def main():
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
-    # بررسی دقیق تعداد Mean و Std
     if len(args.model_paths) != len(MEANS) or len(args.model_paths) != len(STDS):
         raise ValueError(
             f"Number of models ({len(args.model_paths)}) must exactly match "
@@ -349,6 +394,20 @@ def main():
 
     base_models = load_pruned_models(args.model_paths, device)
     MODEL_NAMES = args.model_names[:len(base_models)]
+
+    # =================== فراخوانی دقیق تابع AdaBN ===================
+    if create_adabn_dataloader is not None:
+        adabn_loader = create_adabn_dataloader(
+            args.data_dir, args.batch_size, num_workers=args.num_workers,
+            dataset_type=args.dataset, seed=args.seed, is_main=True
+        )
+        adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main=True)
+        
+        del adabn_loader
+        torch.cuda.empty_cache()
+    else:
+        print("\n[INFO] Skipping AdaBN because 'create_adabn_dataloader' is missing in dataset_utils.py")
+    # ===============================================================
 
     # ساخت انسامبل (بدون DDP)
     ensemble = WeightedAverageEnsemble(
@@ -361,7 +420,7 @@ def main():
         dataset_type=args.dataset, is_distributed=False, seed=args.seed, is_main=True
     )
 
-    print("\n" + "="*70); print("INDIVIDUAL MODEL PERFORMANCE"); print("="*70)
+    print("\n" + "="*70); print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)"); print("="*70)
     individual_accs = []
     for i, model in enumerate(base_models):
         acc = evaluate_single_model(
@@ -377,7 +436,7 @@ def main():
         ensemble, train_loader, val_loader,
         args.epochs, args.lr, device, args.save_dir, MODEL_NAMES)
 
-    # لود کردن بهترین وزن‌ها (بدون نیاز به barrier در تک GPU)
+    # لود کردن بهترین وزن‌ها
     ckpt_path = os.path.join(args.save_dir, 'best_weighted_ensemble.pt')
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -407,7 +466,7 @@ def main():
     save_accuracy_log_from_results(y_true, y_pred, log_path, "Weighted Ensemble")
 
     final_results = {
-        'seed': args.seed, 'method': 'Weighted_Average',
+        'seed': args.seed, 'method': 'Weighted_Average_AdaBN',
         'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
         'ensemble': {'test_accuracy': float(ensemble_test_acc), 'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)}},
         'improvement': float(ensemble_test_acc - best_single), 'training_history': history
