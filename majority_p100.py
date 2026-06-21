@@ -13,6 +13,8 @@ import random
 import matplotlib.pyplot as plt
 import cv2
 
+from metrics_utils import plot_roc_and_f1
+
 warnings.filterwarnings("ignore")
 
 # =================== بخش ایمپورت دیتاست ===================
@@ -21,14 +23,14 @@ try:
         UADFVDataset, 
         CustomGenAIDataset, 
         create_dataloaders, 
-        create_adabn_dataloader,  # <--- اضافه شدن ایمپورت تابع AdaBN
+        create_adabn_dataloader, # <--- اضافه شد
         get_sample_info, 
         worker_init_fn
     )
 except ImportError:
     print("Warning: 'dataset_utils_p100.py' not found. Using dummy functions.")
     def create_dataloaders(*args, **kwargs): return None, None, None
-    def create_adabn_dataloader(*args, **kwargs): return None # <--- تابع_dummy
+    def create_adabn_dataloader(*args, **kwargs): return None # <--- اضافه شد
     def get_sample_info(*args, **kwargs): return "dummy_path", 0
     def worker_init_fn(*args, **kwargs): pass
     class UADFVDataset(torch.utils.data.Dataset):
@@ -99,6 +101,51 @@ class MultiModelNormalization(nn.Module):
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
+
+# =====================================================================
+# ================== BATCHNORM ADAPTATION (AdaBN) ====================
+# =====================================================================
+# این تابع دقیقاً کپی شده از کد Fuzzy شماست
+@torch.no_grad()
+def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True):
+    """
+    اعمال AdaBN با دیتالودر بدون augmentation.
+    فقط آمار BN آپدیت می‌شود، نه وزن‌ها.
+    """
+    if is_main:
+        print("\n" + "="*70)
+        print("STARTING BATCHNORM ADAPTATION (AdaBN) - CLEAN DATA (NO AUGMENTATION)")
+        print("="*70)
+        
+    normalizer = MultiModelNormalization(means, stds).to(device)
+    
+    for model in models:
+        model.eval()  # قطع شدن Dropout و لایه‌های غیرقطعی
+        # ریست کردن آمار قبلی و تنظیم برای محاسبه آمار تجمعی (Cumulative)
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.reset_running_stats()
+                m.momentum = None  # محاسبه میانگین/واریانس گلبال
+                m.train()          # فقط BN در حالت train باشد
+                
+    for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
+        images = images.to(device)
+        for i, model in enumerate(models):
+            x_n = normalizer(images, i)
+            model(x_n)  # فقط یک forward pass برای آپدیت آمار BN
+            
+    # برگرداندن momentum به حالت پیش‌فرض و مدل به حالت eval
+    for model in models:
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.momentum = 0.1
+        model.eval()
+        
+    if is_main:
+        print("✅ BatchNorm Adaptation Completed!\n")
+# =====================================================================
+
+
 # ================== MAJORITY VOTING ENSEMBLE CLASS ==================
 class MajorityVotingEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
@@ -168,40 +215,6 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
     if len(models) == 0: raise ValueError("No models loaded!")
     print(f"All {len(models)} models loaded!\n")
     return models
-
-# ================== ADABN FUNCTION ==================
-@torch.no_grad()
-def apply_adabn(models: List[nn.Module], adabn_loader: DataLoader, device: torch.device, means: List, stds: List):
-    """
-    Adaptive Batch Normalization (AdaBN)
-    Updates running mean and variance of BN layers based on target dataset distribution.
-    """
-    print("\n" + "="*70)
-    print("APPLYING ADAPTIVE BATCH NORMALIZATION (AdaBN)")
-    print("="*70)
-    
-    normalizer = MultiModelNormalization(means, stds).to(device)
-
-    for i, model in enumerate(models):
-        # قرار دادن مدل در حالت train تا آمارهای BatchNorm آپدیت شود
-        model.train() 
-        
-        print(f"Calibrating Model {i+1}/{len(models)}...")
-        for images, _ in tqdm(adabn_loader, desc=f"AdaBN Model {i+1}"):
-            images = images.to(device)
-            # نرمالسازی مخصوص همان مدل اعمال می‌شود
-            images = normalizer(images, i)
-            # Forward pass برای آپدیت آمارهای BN (گرادیان محاسبه نمی‌شود)
-            out = model(images)
-            if isinstance(out, (tuple, list)):
-                _ = out[0] 
-
-        # برگرداندن مدل به حالت eval
-        model.eval()
-        print(f"✅ Model {i+1} BN stats updated successfully.")
-
-    print("AdaBN calibration completed for all models!")
-    print("="*70 + "\n")
 
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
@@ -289,6 +302,8 @@ def evaluate_ensemble_final(model, loader, device, name, model_names):
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args):
     model.eval()
+    
+    # استفاده مستقیم از subset_dataset که دارای ترنسفورم‌های اعمال شده است
     subset_dataset = test_loader_full.dataset 
 
     lines = []
@@ -302,25 +317,34 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     TP, TN, FP, FN = 0, 0, 0, 0
     
     all_y_true = []
-    all_y_score = [] 
-    all_y_pred = []  
+    all_y_score = [] # برای ROC از Soft Probability استفاده می‌کنیم
+    all_y_pred = []  # برای Accuracy از Hard Voting استفاده می‌کنیم
     
     print(f"\nRunning Unified Final Evaluation on {len(subset_dataset)} samples...")
     
     with torch.no_grad():
         for i in tqdm(range(len(subset_dataset)), desc="Final Eval"):
             try:
+                # 1. دریافت تصویر ترنسفورم شده (تنسور) و لیبل از subset
                 image, label = subset_dataset[i]
+                
+                # 2. یافتن مسیر فایل از طریق ایندکس اصلی دیتاست بیس
                 original_idx = subset_dataset.indices[i]
                 path, _ = get_sample_info(subset_dataset, original_idx)
             except Exception as e:
                 continue
 
+            # حالا image یک تنسور است و دیگر ارور نمی‌دهد
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
+            # خروجی‌ها: final_decision, weights, avg_probs, stacked_logits
             decision, _, avg_probs, stacked_logits = model(image, return_details=True)
+            
+            # پیش‌بینی نهایی بر اساس Hard Voting
             pred_int = int(decision.squeeze().item())
+            
+            # امتیاز برای ROC (میانگین احتمالات)
             score_for_roc = avg_probs.squeeze().item()
             
             all_y_true.append(label_int)
@@ -343,6 +367,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     total_samples = len(all_y_true)
     correct_count = TP + TN
     acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
+    
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
@@ -396,7 +421,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             "num_samples": int(total_samples),
             "positive_count": int(np.sum(y_true_np)),
             "negative_count": int(total_samples - np.sum(y_true_np)),
-            "model": "majority_voting_ensemble_HARD_AdaBN" # اصلاح نام در متادیتا
+            "model": "majority_voting_ensemble_HARD_AdaBN"
         },
         "y_true": y_true_np.tolist(),
         "y_score": y_score_np.tolist(),
@@ -438,7 +463,6 @@ def main():
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--use_adabn', action='store_true', help="Flag to apply Adaptive Batch Normalization before evaluation")
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
@@ -446,15 +470,16 @@ def main():
 
     set_seed(args.seed)
     
+    # تنظیم دستگاه به صورت صریح روی یک عدد GPU
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is not available! Please run this code on a machine with a GPU.")
     
-    device = torch.device('cuda:0') 
+    device = torch.device('cuda:0')  # استفاده از اولین GPU موجود
     print(f"Using device: {device} ({torch.cuda.get_device_name(0)})")
 
     print("="*70)
     print(f"MAJORITY VOTING ENSEMBLE EVALUATION (HARD VOTING) - Single GPU")
-    print(f"Seed: {args.seed} | AdaBN Enabled: {args.use_adabn}")
+    print(f"Seed: {args.seed}")
     print("="*70)
 
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
@@ -465,28 +490,24 @@ def main():
     MEANS = MEANS[:len(base_models)]
     STDS = STDS[:len(base_models)]
 
-    # =================== بخش اعمال AdaBN ===================
-    if args.use_adabn:
-        try:
-            print("\n[AdaBN] Creating AdaBN DataLoader (Clean Train Data)...")
-            adabn_loader = create_adabn_dataloader(
-                args.data_dir, args.batch_size, num_workers=4,
-                dataset_type=args.dataset, seed=args.seed, is_main=True
-            )
-            # اعمال کالیبراسیون روی مدل‌های پایه (قبل از وارد کردن آن‌ها به کلاس انسامبل)
-            apply_adabn(base_models, adabn_loader, device, MEANS, STDS)
-            
-            # پاک کردن حافظه دیتالودر AdaBN
-            del adabn_loader
-            torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"[WARNING] AdaBN failed to apply. Falling back to original BN stats. Error: {e}")
-    # =========================================================
+    # =================== فراخوانی دقیق تابع AdaBN ===================
+    adabn_loader = create_adabn_dataloader(
+        args.data_dir, args.batch_size, num_workers=4,
+        dataset_type=args.dataset, seed=args.seed, is_main=True
+    )
+    # فراخوانی تابع دقیقاً مشابه کد Fuzzy شما
+    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main=True)
+    
+    # آزادسازی حافظه دیتالودر AdaBN
+    del adabn_loader
+    torch.cuda.empty_cache()
+    # ===============================================================
 
-    # ساخت انسامبل (مدل‌ها در کلاس انسامبل مجدداً eval می‌شوند که کاملاً استاندارد است)
+    # ساخت انسامبل (مدل‌ها داخل این کلاس فریز می‌شوند)
     ensemble = MajorityVotingEnsemble(base_models, MEANS, STDS, freeze_models=True).to(device)
 
     try:
+        # قرار دادن is_distributed=False چون فقط روی یک GPU ران می شود
         train_loader, val_loader, test_loader = create_dataloaders(
             args.data_dir, args.batch_size, dataset_type=args.dataset,
             is_distributed=False, seed=args.seed, is_main=True)
@@ -499,7 +520,7 @@ def main():
         return
 
     print("\n" + "="*70)
-    print("INDIVIDUAL MODEL PERFORMANCE")
+    print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
     print("="*70)
     individual_accs = []
     for i, model in enumerate(base_models):
@@ -539,7 +560,7 @@ def main():
 
     final_results = {
         'seed': args.seed,
-        'method': 'Majority Voting (Hard)' + (' + AdaBN' if args.use_adabn else ''),
+        'method': 'Majority Voting (Hard) + AdaBN',
         'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
         'ensemble': {'test_accuracy': float(final_acc), 'vote_distribution': {name: {'fake': int(d[0]), 'real': int(d[1])} for name, d in zip(MODEL_NAMES, vote_dist)}},
         'improvement': float(final_acc - best_single)
@@ -547,18 +568,14 @@ def main():
     with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
         json.dump(final_results, f, indent=4)
 
-    try:
-        from metrics_utils import plot_roc_and_f1
-        plot_roc_and_f1(
-            ensemble,
-            test_loader_full, 
-            device, 
-            args.save_dir, 
-            MODEL_NAMES,
-            is_main=True
-        )
-    except Exception as e:
-        print(f"Could not generate ROC/F1 plots: {e}")
+    plot_roc_and_f1(
+        ensemble,
+        test_loader_full, 
+        device, 
+        args.save_dir, 
+        MODEL_NAMES,
+        is_main=True
+    )
 
 if __name__ == "__main__":
     main()
