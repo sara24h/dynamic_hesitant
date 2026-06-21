@@ -17,6 +17,7 @@ warnings.filterwarnings("ignore")
 from dataset_utils_p100 import (
     UADFVDataset, 
     create_dataloaders, 
+    create_adabn_dataloader,  # <-- این خط اضافه شد
     get_sample_info, 
     worker_init_fn
 )
@@ -331,8 +332,14 @@ def main():
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=False, seed=args.seed, is_main=is_main)
 
-    # ===== اعمال AdaBN قبل از شروع ارزیابی و آموزش =====
-    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, train_loader, device, is_main)
+# ===== استفاده از لودر تمیز برای AdaBN =====
+    adabn_loader = create_adabn_dataloader(
+        args.data_dir, args.batch_size, num_workers=0,
+        dataset_type=args.dataset, seed=args.seed, is_main=is_main
+    )
+
+    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main)
+# =================================================
     # =================================================
 
     print("\n" + "="*70)
