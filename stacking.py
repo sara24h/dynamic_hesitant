@@ -20,6 +20,7 @@ from dataset_utils import (
     UADFVDataset, 
     CustomGenAIDataset, 
     create_dataloaders, 
+    create_adabn_dataloader, 
     get_sample_info, 
     worker_init_fn
 )
@@ -596,20 +597,28 @@ def main():
         MODEL_NAMES = args.model_names[:len(base_models)]
 
         # =================== فراخوانی و اعمال AdaBN ===================
-        adabn_train_loader, _, _ = create_dataloaders(
-            args.data_dir, args.batch_size, dataset_type=args.dataset,
-            is_distributed=is_distributed, 
-            seed=current_seed, is_main=is_main
+                # =================== فراخوانی و اعمال AdaBN ===================
+        # استفاده از تابع اختصاصی AdaBN که در dataset_utils.py قرار دارد
+        adabn_loader = create_adabn_dataloader(
+            base_dir=args.data_dir, 
+            batch_size=args.batch_size, 
+            num_workers=4,
+            dataset_type=args.dataset, 
+            seed=current_seed, 
+            is_main=is_main,
+            is_distributed=is_distributed  # <-- این باعث میشه داده بین 2 گرافیک تقسیم بشه
         )
-        adabn_loader = adabn_train_loader
         
+        # اعمال AdaBN به صورت موازی روی هر دو گرافیک
         adapt_batchnorm_for_new_dataset(
             base_models, MEANS, STDS, adabn_loader, device, is_main=is_main,
-            is_distributed=is_distributed
+            is_distributed=is_distributed  # <-- ارسال پرچم توزیع شده به تابع آداپت
         )
         
-        del adabn_train_loader, adabn_loader
+        # پاکسازی حافظه
+        del adabn_loader
         torch.cuda.empty_cache()
+        # ===============================================================
         # ===============================================================
 
         ensemble = StackingEnsemble(
