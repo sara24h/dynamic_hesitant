@@ -133,10 +133,6 @@ class MultiModelNormalization(nn.Module):
 # =====================================================================
 @torch.no_grad()
 def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True, is_distributed=False):
-    """
-    اعمال AdaBN به صورت موازی روی چندین GPU.
-    اگر is_distributed=True باشد، از فرمول محاسبه واریانس موازی (Parallel Variance) استفاده می‌کند.
-    """
     if is_main:
         print("\n" + "="*70)
         print(f"STARTING BATCHNORM ADAPTATION (AdaBN) - Mode: {'Distributed' if is_distributed else 'Single GPU'}")
@@ -145,12 +141,11 @@ def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, i
     normalizer = MultiModelNormalization(means, stds).to(device)
     
     if is_distributed:
-        # =================== منطق چند GPU ===================
         accumulators = [{} for _ in models]
         hooks = []
         
         for i, model in enumerate(models):
-            model.eval() # مدل در حالت eval میماند تا dropout خاموش شود
+            model.eval()
             for name, m in model.named_modules():
                 if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
                     accumulators[i][name] = {
@@ -163,10 +158,8 @@ def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, i
                         def hook(module, inp, out):
                             x = inp[0]
                             n = x.numel() / x.size(1) 
-                            
                             mean = x.mean(dim=[0, 2, 3])
                             var = x.var(dim=[0, 2, 3], unbiased=False) 
-                            
                             accumulators[model_idx][layer_name]['n'] += n
                             accumulators[model_idx][layer_name]['sum_mean'] += mean * n
                             accumulators[model_idx][layer_name]['sum_x2'] += (var * n) + (mean ** 2 * n)
@@ -190,7 +183,6 @@ def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, i
             for name, m in model.named_modules():
                 if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
                     acc = accumulators[i][name]
-                    
                     dist.all_reduce(acc['n'], op=dist.ReduceOp.SUM)
                     dist.all_reduce(acc['sum_mean'], op=dist.ReduceOp.SUM)
                     dist.all_reduce(acc['sum_x2'], op=dist.ReduceOp.SUM)
@@ -206,7 +198,6 @@ def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, i
         if is_main: print("✅ Distributed BatchNorm Adaptation Completed!\n")
 
     else:
-        # =================== منطق تک GPU ===================
         for model in models:
             actual_model = model.module if hasattr(model, 'module') else model
             actual_model.eval()  
@@ -232,7 +223,6 @@ def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, i
         if is_main: print("✅ BatchNorm Adaptation Completed!\n")
 # =====================================================================
 
-
 # ================== MAJORITY VOTING ENSEMBLE CLASS ==================
 class MajorityVotingEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
@@ -253,7 +243,7 @@ class MajorityVotingEnsemble(nn.Module):
             current_std = getattr(self.normalizations, f'std_{i}')
             x_n = x
             if not torch.all(current_std == 0):
-                x_n = self.normalizations(x, i)
+                x_n = self.normalization(x, i)
             with torch.no_grad():
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
@@ -261,12 +251,10 @@ class MajorityVotingEnsemble(nn.Module):
             votes_logits.append(out)
 
         stacked_logits = torch.cat(votes_logits, dim=1) 
-        
         hard_votes = (stacked_logits > 0).long() 
         sum_votes = hard_votes.sum(dim=1, keepdim=True)
         threshold = self.num_models / 2.0
         final_decision = (sum_votes >= threshold).long().float()
-        
         avg_probs = torch.sigmoid(stacked_logits).mean(dim=1, keepdim=True)
         
         if return_details:
@@ -337,7 +325,6 @@ def evaluate_ensemble_final(model, loader, device, name, model_names, is_main):
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
         outputs, weights, _, stacked_logits = model(images, return_details=True)
-        
         pred = outputs.squeeze(1).long()
         
         is_tp = ((pred == 1) & (labels.long() == 1)).sum()
@@ -412,13 +399,21 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     
     with torch.no_grad():
         for i in tqdm(range(len(subset_dataset)), desc="Final Eval"):
+            # 1. اول تصویر را لود می‌کنیم. اگر این خطا داد، یعنی فایل خراب است و continue می‌کنیم
             try:
                 image, label = subset_dataset[i]
-                original_idx = subset_dataset.indices[i]
-                path, _ = get_sample_info(subset_dataset, original_idx)
             except Exception as e:
+                if is_main: print(f"[WARN] Skipping corrupted sample {i}: {e}")
                 continue
 
+            # 2. مسیر فایل را استخراج می‌کنیم. اگر این خطا داد، ارزیابی نمونه رها نمی‌شود!
+            path = "unknown_file.jpg"
+            try:
+                original_idx = subset_dataset.indices[i] if hasattr(subset_dataset, 'indices') else i
+                path, _ = get_sample_info(subset_dataset, original_idx)
+            except Exception:
+                pass # اگر مسیر پیدا نشد، همانی که در بالا تنظیم شد استفاده می‌شود
+            
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
@@ -658,12 +653,12 @@ def main():
 
     # رسم ROC (فقط روی GPU اصلی)
     if is_main:
+        # ✅ رفع خطای تداخل آرگومان‌ها با حذف MODEL_NAMES
         plot_roc_and_f1(
             ensemble,
             test_loader_full, 
             device, 
-            args.save_dir, 
-            MODEL_NAMES,
+            args.save_dir,
             is_main=True
         )
 
