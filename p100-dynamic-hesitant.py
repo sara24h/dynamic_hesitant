@@ -612,20 +612,21 @@ def main():
 
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
+        is_distributed=False, seed=args.seed, is_main=is_main)
 
-    # ===== اعمال AdaBN قبل از شروع ارزیابی و آموزش =====
+    # ===== استفاده از لودر تمیز برای AdaBN =====
     adabn_loader = create_adabn_dataloader(
-        args.data_dir, args.batch_size, num_workers=4,
+        args.data_dir, args.batch_size, num_workers=0,
         dataset_type=args.dataset, seed=args.seed, is_main=is_main
     )
+
+    # در اینجا 4 تا فاصله (Space) در ابتدای خط باید باشد:
     adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main)
     # =================================================
 
-    if is_main:
-        print("\n" + "="*70)
-        print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
-        print("="*70)
+    print("\n" + "="*70)
+    print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
+    print("="*70)
 
     individual_accs = []
     for i, model in enumerate(base_models):
