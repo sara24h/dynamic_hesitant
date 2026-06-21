@@ -359,13 +359,27 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     return acc, np.array(all_y_true), np.array(all_y_score)
 
 # ================== DISTRIBUTED & MAIN ==================
+# ================== DISTRIBUTED & MAIN ==================
 def setup_distributed():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank, world_size, local_rank = int(os.environ["RANK"]), int(os.environ['WORLD_SIZE']), int(os.environ['LOCAL_RANK'])
-        dist.init_process_group(backend='nccl')
-        torch.cuda.set_device(local_rank)
-        return torch.device(f'cuda:{local_rank}'), local_rank, rank, world_size
-    return torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 0, 0, 1
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        
+        # ✅ تغییر nccl به gloo برای رفع خطای Kaggle
+        dist.init_process_group(backend='gloo')
+        
+        # اگر GPU در دسترس بود، آن را تنظیم کن
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f'cuda:{local_rank}')
+        else:
+            device = torch.device('cpu')
+            
+        return device, local_rank, rank, world_size
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        return device, 0, 0, 1
 
 def cleanup_distributed():
     if dist.is_initialized(): dist.destroy_process_group()
