@@ -34,9 +34,40 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
-# ================== UNIFIED FINAL EVALUATION & REPORT ==================
+# ================== BATCHNORM ADAPTATION (AdaBN) ==================
+@torch.no_grad()
+def adapt_batchnorm_for_new_dataset(models, means, stds, train_loader, device, is_main):
+    """
+    این تابع آمار BatchNorm مدل‌های فریز شده را با داده‌های دیتاست جدید آپدیت می‌کند (AdaBN).
+    """
+    if is_main:
+        print("\n" + "="*70)
+        print("STARTING BATCHNORM ADAPTATION (AdaBN) FOR NEW DATASET")
+        print("="*70)
+        
+    normalizer = MultiModelNormalization(means, stds).to(device)
+    
+    # 1. مدل‌ها را در حالت train قرار می‌دهیم تا آمار BN آپدیت شود
+    for model in models:
+        model.train() 
+        
+    # 2. کل دیتاست Train جدید را یک بار پاس می‌دهیم تا آمار جمع شود
+    for images, _ in tqdm(train_loader, desc="Adapting BN", disable=not is_main):
+        images = images.to(device)
+        for i, model in enumerate(models):
+            x_n = normalizer(images, i)
+            model(x_n) # فقط یک forward pass برای آپدیت آمار BN
+            
+    # 3. مدل‌ها را دوباره در حالت eval قرار می‌دهیم برای ارزیابی
+    for model in models:
+        model.eval()
+        
+    if is_main:
+        print("✅ BatchNorm Adaptation Completed!\n")
 
-from torchvision import transforms  # ← بالای فایل
+
+# ================== UNIFIED FINAL EVALUATION & REPORT ==================
+from torchvision import transforms
 
 @torch.no_grad()
 def final_evaluation_and_report(model, loader, device, save_dir, model_name, args, is_main):
@@ -91,7 +122,6 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
 
     os.makedirs(save_dir, exist_ok=True)
 
-    # ذخیره log
     output_str = [
         "-"*100, "SUMMARY STATISTICS:", "-"*100,
         f"Accuracy: {acc*100:.2f}%",
@@ -115,7 +145,6 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         f.write("\n".join(output_str))
     print(f"✅ Prediction log saved: {log_path}")
 
-    # ذخیره JSON و TXT
     y_true_np  = np.array(all_y_true)
     y_score_np = np.array(all_y_score)
     y_pred_np  = np.array(all_y_pred)
@@ -270,7 +299,7 @@ def main():
 
     set_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    is_main = True  # تک پردازشی - همیشه main
+    is_main = True
 
     print("="*70)
     print(f"SIMPLE AVERAGING ENSEMBLE (Single GPU)")
@@ -302,8 +331,12 @@ def main():
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=False, seed=args.seed, is_main=is_main)
 
+    # ===== اعمال AdaBN قبل از شروع ارزیابی و آموزش =====
+    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, train_loader, device, is_main)
+    # =================================================
+
     print("\n" + "="*70)
-    print("INDIVIDUAL MODEL PERFORMANCE")
+    print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
     print("="*70)
 
     individual_accs = []
@@ -325,14 +358,10 @@ def main():
     print("FINAL ENSEMBLE EVALUATION")
     print("="*70)
 
-    ensemble_module = ensemble  # بدون DDP، wrapper وجود ندارد
-
+    ensemble_module = ensemble 
     os.makedirs(args.save_dir, exist_ok=True)
-
-    # تک GPU است، همان test_loader قابل استفاده است (غیرتوزیع‌شده)
     test_loader_full = test_loader
 
-    # اجرای ارزیابی یکپارچه
     ensemble_test_acc, y_true, y_score = final_evaluation_and_report(
         ensemble_module, test_loader_full, device, args.save_dir, 
         "Simple Averaging Ensemble", args, is_main
