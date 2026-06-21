@@ -16,12 +16,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from metrics_utils import plot_roc_and_f1
 from dataset_utils import (
     UADFVDataset, CustomGenAIDataset, NewGenAIDataset,
-    create_dataloaders, get_sample_info
+    create_dataloaders, create_adabn_dataloader, get_sample_info
 )
 from visualization_utils import generate_visualizations
 
 warnings.filterwarnings("ignore")
-
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -35,7 +34,6 @@ def set_seed(seed: int = 42):
 
 
 def is_dist():
-   
     return dist.is_initialized()
 
 
@@ -49,6 +47,122 @@ class MultiModelNormalization(nn.Module):
 
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
+
+
+# =====================================================================
+# ================== DISTRIBUTED BATCHNORM ADAPTATION ==================
+# =====================================================================
+@torch.no_grad()
+def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True, is_distributed=False):
+    """
+    اعمال AdaBN به صورت موازی روی چندین GPU.
+    اگر is_distributed=True باشد، از فرمول محاسبه واریانس موازی (Parallel Variance) استفاده می‌کند.
+    """
+    if is_main:
+        print("\n" + "="*70)
+        print(f"STARTING BATCHNORM ADAPTATION (AdaBN) - Mode: {'Distributed' if is_distributed else 'Single GPU'}")
+        print("="*70)
+        
+    normalizer = MultiModelNormalization(means, stds).to(device)
+    
+    if is_distributed:
+        # =================== منطق چند GPU ===================
+        accumulators = [{} for _ in models]
+        hooks = []
+        
+        for i, model in enumerate(models):
+            model.eval() # مدل در حالت eval میماند تا dropout خاموش شود
+            for name, m in model.named_modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    # ساخت بافرهای accumulator برای هر لایه BN
+                    accumulators[i][name] = {
+                        'n': torch.tensor(0.0, device=device),
+                        'sum_mean': torch.zeros(m.num_features, device=device),
+                        'sum_x2': torch.zeros(m.num_features, device=device) # مجموع مربعات برای محاسبه واریانس
+                    }
+                    
+                    def get_hook(model_idx, layer_name):
+                        def hook(module, inp, out):
+                            x = inp[0]
+                            # N در اینجا برابر با (Batch_size * H * W) است
+                            n = x.numel() / x.size(1) 
+                            
+                            # محاسبه mean و var دقیقاً مشابه نحوه محاسبه داخلی PyTorch (unbiased=False)
+                            mean = x.mean(dim=[0, 2, 3])
+                            var = x.var(dim=[0, 2, 3], unbiased=False) 
+                            
+                            # آپدیت مقادیر تجمعی
+                            accumulators[model_idx][layer_name]['n'] += n
+                            accumulators[model_idx][layer_name]['sum_mean'] += mean * n
+                            # فرمول ریاضی: sum(x^2) = Var(x) * N + Mean(x)^2 * N
+                            accumulators[model_idx][layer_name]['sum_x2'] += (var * n) + (mean ** 2 * n)
+                        return hook
+                    # ثبت Hook روی لایه
+                    hooks.append(m.register_forward_hook(get_hook(i, name)))
+
+        # تنظیم epoch برای sampler در صورت وجود
+        if hasattr(adabn_loader.sampler, 'set_epoch'):
+            adabn_loader.sampler.set_epoch(0)
+
+        # پاس دادن داده‌ها (هر GPU فقط بخشی از داده را می‌بیند)
+        for images, _ in tqdm(adabn_loader, desc="Adapting BN (Dist)", disable=not is_main):
+            images = images.to(device)
+            for i, model in enumerate(models):
+                x_n = normalizer(images, i)
+                model(x_n) # Hook ها به صورت خودکار اجرا و مقادیر را جمع می‌کنند
+
+        # حذف Hook ها
+        for h in hooks: h.remove()
+
+        if is_main: print("Synchronizing BN statistics across GPUs...")
+        
+        # جمع کردن آمارهای محاسبه شده از تمام GPUها
+        for i, model in enumerate(models):
+            for name, m in model.named_modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    acc = accumulators[i][name]
+                    
+                    # جمع کردن مقادیر روی تمام پردازنده‌ها
+                    dist.all_reduce(acc['n'], op=dist.ReduceOp.SUM)
+                    dist.all_reduce(acc['sum_mean'], op=dist.ReduceOp.SUM)
+                    dist.all_reduce(acc['sum_x2'], op=dist.ReduceOp.SUM)
+                    
+                    # محاسبه آمار نهایی و جامع (Global Mean & Variance)
+                    global_mean = acc['sum_mean'] / acc['n']
+                    global_var = (acc['sum_x2'] / acc['n']) - (global_mean ** 2)
+                    global_var = torch.clamp(global_var, min=1e-5) # جلوگیری از صفر شدن واریانس
+                    
+                    # ست کردن آمارهای محاسبه شده
+                    m.running_mean.copy_(global_mean)
+                    m.running_var.copy_(global_var)
+                    m.num_batches_tracked.copy_(torch.tensor(1, dtype=torch.long, device=device))
+        
+        if is_main: print("✅ Distributed BatchNorm Adaptation Completed!\n")
+
+    else:
+        # =================== منطق تک GPU (کد قبلی) ===================
+        for model in models:
+            model.eval()  
+            for m in model.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    m.reset_running_stats()
+                    m.momentum = None  
+                    m.train()          
+                    
+        for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
+            images = images.to(device)
+            for i, model in enumerate(models):
+                x_n = normalizer(images, i)
+                model(x_n) 
+                
+        for model in models:
+            for m in model.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    m.momentum = 0.1
+            model.eval()
+            
+        if is_main: print("✅ BatchNorm Adaptation Completed!\n")
+# =====================================================================
 
 
 class HesitantFuzzyMembership(nn.Module):
@@ -339,7 +453,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir,
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    # ──────────── [اصلاح] یک بلوک چاپ (بدون تکرار) ────────────
+    # ──────────── یک بلوک چاپ (بدون تکرار) ────────────
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
@@ -482,7 +596,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir,
             "num_samples": int(total_samples),
             "positive_count": int(np.sum(y_true_np)),
             "negative_count": int(total_samples - np.sum(y_true_np)),
-            "model": "fuzzy_hesitant_ensemble"
+            "model": "fuzzy_hesitant_ensemble_AdaBN"
         },
         "y_true": y_true_np.tolist(),
         "y_score": y_score_np.tolist(),
@@ -546,7 +660,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader,
             train_loader.sampler.set_epoch(epoch)
         ensemble_model.train()
 
-        # ──── [اصلاح] متغیرهای محلی هر GPU ────
+        # ──── متغیرهای محلی هر GPU ────
         local_loss = 0.0
         local_correct = 0
         local_total = 0
@@ -583,7 +697,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader,
             local_cumsum_used += (n_active < num_model).sum().item()
             local_active += act_mask.sum(dim=0)
 
-        # ──── [اصلاح] All-reduce برای متریک‌های آموزش ────
+        # ──── All-reduce برای متریک‌های آموزش ────
         if is_dist():
             correct_t = torch.tensor(
                 local_correct, dtype=torch.float, device=device
@@ -619,10 +733,10 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader,
         overall_mean_hes = avg_hesitancy.mean().item()
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device, is_main)
     
-    # ---------- این دو خط را اضافه کنید ----------
+        # ---------- این دو خط را اضافه کنید ----------
         if is_dist():
             dist.barrier()
-    # ---------------------------------------------
+        # ---------------------------------------------
 
         scheduler.step()
 
@@ -707,7 +821,7 @@ def cleanup_distributed():
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(
-        description="Optimized Fuzzy Hesitant Ensemble Training"
+        description="Optimized Fuzzy Hesitant Ensemble Training with Distributed AdaBN"
     )
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.0001)
@@ -734,6 +848,7 @@ def main():
     set_seed(args.seed)
     device, local_rank, rank, world_size = setup_distributed()
     is_main = (rank == 0)
+    is_distributed = (world_size > 1)
 
     if is_main:
         print("=" * 70)
@@ -770,6 +885,20 @@ def main():
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
+    # =================== فراخوانی AdaBN به صورت موازی ===================
+    adabn_loader = create_adabn_dataloader(
+        args.data_dir, args.batch_size, num_workers=0,
+        dataset_type=args.dataset, seed=args.seed, is_main=is_main,
+        is_distributed=is_distributed
+    )
+    adapt_batchnorm_for_new_dataset(
+        base_models, MEANS, STDS, adabn_loader, device, is_main,
+        is_distributed=is_distributed
+    )
+    del adabn_loader
+    if is_main: torch.cuda.empty_cache()
+    # ====================================================================
+
     ensemble = FuzzyHesitantEnsemble(
         base_models, MEANS, STDS,
         num_memberships=args.num_memberships,
@@ -778,7 +907,7 @@ def main():
         hesitancy_threshold=args.hesitancy_threshold
     ).to(device)
 
-    if world_size > 1:
+    if is_distributed:
         ensemble = DDP(
             ensemble, device_ids=[local_rank],
             output_device=local_rank,
@@ -793,17 +922,15 @@ def main():
         print(f"Total params: {total_p:,} | Trainable: {trainable:,} | "
               f"Frozen: {total_p - trainable:,}\n")
 
-    # ──── [اصلاح] ساخت دیتالودرهای توزیع‌شده (برای آموزش) ────
+    # ──── ساخت دیتالودرهای توزیع‌شده (برای آموزش) ────
     train_loader, val_loader, _ = create_dataloaders(
         args.data_dir, args.batch_size,
         dataset_type=args.dataset,
-        is_distributed=(world_size > 1),
+        is_distributed=is_distributed,
         seed=args.seed, is_main=is_main
     )
 
-    # ──── [اصلاح] ساخت دیتالودر تست غیرتوزیع‌شده روی GPU اصلی ────
-    # این loader تمام نمونه‌های تست را بدون padding و تکرار
-    # شامل می‌شود → دقت کاملاً صحیح
+    # ──── ساخت دیتالودر تست غیرتوزیع‌شده روی GPU اصلی ────
     test_loader_full = None
     if is_main:
         _, _, test_loader_full = create_dataloaders(
@@ -813,16 +940,14 @@ def main():
             seed=args.seed, is_main=True
         )
 
-    # ──── [اصلاح] ارزیابی مدل‌های منفرد با loader غیرتوزیع‌شده ────
-    # این تضمین می‌کند که مقایسه مدل‌های منفرد با آنسامبل
-    # روی دقیقاً همان مجموعه داده انجام شود
+    # ──── ارزیابی مدل‌های منفرد با loader غیرتوزیع‌شده ────
     individual_accs = []
     best_single = 0.0
     best_idx = 0
 
     if is_main:
         print("\n" + "=" * 70)
-        print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
+        print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
         print("=" * 70)
         for i, model in enumerate(base_models):
             acc = evaluate_single_model(
@@ -837,7 +962,7 @@ def main():
               f"({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
         print("=" * 70)
 
-    # [اصلاح] همگام‌سازی قبل از شروع آموزش
+    # همگام‌سازی قبل از شروع آموزش
     if is_dist():
         dist.barrier()
 
@@ -848,7 +973,7 @@ def main():
         args.save_dir, is_main, MODEL_NAMES
     )
 
-    # ──── [اصلاح] همگام‌سازی بعد از آموزش و قبل از بارگذاری ────
+    # همگام‌سازی بعد از آموزش و قبل از بارگذاری
     if is_dist():
         dist.barrier()
 
@@ -887,7 +1012,7 @@ def main():
         # ذخیره نتایج JSON
         final_results = {
             'seed': args.seed,
-            'method': 'Fuzzy_Hesitant',
+            'method': 'Fuzzy_Hesitant_Distributed_AdaBN',
             'best_single_model': {
                 'name': MODEL_NAMES[best_idx],
                 'accuracy': float(best_single)
@@ -908,8 +1033,7 @@ def main():
             'seed': args.seed
         }, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
 
-    # ──── [اصلاح] Cleanup قبل از ROC ────
-    # plot_roc_and_f1 نیازی به عملیات توزیع‌شده ندارد
+    # ──── Cleanup قبل از ROC ────
     cleanup_distributed()
 
     # ──── رسم ROC (فقط GPU اصلی) ────
