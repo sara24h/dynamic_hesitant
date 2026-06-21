@@ -20,6 +20,7 @@ from dataset_utils_p100 import (
     UADFVDataset,
     CustomGenAIDataset,
     create_dataloaders,
+    create_adabn_dataloader,  # <-- اضافه شد
     get_sample_info,
     worker_init_fn
 )
@@ -48,6 +49,46 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
  
  
+# ================== BATCHNORM ADAPTATION (AdaBN) ==================
+@torch.no_grad()
+def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main):
+    """
+    اعمال AdaBN با دیتالودر بدون augmentation.
+    فقط آمار BN آپدیت می‌شود، نه وزن‌ها.
+    """
+    if is_main:
+        print("\n" + "="*70)
+        print("STARTING BATCHNORM ADAPTATION (AdaBN) - CLEAN DATA (NO AUGMENTATION)")
+        print("="*70)
+        
+    normalizer = MultiModelNormalization(means, stds).to(device)
+    
+    for model in models:
+        model.eval()  # قطع شدن Dropout و لایه‌های غیرقطعی
+        # ریست کردن آمار قبلی و تنظیم برای محاسبه آمار تجمعی (Cumulative)
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.reset_running_stats()
+                m.momentum = None  # محاسبه میانگین/واریانس گلبال
+                m.train()          # فقط BN در حالت train باشد
+                
+    for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
+        images = images.to(device)
+        for i, model in enumerate(models):
+            x_n = normalizer(images, i)
+            model(x_n)  # فقط یک forward pass برای آپدیت آمار BN
+            
+    # برگرداندن momentum به حالت پیش‌فرض و مدل به حالت eval
+    for model in models:
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.momentum = 0.1
+        model.eval()
+        
+    if is_main:
+        print("✅ BatchNorm Adaptation Completed!\n")
+
+
 # ================== STACKING META LEARNER (Logistic Regression) ==================
 class StackingMetaLearner(nn.Module):
     def __init__(self, num_models: int):
@@ -137,11 +178,6 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
  
  
 # ================== EVALUATION FUNCTIONS ==================
-# نکته: همه‌ی dist.all_reduce / dist.all_gather_object فقط زمانی اجرا می‌شوند
-# که process group واقعاً initialize شده باشد (یعنی با torchrun و >1 پردازش).
-# با این تغییر، اسکریپت هم با 1 GPU (python script.py ...) و هم با چند GPU
-# (torchrun --nproc_per_node=N script.py ...) به درستی کار می‌کند.
- 
 @torch.no_grad()
 def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device,
                               name: str, mean: Tuple[float, float, float],
@@ -290,14 +326,10 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
  
-        # --- اصلاح باگ BatchNorm ---
-        # متا-لرنر به حالت train می‌رود (اگرچه Linear فرقی نمی‌کند، برای اصولی بودن)
         meta_learner.train()
-        # مدل‌های پایه (frozen) حتماً در حالت eval می‌مانند تا آمار BatchNorm آپدیت نشود
         base_models = ensemble_model.module.models if hasattr(ensemble_model, 'module') else ensemble_model.models
         for model in base_models:
             model.eval()
-        # ---------------------------
             
         train_loss = 0.0
         train_correct = 0
@@ -360,11 +392,6 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
  
 # ================== DISTRIBUTED SETUP ==================
 def setup_distributed():
-    """
-    اگر با torchrun و RANK/WORLD_SIZE اجرا شود → حالت distributed واقعی.
-    در غیر این صورت (مثلاً `python script.py ...` روی یک GPU) →
-    فقط از همان یک GPU استفاده می‌شود و process group هم init نمی‌شود.
-    """
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ['WORLD_SIZE'])
@@ -411,15 +438,10 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
  
 # ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
-    """
-    ساخت فایل txt دقیقاً بر اساس لیست‌های y_true و y_pred که از تست کنسول آمده‌اند.
-    این تابع تضمین می‌کند که اعداد با کنسول یکی باشند.
-    """
     total = len(y_true)
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
  
-    # محاسبه ماتریس آشفتگی
     TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
     TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
     FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
@@ -520,8 +542,6 @@ def main():
             freeze_models=True
         ).to(device)
  
-        # فقط وقتی واقعاً بیش از یک GPU/پردازش وجود دارد DDP فعال می‌شود.
-        # با یک GPU (world_size == 1) ensemble به همان شکل ساده باقی می‌ماند.
         if world_size > 1:
             ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
  
@@ -534,9 +554,18 @@ def main():
             args.data_dir, args.batch_size, dataset_type=args.dataset,
             is_distributed=(world_size > 1), seed=current_seed, is_main=is_main)
  
+        # ===== استفاده از لودر تمیز برای AdaBN =====
+        adabn_loader = create_adabn_dataloader(
+            args.data_dir, args.batch_size, num_workers=0,
+            dataset_type=args.dataset, seed=current_seed, is_main=is_main
+        )
+
+        adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main)
+        # =================================================
+
         if is_main:
             print("\n" + "="*70)
-            print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
+            print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
             print("="*70)
  
         individual_accs = []
@@ -573,7 +602,6 @@ def main():
  
         ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
  
-        # دریافت خروجی‌ها برای JSON و Log
         ensemble_test_acc, learned_weights, learned_bias, predictions_data = evaluate_ensemble_final_ddp(
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
  
@@ -586,14 +614,11 @@ def main():
             print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
             print("="*70)
  
-            # استخراج لیست‌ها
             y_true, y_score, y_pred = predictions_data
  
-            # 1. ذخیره JSON
             json_path = os.path.join(current_save_dir, 'test_predictions.json')
             save_predictions_json(y_true, y_score, y_pred, json_path, current_seed, args.dataset)
  
-            # 2. ذخیره فایل txt دقیقاً مطابق با کنسول (جایگزین save_prediction_log قبلی)
             log_path_ensemble = os.path.join(current_save_dir, 'prediction_log_stacking.txt')
             save_accuracy_log_from_results(y_true, y_pred, log_path_ensemble, "Stacking Ensemble")
  
@@ -630,9 +655,6 @@ def main():
             }, final_model_path)
             print(f"Model saved: {final_model_path}")
  
-            # ==========================================
-            # Save Best Single Model Log (بازسازی لیست برای مدل تکی)
-            # ==========================================
             print("\nGenerating Single Best Model Log...")
             single_model = base_models[best_idx]
             single_model.eval()
