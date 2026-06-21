@@ -274,8 +274,10 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
 
 
 # ================== ADABN DATALOADER (اضافه شده) ==================
+# ================== ADABN DATALOADER (پشتیبانی از Distributed) ==================
 def create_adabn_dataloader(base_dir: str, batch_size: int, num_workers: int = 0,
-                            dataset_type: str = 'wild', seed: int = 42, is_main: bool = True):
+                            dataset_type: str = 'wild', seed: int = 42, is_main: bool = True,
+                            is_distributed: bool = False): # <--- پارامتر جدید اضافه شد
     """
     DataLoader specifically for AdaBN: No Augmentation, only base Preprocess.
     """
@@ -287,7 +289,7 @@ def create_adabn_dataloader(base_dir: str, batch_size: int, num_workers: int = 0
 
     if is_main:
         print("="*70)
-        print("Creating AdaBN DataLoader (Clean Data - No Augmentation)")
+        print(f"Creating AdaBN DataLoader (Clean Data) - Mode: {'Distributed' if is_distributed else 'Single GPU'}")
         print("="*70)
 
     if dataset_type == 'wild':
@@ -299,8 +301,11 @@ def create_adabn_dataloader(base_dir: str, batch_size: int, num_workers: int = 0
         full_dataset, train_indices, _, _ = prepare_dataset(base_dir, dataset_type, seed=seed)
         dataset = TransformSubset(full_dataset, train_indices, adabn_transform)
 
+    # استفاده از DistributedSampler در صورت اجرای روی چند GPU
+    sampler = DistributedSampler(dataset, shuffle=False) if is_distributed else None
+
     loader = DataLoader(dataset, batch_size=batch_size,
-                       shuffle=False, sampler=None,
+                       shuffle=False, sampler=sampler,
                        num_workers=num_workers, pin_memory=True,
                        drop_last=False, worker_init_fn=worker_init_fn)
 
@@ -308,6 +313,7 @@ def create_adabn_dataloader(base_dir: str, batch_size: int, num_workers: int = 0
         print(f"AdaBN DataLoaders ready! Batch size: {batch_size}, Total samples: {len(dataset)}")
         print("="*70 + "\n")
     return loader
+# ==================================================================
 # ==================================================================
 
 if __name__ == '__main__':
