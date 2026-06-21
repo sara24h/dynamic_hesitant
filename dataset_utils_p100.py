@@ -12,7 +12,7 @@ from PIL import Image
 # ================== DATASET CLASSES ==================
 
 class CustomGenAIDataset(Dataset):
-    """دیتاست قدیمی (جهت سازگاری با نسخه‌های قبلی نگهداری شده است)"""
+    """Old dataset (kept for backward compatibility)"""
     
     def __init__(self, root_dir, fake_classes, real_class, transform=None):
         self.root_dir = root_dir
@@ -256,10 +256,13 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 
-# ================== NEW: ADABN DATALOADER ==================
+# ================== ADABN DATALOADER ==================
 def create_adabn_dataloader(base_dir: str, batch_size: int, num_workers: int = 0,
                             dataset_type: str = 'wild', seed: int = 42, is_main: bool = True):
-  
+    """
+    DataLoader specifically for AdaBN: No Augmentation, only base Preprocess.
+    To calculate accurate BatchNorm statistics based on the real dataset distribution.
+    """
     adabn_transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(256),
@@ -280,7 +283,9 @@ def create_adabn_dataloader(base_dir: str, batch_size: int, num_workers: int = 0
         full_dataset, train_indices, _, _ = prepare_dataset(base_dir, dataset_type, seed=seed)
         dataset = TransformSubset(full_dataset, train_indices, adabn_transform)
 
-     loader = DataLoader(dataset, batch_size=batch_size,
+    # For AdaBN, it is better that all data is seen by one process (or all processes see all data)
+    # So we disable DistributedSampler here.
+    loader = DataLoader(dataset, batch_size=batch_size,
                        shuffle=False, sampler=None,
                        num_workers=num_workers, pin_memory=True,
                        drop_last=False, worker_init_fn=worker_init_fn)
@@ -300,21 +305,15 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
         print(f"Creating DataLoaders (Dataset: {dataset_type})")
         print("="*70)
 
-    # اصلاح ترنسفورم‌ها برای حفظ یکسانی aspect ratio
-       train_transform = transforms.Compose([
-
+    train_transform = transforms.Compose([
         transforms.Resize(256),
-
         transforms.RandomCrop(256),
-
         transforms.RandomHorizontalFlip(p=0.5),
-
-        transforms.RandomRotation(10),
-
-        transforms.ColorJitter(0.2, 0.2),
-
+        transforms.RandomRotation(20),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.GaussianBlur(kernel_size=3),
         transforms.ToTensor(),
-
     ])
 
     val_test_transform = transforms.Compose([
@@ -339,7 +338,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
             print(f"\nDataset Stats:")
             for split, ds in datasets_dict.items():
                 print(f" {split.capitalize():5}: {len(ds):,} images | Classes: {ds.classes}")
-            print(f" Class → Index: {datasets_dict['train'].class_to_idx}\n")
+            print(f" Class -> Index: {datasets_dict['train'].class_to_idx}\n")
 
         train_sampler = DistributedSampler(datasets_dict['train'], shuffle=True) if is_distributed else None
         val_sampler = DistributedSampler(datasets_dict['valid'], shuffle=False) if is_distributed else None
@@ -371,7 +370,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
             print(f" Valid: {len(val_indices):,} ({len(val_indices)/len(full_dataset)*100:.1f}%)")
             print(f" Test: {len(test_indices):,} ({len(test_indices)/len(full_dataset)*100:.1f}%)")
             if hasattr(full_dataset, 'class_to_idx'):
-                print(f" Class → Index: {full_dataset.class_to_idx}\n")
+                print(f" Class -> Index: {full_dataset.class_to_idx}\n")
 
         train_dataset = TransformSubset(full_dataset, train_indices, train_transform)
         val_dataset = TransformSubset(full_dataset, val_indices, val_test_transform)
@@ -404,6 +403,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
 
     if is_main:
         print(f"DataLoaders ready! Batch size: {batch_size}")
-        print(f" Batches → Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
+        print(f" Batches -> Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
         print("="*70 + "\n")
     return train_loader, val_loader, test_loader
