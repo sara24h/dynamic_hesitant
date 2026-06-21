@@ -14,7 +14,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import transforms as T
 from metrics_utils import plot_roc_and_f1
-# ایمپورت تابع جدید AdaBN
 from dataset_utils_p100 import (
     UADFVDataset, CustomGenAIDataset, NewGenAIDataset,
     create_dataloaders, create_adabn_dataloader, get_sample_info
@@ -386,7 +385,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
         
         hesitant_net.train()
-        
         base_models = ensemble_model.module.models if hasattr(ensemble_model, 'module') else ensemble_model.models
         for m in base_models:
             m.eval()
@@ -394,6 +392,10 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         train_loss = 0.0
         train_correct = 0
         train_total = 0
+        
+        sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
+        sum_cumsum_used = 0
+        sum_active_models = torch.zeros(len(model_names), device=device)
         
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main)
         for images, labels in pbar:
@@ -410,21 +412,69 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
+            
+            per_model_hesitancy = memberships.var(dim=2)
+            sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
+            
+            active_mask = (weights > 1e-4).float()
+            num_active_per_sample = active_mask.sum(dim=1)
+            cumsum_used_samples = (num_active_per_sample < len(model_names)).sum().item()
+            sum_cumsum_used += cumsum_used_samples
+            sum_active_models += active_mask.sum(dim=0)
 
         train_acc = 100. * train_correct / train_total
         train_loss = train_loss / train_total
+        
+        avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
+        avg_cumsum_usage = (sum_cumsum_used / train_total) * 100
+        avg_model_activation = (sum_active_models / train_total) * 100
+        overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
         
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         scheduler.step()
 
         if is_main:
-            print(f"\nEpoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
+            print(f"\n{'='*70}")
+            print(f"Epoch {epoch+1}/{num_epochs}")
+            print(f"{'='*70}")
+            print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
+            
+            print(f"\n{'Hesitancy (Variance) per Model:':^70}")
+            print(f"{'-'*70}")
+            for i, name in enumerate(model_names):
+                hesitancy_val = avg_per_model_hesitancy[i].item()
+                print(f"  {i+1:2d}. {name:<30}: {hesitancy_val:.6f}")
+            print(f"{'-'*70}")
+            print(f"  {'Overall Mean Hesitancy:':<30}  {overall_mean_hesitancy:.6f}")
+            
+            print(f"\n{'Cumulative Weight Threshold (Cumsum) Analysis:':^70}")
+            print(f"{'-'*70}")
+            print(f"  {'Cumsum activated in:':<30}  {avg_cumsum_usage:.2f}% of samples")
+            if avg_cumsum_usage > 50:
+                print(f"  {'Status:':<30}  ✓ Efficient")
+            elif avg_cumsum_usage > 20:
+                print(f"  {'Status:':<30}  ≈ Moderate")
+            else:
+                print(f"  {'Status:':<30}  ✗ Low efficiency")
+            print(f"  {'All models used in:':<30}  {100-avg_cumsum_usage:.2f}% of samples")
+            
+            print(f"\n{'Model Activation Frequency:':^70}")
+            print(f"{'-'*70}")
+            for i, name in enumerate(model_names):
+                activation_pct = avg_model_activation[i].item()
+                bar_length = int(activation_pct / 2)
+                bar = '█' * bar_length
+                print(f"  {i+1:2d}. {name:<30}: {activation_pct:5.1f}% {bar}")
 
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
             save_path = os.path.join(save_dir, 'best_hesitant_fuzzy.pt')
             torch.save({'hesitant_state_dict': hesitant_net.state_dict()}, save_path)
-            print(f"✓ Best model saved → {val_acc:.2f}%\n")
+            print(f"\n✓ Best model saved → {val_acc:.2f}%")
+
+        if is_main:
+            print()
 
     return best_val_acc
 
@@ -448,7 +498,7 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-# ================== FIXED: BATCHNORM ADAPTATION (AdaBN) ==================
+# ================== BATCHNORM ADAPTATION (AdaBN) ==================
 @torch.no_grad()
 def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main):
     """
@@ -523,6 +573,11 @@ def main():
         print("="*70)
         print(f"OPTIMIZED FUZZY HESITANT ENSEMBLE TRAINING")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
+        print("="*70)
+        print(f"Dataset: {args.dataset}")
+        print(f"Data directory: {args.data_dir}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Models: {len(args.model_paths)}")
         print("="*70 + "\n")
 
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
@@ -539,17 +594,6 @@ def main():
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    # ===== 1. ساخت دیتالودر مخصوص AdaBN (بدون Augmentation) =====
-    # برای جلوگیری از تداخل در DDP، is_distributed=False می‌گذاریم تا هر پردازش تمام داده‌ها را ببیند
-    adabn_loader = create_adabn_dataloader(
-        args.data_dir, args.batch_size, num_workers=4,
-        dataset_type=args.dataset, seed=args.seed, is_main=is_main
-    )
-
-    # ===== 2. اعمال AdaBN قبل از ساخت Ensemble =====
-    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main)
-
-    # ===== 3. ساخت Ensemble با مدل‌های تطبیق‌یافته =====
     ensemble = FuzzyHesitantEnsemble(
         base_models, MEANS, STDS,
         num_memberships=args.num_memberships, 
@@ -566,14 +610,21 @@ def main():
         total = sum(p.numel() for p in ensemble.parameters())
         print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
-    # ===== 4. دیتالودرهای اصلی (با Augmentation برای آموزش شبکه فازی) =====
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
 
+    # ===== اعمال AdaBN قبل از شروع ارزیابی و آموزش =====
+    adabn_loader = create_adabn_dataloader(
+        args.data_dir, args.batch_size, num_workers=4,
+        dataset_type=args.dataset, seed=args.seed, is_main=is_main
+    )
+    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main)
+    # =================================================
+
     if is_main:
         print("\n" + "="*70)
-        print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
+        print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
         print("="*70)
 
     individual_accs = []
