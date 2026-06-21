@@ -93,14 +93,20 @@ class UADFVDataset(Dataset):
 
 
 class TransformSubset(Subset):
+    """Subset with custom transform that bypasses dataset's transform if necessary."""
     def __init__(self, dataset, indices, transform):
         super().__init__(dataset, indices)
         self.transform = transform
 
     def __getitem__(self, idx):
         img, label = self.dataset[self.indices[idx]]
-        if self.transform: img = self.transform(img)
+        if self.transform:
+            img = self.transform(img)
         return img, label
+
+    # اضافه کردن این متد برای رفع ارور نسخه‌های جدید PyTorch
+    def __getitems__(self, indices):
+        return [self.__getitem__(i) for i in indices]
 
 # ================== UTILITY FUNCTIONS ==================
 
