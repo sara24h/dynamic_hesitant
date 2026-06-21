@@ -35,7 +35,6 @@ def set_seed(seed: int = 42):
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
 
-
     if not is_main: return 0.0, None, None
 
     model.eval()
@@ -89,8 +88,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             image = eval_transform(image_pil).unsqueeze(0).to(device)
             label_int = int(label)
             
-            # پیش‌بینی مدل
-                        # پیش‌بینی مدل با دریافت جزئیات وزن‌ها
+            # پیش‌بینی مدل با دریافت جزئیات وزن‌ها
             output, final_weights, _, _ = model(image, return_details=True)
             
             # محاسبه احتمال (Score) و کلاس پیش‌بینی شده
@@ -143,7 +141,6 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
     print(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
     print("="*70)
-
 
     # ════════════════════════════════════════════════════════════════
     #        آمار فعال‌سازی هر مدل (درصد نمونه‌هایی که مدل فعال بوده)
@@ -353,7 +350,7 @@ class FuzzyHesitantEnsemble(nn.Module):
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
-        hesitancy = all_memberships.var(dim=2,unbiased=False)
+        hesitancy = all_memberships.var(dim=2)
         avg_hesitancy = hesitancy.mean(dim=1)
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
         final_weights = final_weights * mask
@@ -464,11 +461,17 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
 
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
-        ensemble_model.train()
+        
+        # --- اصلاح باگ BatchNorm ---
+        # فقط شبکه فازی (متا-لرنر) به حالت train می‌رود
+        hesitant_net.train()
+        
+        # مدل‌های پایه (frozen) حتماً در حالت eval می‌مانند تا آمار BatchNorm ثابت بماند
         base_models = ensemble_model.module.models if hasattr(ensemble_model, 'module') else ensemble_model.models
         for m in base_models:
             m.eval()
-        
+        # ---------------------------
+            
         train_loss = 0.0
         train_correct = 0
         train_total = 0
@@ -493,7 +496,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
             
-            per_model_hesitancy = memberships.var(dim=2,unbiased=False)
+            per_model_hesitancy = memberships.var(dim=2)
             sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
             
             active_mask = (weights > 1e-4).float()
@@ -577,6 +580,40 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
+
+# ================== BATCHNORM ADAPTATION (AdaBN) ==================
+@torch.no_grad()
+def adapt_batchnorm_for_new_dataset(models, means, stds, train_loader, device, is_main):
+    """
+    این تابع آمار BatchNorm مدل‌های فریز شده را با داده‌های دیتاست جدید آپدیت می‌کند (AdaBN).
+    توجه: وزن‌ها تغییر نمی‌کنند، فقط running_mean و running_var آپدیت می‌شوند.
+    """
+    if is_main:
+        print("\n" + "="*70)
+        print("STARTING BATCHNORM ADAPTATION (AdaBN) FOR NEW DATASET")
+        print("="*70)
+        
+    normalizer = MultiModelNormalization(means, stds).to(device)
+    
+    # 1. مدل‌ها را در حالت train قرار می‌دهیم تا آمار BN آپدیت شود
+    for model in models:
+        model.train() 
+        
+    # 2. کل دیتاست Train جدید را یک بار پاس می‌دهیم تا آمار جمع شود
+    for images, _ in tqdm(train_loader, desc="Adapting BN", disable=not is_main):
+        images = images.to(device)
+        for i, model in enumerate(models):
+            x_n = normalizer(images, i)
+            model(x_n) # فقط یک forward pass برای آپدیت آمار BN
+            
+    # 3. مدل‌ها را دوباره در حالت eval قرار می‌دهیم برای ارزیابی
+    for model in models:
+        model.eval()
+        
+    if is_main:
+        print("✅ BatchNorm Adaptation Completed!\n")
+
+
 # ================== MAIN FUNCTION ==================
 def main():
     parser = argparse.ArgumentParser(description="Optimized Fuzzy Hesitant Ensemble Training")
@@ -591,11 +628,9 @@ def main():
     parser.add_argument('--save_dir', type=str, default='./output')
     parser.add_argument('--seed', type=int, default=42)
     
- 
     parser.add_argument('--num_memberships', type=int, default=3)
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
-    
     
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
@@ -621,7 +656,6 @@ def main():
         print(f"Models: {len(args.model_paths)}")
         print("="*70 + "\n")
 
-   
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     
@@ -656,9 +690,13 @@ def main():
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
 
+    # ===== اعمال AdaBN قبل از شروع ارزیابی و آموزش =====
+    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, train_loader, device, is_main)
+    # =================================================
+
     if is_main:
         print("\n" + "="*70)
-        print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
+        print("INDIVIDUAL MODEL PERFORMANCE (Before Training - After AdaBN)")
         print("="*70)
 
     individual_accs = []
