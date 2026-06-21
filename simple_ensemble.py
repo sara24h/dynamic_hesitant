@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 from dataset_utils import (
     UADFVDataset, 
     create_dataloaders, 
-    create_adabn_dataloader, # <-- اضافه شد
+    create_adabn_dataloader, 
     get_sample_info, 
     worker_init_fn
 )
@@ -38,45 +38,118 @@ def set_seed(seed: int = 42):
 
 
 # =====================================================================
-# ================== BATCHNORM ADAPTATION (AdaBN) ====================
+# ================== DISTRIBUTED BATCHNORM ADAPTATION ==================
 # =====================================================================
 @torch.no_grad()
-def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True):
+def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True, is_distributed=False):
     """
-    اعمال AdaBN با دیتالودر بدون augmentation.
-    فقط آمار BN آپدیت می‌شود، نه وزن‌ها.
+    اعمال AdaBN به صورت موازی روی چندین GPU.
+    اگر is_distributed=True باشد، از فرمول محاسبه واریانس موازی (Parallel Variance) استفاده می‌کند.
     """
     if is_main:
         print("\n" + "="*70)
-        print("STARTING BATCHNORM ADAPTATION (AdaBN) - CLEAN DATA (NO AUGMENTATION)")
+        print(f"STARTING BATCHNORM ADAPTATION (AdaBN) - Mode: {'Distributed' if is_distributed else 'Single GPU'}")
         print("="*70)
         
     normalizer = MultiModelNormalization(means, stds).to(device)
     
-    for model in models:
-        model.eval()  # قطع شدن Dropout و لایه‌های غیرقطعی
-        # ریست کردن آمار قبلی و تنظیم برای محاسبه آمار تجمعی (Cumulative)
-        for m in model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.reset_running_stats()
-                m.momentum = None  # محاسبه میانگین/واریانس گلبال
-                m.train()          # فقط BN در حالت train باشد
-                
-    for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
-        images = images.to(device)
-        for i, model in enumerate(models):
-            x_n = normalizer(images, i)
-            model(x_n)  # فقط یک forward pass برای آپدیت آمار BN
-            
-    # برگرداندن momentum به حالت پیش‌فرض و مدل به حالت eval
-    for model in models:
-        for m in model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.momentum = 0.1
-        model.eval()
+    if is_distributed:
+        # =================== منطق چند GPU ===================
+        accumulators = [{} for _ in models]
+        hooks = []
         
-    if is_main:
-        print("✅ BatchNorm Adaptation Completed!\n")
+        for i, model in enumerate(models):
+            model.eval() # مدل در حالت eval میماند تا dropout خاموش شود
+            for name, m in model.named_modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    # ساخت بافرهای accumulator برای هر لایه BN
+                    accumulators[i][name] = {
+                        'n': torch.tensor(0.0, device=device),
+                        'sum_mean': torch.zeros(m.num_features, device=device),
+                        'sum_x2': torch.zeros(m.num_features, device=device) # مجموع مربعات برای محاسبه واریانس
+                    }
+                    
+                    def get_hook(model_idx, layer_name):
+                        def hook(module, inp, out):
+                            x = inp[0]
+                            # N در اینجا برابر با (Batch_size * H * W) است
+                            n = x.numel() / x.size(1) 
+                            
+                            # محاسبه mean و var دقیقاً مشابه نحوه محاسبه داخلی PyTorch (unbiased=False)
+                            mean = x.mean(dim=[0, 2, 3])
+                            var = x.var(dim=[0, 2, 3], unbiased=False) 
+                            
+                            # آپدیت مقادیر تجمعی
+                            accumulators[model_idx][layer_name]['n'] += n
+                            accumulators[model_idx][layer_name]['sum_mean'] += mean * n
+                            # فرمول ریاضی: sum(x^2) = Var(x) * N + Mean(x)^2 * N
+                            accumulators[model_idx][layer_name]['sum_x2'] += (var * n) + (mean ** 2 * n)
+                        return hook
+                    # ثبت Hook روی لایه
+                    hooks.append(m.register_forward_hook(get_hook(i, name)))
+
+        # تنظیم epoch برای sampler در صورت وجود
+        if hasattr(adabn_loader.sampler, 'set_epoch'):
+            adabn_loader.sampler.set_epoch(0)
+
+        # پاس دادن داده‌ها (هر GPU فقط بخشی از داده را می‌بیند)
+        for images, _ in tqdm(adabn_loader, desc="Adapting BN (Dist)", disable=not is_main):
+            images = images.to(device)
+            for i, model in enumerate(models):
+                x_n = normalizer(images, i)
+                model(x_n) # Hook ها به صورت خودکار اجرا و مقادیر را جمع می‌کنند
+
+        # حذف Hook ها
+        for h in hooks: h.remove()
+
+        if is_main: print("Synchronizing BN statistics across GPUs...")
+        
+        # جمع کردن آمارهای محاسبه شده از تمام GPUها
+        for i, model in enumerate(models):
+            for name, m in model.named_modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    acc = accumulators[i][name]
+                    
+                    # جمع کردن مقادیر روی تمام پردازنده‌ها
+                    dist.all_reduce(acc['n'], op=dist.ReduceOp.SUM)
+                    dist.all_reduce(acc['sum_mean'], op=dist.ReduceOp.SUM)
+                    dist.all_reduce(acc['sum_x2'], op=dist.ReduceOp.SUM)
+                    
+                    # محاسبه آمار نهایی و جامع (Global Mean & Variance)
+                    global_mean = acc['sum_mean'] / acc['n']
+                    global_var = (acc['sum_x2'] / acc['n']) - (global_mean ** 2)
+                    global_var = torch.clamp(global_var, min=1e-5) # جلوگیری از صفر شدن واریانس
+                    
+                    # ست کردن آمارهای محاسبه شده
+                    m.running_mean.copy_(global_mean)
+                    m.running_var.copy_(global_var)
+                    m.num_batches_tracked.copy_(torch.tensor(1, dtype=torch.long, device=device))
+        
+        if is_main: print("✅ Distributed BatchNorm Adaptation Completed!\n")
+
+    else:
+        # =================== منطق تک GPU (کد قبلی) ===================
+        for model in models:
+            model.eval()  
+            for m in model.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    m.reset_running_stats()
+                    m.momentum = None  
+                    m.train()          
+                    
+        for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
+            images = images.to(device)
+            for i, model in enumerate(models):
+                x_n = normalizer(images, i)
+                model(x_n) 
+                
+        for model in models:
+            for m in model.modules():
+                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    m.momentum = 0.1
+            model.eval()
+            
+        if is_main: print("✅ BatchNorm Adaptation Completed!\n")
 # =====================================================================
 
 
@@ -158,7 +231,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     y_true_np, y_score_np, y_pred_np = np.array(all_y_true), np.array(all_y_score), np.array(all_y_pred)
 
     roc_json_path = os.path.join(save_dir, "roc_data_test.json")
-    roc_data_json = {"metadata": {"seed": args.seed, "dataset": args.dataset, "num_samples": int(total_samples), "positive_count": int(np.sum(y_true_np)), "negative_count": int(total_samples - np.sum(y_true_np)), "model": "simple_averaging_ensemble_AdaBN"}, "y_true": y_true_np.tolist(), "y_score": y_score_np.tolist(), "y_pred": y_pred_np.tolist()}
+    roc_data_json = {"metadata": {"seed": args.seed, "dataset": args.dataset, "num_samples": int(total_samples), "positive_count": int(np.sum(y_true_np)), "negative_count": int(total_samples - np.sum(y_true_np)), "model": "simple_averaging_ensemble_AdaBN_Dist"}, "y_true": y_true_np.tolist(), "y_score": y_score_np.tolist(), "y_pred": y_pred_np.tolist()}
     with open(roc_json_path, 'w', encoding='utf-8') as f: json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
     
     roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
@@ -279,7 +352,7 @@ def cleanup_distributed():
 
 # ================== MAIN FUNCTION ==================
 def main():
-    parser = argparse.ArgumentParser(description="Simple Averaging Ensemble + AdaBN")
+    parser = argparse.ArgumentParser(description="Simple Averaging Ensemble + Distributed AdaBN")
     parser.add_argument('--epochs', type=int, default=1, help="Unused in Simple Averaging")
     parser.add_argument('--lr', type=float, default=0.0001, help="Unused in Simple Averaging")
     parser.add_argument('--batch_size', type=int, default=32)
@@ -298,10 +371,11 @@ def main():
     set_seed(args.seed)
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
+    is_distributed = world_size > 1 # <--- متغیر کمکی
 
     if is_main:
         print("="*70)
-        print(f"SIMPLE AVERAGING ENSEMBLE + AdaBN")
+        print(f"SIMPLE AVERAGING ENSEMBLE + Distributed AdaBN")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
         print(f"Dataset: {args.dataset}\nData directory: {args.data_dir}\nBatch size: {args.batch_size}\nModels: {len(args.model_paths)}")
@@ -315,19 +389,23 @@ def main():
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    # =================== فراخوانی دقیق تابع AdaBN ===================
+    # =================== فراخوانی AdaBN به صورت موازی ===================
     adabn_loader = create_adabn_dataloader(
         args.data_dir, args.batch_size, num_workers=0,
-        dataset_type=args.dataset, seed=args.seed, is_main=is_main
+        dataset_type=args.dataset, seed=args.seed, is_main=is_main,
+        is_distributed=is_distributed # <--- فعال سازی موازی سازی دیتا
     )
-    adapt_batchnorm_for_new_dataset(base_models, MEANS, STDS, adabn_loader, device, is_main)
+    adapt_batchnorm_for_new_dataset(
+        base_models, MEANS, STDS, adabn_loader, device, is_main,
+        is_distributed=is_distributed # <--- فعال سازی محاسبات موازی روی GPUها
+    )
     del adabn_loader
     if is_main: torch.cuda.empty_cache()
-    # ===============================================================
+    # ====================================================================
 
     ensemble = SimpleAveragingEnsemble(base_models, MEANS, STDS).to(device)
 
-    if world_size > 1:
+    if is_distributed:
         ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     if is_main:
@@ -337,11 +415,11 @@ def main():
 
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
+        is_distributed=is_distributed, seed=args.seed, is_main=is_main)
 
     if is_main:
         print("\n" + "="*70)
-        print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
+        print("INDIVIDUAL MODEL PERFORMANCE (After Distributed AdaBN)")
         print("="*70)
 
     individual_accs = []
@@ -376,7 +454,7 @@ def main():
         print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
 
-        final_results = {'method': 'Simple Averaging + AdaBN', 'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)}, 'ensemble': {'test_accuracy': float(ensemble_test_acc), 'strategy': 'Uniform Weights'}, 'improvement': float(ensemble_test_acc - best_single)}
+        final_results = {'method': 'Simple Averaging + Distributed AdaBN', 'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)}, 'ensemble': {'test_accuracy': float(ensemble_test_acc), 'strategy': 'Uniform Weights'}, 'improvement': float(ensemble_test_acc - best_single)}
         
         results_path = os.path.join(args.save_dir, 'final_results_simple_avg.json')
         with open(results_path, 'w') as f: json.dump(final_results, f, indent=4)
