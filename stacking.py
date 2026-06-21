@@ -48,8 +48,6 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
-# ================== BATCHNORM ADAPTATION (AdaBN) ==================
-@torch.no_grad()
 # =====================================================================
 # ================== DISTRIBUTED BATCHNORM ADAPTATION ==================
 # =====================================================================
@@ -149,7 +147,6 @@ def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, i
             model.eval()
             
         if is_main: print("✅ BatchNorm Adaptation Completed!\n")
-# =====================================================================
 # =====================================================================
 
 
@@ -574,6 +571,7 @@ def main():
         set_seed(current_seed)
         device, local_rank, rank, world_size = setup_distributed()
         is_main = rank == 0
+        is_distributed = (world_size > 1)  # 🔴 تعریف متغیر is_distributed
 
         current_save_dir = os.path.join(args.save_dir, f'seed_{current_seed}')
         
@@ -598,8 +596,6 @@ def main():
         MODEL_NAMES = args.model_names[:len(base_models)]
 
         # =================== فراخوانی و اعمال AdaBN ===================
-        # استفاده از تعداد کلاستر 4 برای جلوگیری از تداخل DistributedSampler
-                # =================== فراخوانی و اعمال AdaBN ===================
         adabn_train_loader, _, _ = create_dataloaders(
             args.data_dir, args.batch_size, dataset_type=args.dataset,
             is_distributed=is_distributed, 
@@ -614,7 +610,6 @@ def main():
         
         del adabn_train_loader, adabn_loader
         torch.cuda.empty_cache()
-        # ===============================================================
         # ===============================================================
 
         ensemble = StackingEnsemble(
@@ -649,7 +644,6 @@ def main():
             print("="*70)
 
         individual_accs = []
-        # برای ارور ندادن DistributedSampler در حلقه برای تست، یک دوره (Epoch) تنظیم می‌کنیم
         if hasattr(test_loader.sampler, 'set_epoch'):
             test_loader.sampler.set_epoch(0)
 
@@ -689,7 +683,6 @@ def main():
         if hasattr(test_loader.sampler, 'set_epoch'):
             test_loader.sampler.set_epoch(1)
 
-        # دریافت خروجی‌ها برای JSON و Log
         ensemble_test_acc, learned_weights, learned_bias, predictions_data = evaluate_ensemble_final_ddp(
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
@@ -702,14 +695,11 @@ def main():
             print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
             print("="*70)
 
-            # استخراج لیست‌ها
             y_true, y_score, y_pred = predictions_data
             
-            # 1. ذخیره JSON
             json_path = os.path.join(current_save_dir, 'test_predictions.json')
             save_predictions_json(y_true, y_score, y_pred, json_path, current_seed, args.dataset)
 
-            # 2. ذخیره فایل txt دقیقاً مطابق با کنسول
             log_path_ensemble = os.path.join(current_save_dir, 'prediction_log_stacking.txt')
             save_accuracy_log_from_results(y_true, y_pred, log_path_ensemble, "Stacking Ensemble")
 
@@ -746,9 +736,6 @@ def main():
             }, final_model_path)
             print(f"Model saved: {final_model_path}")
 
-        # ==========================================
-        # FIX BUG 1: Save Best Single Model Log (با all_gather_object درست انجام شود)
-        # ==========================================
         single_model = base_models[best_idx]
         single_model.eval()
         single_y_true_local = []
@@ -758,7 +745,6 @@ def main():
         if hasattr(test_loader.sampler, 'set_epoch'):
             test_loader.sampler.set_epoch(2)
 
-        # تمام GPU ها باید این حلقه را بزنند
         for images, labels in tqdm(test_loader, desc="Eval Single for Log", disable=not is_main):
             images, labels = images.to(device), labels.to(device)
             images = single_normalizer(images, 0)
@@ -770,7 +756,6 @@ def main():
             single_y_true_local.extend(labels.cpu().numpy().tolist())
             single_y_pred_local.extend(pred.cpu().numpy().tolist())
         
-        # جمع‌آوری نتایج از تمام GPU ها
         if world_size > 1:
             gathered_true = [None for _ in range(world_size)]
             gathered_pred = [None for _ in range(world_size)]
@@ -785,23 +770,16 @@ def main():
                 single_y_true = single_y_true_local
                 single_y_pred = single_y_pred_local
 
-        # فقط رنک ۰ لاگ را ذخیره می‌کند (با دیتای کامل شده)
         if is_main:
             log_path_single = os.path.join(current_save_dir, 'prediction_log_best_single.txt')
             save_accuracy_log_from_results(single_y_true, single_y_pred, log_path_single, MODEL_NAMES[best_idx])
 
-            # ==========================================
-            # Visualization
-            # ==========================================
             vis_dir = os.path.join(current_save_dir, 'visualizations')
             generate_visualizations(
                 ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
                 args.num_grad_cam_samples, args.num_lime_samples,
                 args.dataset, is_main)
 
-            # ==========================================
-            # FIX BUG 2: plot_roc_and_f1 قبل از cleanup و با داده‌های کامل
-            # ==========================================
             plot_roc_and_f1(
                 y_true=y_true,
                 y_score=y_score,
@@ -810,9 +788,6 @@ def main():
                 is_main=is_main
             )
 
-        # ==========================================
-        # در نهایت پاکسازی DDP انجام شود
-        # ==========================================
         cleanup_distributed()
 
 if __name__ == "__main__":
