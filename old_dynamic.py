@@ -425,10 +425,12 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     real_total = len(loader.dataset)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    
+    # فقط اگر روی چند GPU هستیم، نتایج را جمع کن
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        
     acc = 100. * correct_tensor.item() / real_total
-    if is_main: print(f" {name}: {acc:.2f}%")
-    return acc
 
 @torch.no_grad()
 def evaluate_accuracy_ddp(model, loader, device):
@@ -442,7 +444,10 @@ def evaluate_accuracy_ddp(model, loader, device):
     
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     real_total = len(loader.dataset)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        
     return 100. * correct_tensor.item() / real_total
 
 
