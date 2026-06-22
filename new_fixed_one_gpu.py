@@ -13,7 +13,7 @@ import random
 
 # فرض بر این است که این فایل‌ها در مسیر شما موجود هستند
 from metrics_utils import plot_roc_and_f1
-from dataset_utils_gpu import (
+from dataset_utils import (
     UADFVDataset, CustomGenAIDataset, NewGenAIDataset,
     create_dataloaders, get_sample_info
 )
