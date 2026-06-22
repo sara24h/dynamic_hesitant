@@ -16,7 +16,7 @@ from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
 
-from dataset_utils import (
+from old_dataset_utils import (
     UADFVDataset, 
     create_dataloaders, 
     get_sample_info, 
@@ -224,13 +224,22 @@ class SimpleAveragingEnsemble(nn.Module):
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-            outputs[:, i] = out # بدون سیگموید (Logit خام)
-
-        final_output = outputs.mean(dim=1) # میانگین لاجیت‌ها
+            outputs[:, i] = torch.sigmoid(out)  # ← تبدیل به احتمال
+    
+        final_output = outputs.mean(dim=1)  # ← میانگین احتمالات
     
         if return_details:
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
-            return final_output, weights, None, outputs
+        # ذخیره لاجیت‌های خام برای گزارش‌گیری
+            raw_logits = torch.zeros_like(outputs)
+            for i in range(self.num_models):
+                x_n = self.normalizations(x, i)
+                with torch.no_grad():
+                    out = self.models[i](x_n)
+                    if isinstance(out, (tuple, list)):
+                        out = out[0]
+                raw_logits[:, i] = out
+            return final_output, weights, None, raw_logits
         return final_output, None
 
 
