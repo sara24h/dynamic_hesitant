@@ -216,24 +216,27 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    total = 0
+    
+    # تعداد واقعی نمونه‌ها (بدون padding)
+    total_real_samples = len(loader.dataset)
+    
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
         out = model(images)
         if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
-        total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     
-    acc = 100. * correct_tensor.item() / total_tensor.item() if total_tensor.item() > 0 else 0.0
-    if is_main: print(f" {name}: {acc:.2f}%")
+    # محاسبه با تعداد واقعی نمونه‌ها
+    acc = 100. * correct_tensor.item() / total_real_samples
+    
+    if is_main: 
+        print(f" {name}: {acc:.2f}% (Real samples: {total_real_samples})")
     return acc
 
 
@@ -241,28 +244,31 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
-    total = 0
+    
+    # تعداد واقعی نمونه‌ها (بدون padding)
+    total_real_samples = len(loader.dataset)
+    
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
-        outputs, _ = model(images)          
+        outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
-        total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-    acc = 100. * correct_tensor.item() / total_tensor.item() if total_tensor.item() > 0 else 0.0
-    return acc
+    
+    # محاسبه با تعداد واقعی نمونه‌ها
+    return 100. * correct_tensor.item() / total_real_samples
 
 
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
     total_correct = 0
-    total_samples = 0
+    
+    # تعداد واقعی نمونه‌ها (بدون padding)
+    total_real_samples = len(loader.dataset)
     
     ws = dist.get_world_size() if dist.is_initialized() else 1
     
@@ -290,11 +296,10 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         all_y_pred.extend(pred_int.cpu().numpy().tolist())
         
         total_correct += pred_int.eq(labels.long()).sum().item()
-        total_samples += labels.size(0)
 
-    stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
+    correct_tensor = torch.tensor(total_correct, dtype=torch.long, device=device)
     if dist.is_initialized():
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
 
     if ws > 1:
         gathered_true = [None for _ in range(ws)]
@@ -312,9 +317,13 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
             all_y_pred = [item for sublist in gathered_pred for item in sublist]
 
     if is_main:
-        total_correct = stats[0].item()
-        total_samples = stats[1].item()
-        acc = 100. * total_correct / total_samples
+        # حذف نمونه‌های تکراری از لیست‌ها
+        all_y_true = all_y_true[:total_real_samples]
+        all_y_score = all_y_score[:total_real_samples]
+        all_y_pred = all_y_pred[:total_real_samples]
+        
+        # محاسبه دقت با تعداد واقعی
+        acc = 100. * correct_tensor.item() / total_real_samples
         
         final_weights = last_weights.numpy() if last_weights is not None else np.zeros(len(model_names))
 
@@ -322,7 +331,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"{name.upper()} SET RESULTS (Weighted Average)")
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
-        print(f" → Total Samples: {total_samples:,}")
+        print(f" → Total Real Samples: {total_real_samples:,}")
         print(f"\nLearned Model Weights (Global):")
         for i, (w, mname) in enumerate(zip(final_weights, model_names)):
             print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
