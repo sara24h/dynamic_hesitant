@@ -39,115 +39,161 @@ def set_seed(seed: int = 42):
 # ================== UNIFIED FINAL EVALUATION & REPORT ==================
 @torch.no_grad()
 def final_evaluation_and_report(model, loader, device, save_dir, model_name, args, is_main):
-    """
-    ارزیابی نهایی با فرمول درست: Sigmoid(Mean(Logits))
-    و با رعایت اعمال ترنسفورم‌های تصویر (256x256).
-    """
+   
     if not is_main or loader is None: return 0.0, None, None
 
     model.eval()
     
-    # استخراج اندیس‌های تست بدون دور زدن TransformSubset
+    # استخراج دیتاست پایه و اندیس‌ها
+    base_dataset = loader.dataset
+    if hasattr(base_dataset, 'dataset'):
+        base_dataset = base_dataset.dataset
+        
     if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'indices'):
         test_indices = loader.sampler.indices
     elif hasattr(loader.dataset, 'indices'):
         test_indices = loader.dataset.indices
     else:
-        test_indices = list(range(len(loader.dataset)))
+        test_indices = list(range(len(base_dataset)))
 
-    all_y_true, all_y_score, all_y_pred, lines = [], [], [], []
-    lines.extend(["="*100, "SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):", "="*100])
+    # لیست‌های برای ذخیره داده‌ها
+    all_y_true = []
+    all_y_score = []
+    all_y_pred = []
+    lines = []
+
+    lines.append("="*100)
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
+    lines.append("="*100)
     header = f"{'Sample_ID':<10} {'Sample_Path':<60} {'True_Label':<12} {'Predicted_Label':<15} {'Correct':<10}"
-    lines.extend([header, "-"*100])
+    lines.append(header)
+    lines.append("-"*100)
 
     TP, TN, FP, FN = 0, 0, 0, 0
-    correct_count, total_samples = 0, 0
+    correct_count = 0
+    total_samples = 0
 
     print(f"\nRunning Final Evaluation on {len(test_indices)} samples...")
     
-    for i, idx_in_subset in enumerate(tqdm(test_indices, desc="Final Eval")):
+    for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
         try:
-            # استفاده از loader.dataset تا ترنسفورم‌های Resize و CenterCrop اعمال شوند
-            image, label = loader.dataset[idx_in_subset]
-            
-            # پیدا کردن مسیر فایل اصلی برای لاگ
-            if hasattr(loader.dataset, 'dataset') and hasattr(loader.dataset, 'indices'):
-                original_idx = loader.dataset.indices[idx_in_subset]
-                path, _ = get_sample_info(loader.dataset.dataset, original_idx)
-            else:
-                path, _ = get_sample_info(loader.dataset, idx_in_subset)
-        except Exception as e: 
+            image, label = base_dataset[global_idx]
+            path, _ = get_sample_info(base_dataset, global_idx)
+        except Exception as e:
             continue
 
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
         
         # پیش‌بینی مدل
-        output, _, _, _ = model(image, return_details=True)
+        # final_output اکنون دقیقاً "میانگین لاجیت‌ها" است
+        output, _, _, stacked_logits = model(image, return_details=True)
+ 
+        # تغییر اصلاحی: اعمال سیگمویید روی میانگین لاجیت‌ها (Logit Averaging)
+        probs = torch.sigmoid(output).squeeze().item()
+        pred_int = int(probs > 0.5)
         
-        # فرمول درست: Sigmoid روی میانگین لاجیت‌ها
-        prob = torch.sigmoid(output.squeeze()).item()
-        pred_int = int(prob > 0.5)
-
+        # ذخیره برای ROC
         all_y_true.append(label_int)
-        all_y_score.append(prob)
+        all_y_score.append(probs)
         all_y_pred.append(pred_int)
         
+        # محاسبه آمار
         is_correct = (pred_int == label_int)
         if is_correct: correct_count += 1
+        
         if label_int == 1:
             if pred_int == 1: TP += 1
             else: FN += 1
         else:
             if pred_int == 1: FP += 1
             else: TN += 1
+            
         total_samples += 1
         
+        # آماده‌سازی خط لاگ
         filename = os.path.basename(path)
         if len(filename) >55: filename = filename[:25] + "..." + filename[-27:]
-        lines.append(f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}")
+        line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
+        lines.append(line)
 
+    # محاسبه معیارهای نهایی
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
     prec = TP / (TP + FP) if (TP + FP) > 0 else 0
     rec = TP / (TP + FN) if (TP + FN) > 0 else 0
     spec = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    print(f"\n{'='*70}\nFINAL RESULTS\n{'='*70}")
-    print(f"Precision: {prec:.4f}\nRecall: {rec:.4f}\nSpecificity: {spec:.4f}")
-    print(f"\nConfusion Matrix:\n                 Predicted Real  Predicted Fake")
-    print(f"    Actual Real      {TP:<15} {FN:<15}\n    Actual Fake      {FP:<15} {TN:<15}")
-    print(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
-    print(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)\n{'='*70}")
+    if total == 0:
+        return 0.0, None, None
 
-    output_str = ["-" * 100, "SUMMARY STATISTICS:", "-" * 100, f"Accuracy: {acc*100:.2f}%", f"Precision: {prec:.4f}", f"Recall: {rec:.4f}", f"Specificity: {spec:.4f}"]
-    output_str.extend(["\nConfusion Matrix:", f"                 {'Predicted Real':<15} {'Predicted Fake':<15}", f"    Actual Real   {TP:<15} {FN:<15}", f"    Actual Fake   {FP:<15} {TN:<15}"])
-    output_str.extend([f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)", f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)"])
+    print(f"\n{'='*70}")
+    print("FINAL RESULTS")
+    print(f"{'='*70}")
+    print(f"Precision: {prec:.4f}")
+    print(f"Recall: {rec:.4f}")
+    print(f"Specificity: {spec:.4f}")
+    print(f"\nConfusion Matrix:")
+    print(f"                 Predicted Real  Predicted Fake")
+    print(f"    Actual Real      {TP:<15} {FN:<15}")
+    print(f"    Actual Fake      {FP:<15} {TN:<15}")
+    print(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    print(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
+    print("="*70)
+
+    output_str = []
+    output_str.append("-" * 100)
+    output_str.append("SUMMARY STATISTICS:")
+    output_str.append("-" * 100)
+    output_str.append(f"Accuracy: {acc*100:.2f}%")
+    output_str.append(f"Precision: {prec:.4f}")
+    output_str.append(f"Recall: {rec:.4f}")
+    output_str.append(f"Specificity: {spec:.4f}")
+    output_str.append("\nConfusion Matrix:")
+    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
+    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
+    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
+    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc*100:.2f}%)")
+    output_str.append(f"Incorrect Predictions: {total - correct_count} ({(1-acc)*100:.2f}%)")
     output_str.extend(lines)
 
     log_path = os.path.join(save_dir, 'prediction_log.txt')
-    with open(log_path, 'w') as f: f.write("\n".join(output_str))
+    with open(log_path, 'w') as f:
+        f.write("\n".join(output_str))
     print(f"✅ Prediction log saved to: {log_path}")
 
-    y_true_np, y_score_np, y_pred_np = np.array(all_y_true), np.array(all_y_score), np.array(all_y_pred)
+    print("\nCollecting ROC data (y_true & y_score) ...")
+    
+    y_true_np = np.array(all_y_true)
+    y_score_np = np.array(all_y_score)
+    y_pred_np = np.array(all_y_pred)
 
+    # ذخیره در JSON
     roc_json_path = os.path.join(save_dir, "roc_data_test.json")
     roc_data_json = {
         "metadata": {
-            "seed": args.seed, "dataset": args.dataset, "num_samples": int(total_samples), 
-            "positive_count": int(np.sum(y_true_np)), "negative_count": int(total_samples - np.sum(y_true_np)), 
-            "model": "simple_averaging_ensemble"
-        }, 
-        "y_true": y_true_np.tolist(), "y_score": y_score_np.tolist(), "y_pred": y_pred_np.tolist()
+            "seed": args.seed,
+            "dataset": args.dataset,
+            "num_samples": int(total_samples),
+            "positive_count": int(np.sum(y_true_np)),
+            "negative_count": int(total_samples - np.sum(y_true_np)),
+            "model": "simple_logit_averaging_ensemble" # نام بهروز شد
+        },
+        "y_true": y_true_np.tolist(),
+        "y_score": y_score_np.tolist(),
+        "y_pred": y_pred_np.tolist()
     }
-    with open(roc_json_path, 'w', encoding='utf-8') as f: json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
-    
+    with open(roc_json_path, 'w', encoding='utf-8') as f:
+        json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
+    print(f"ROC data saved (JSON): {roc_json_path}")
+
+    # ذخیره در TXT
     roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
-    with open(roc_txt_path, 'w') as f:
+    with open(roc_txt_path, 'w', encoding='utf-8') as f:
         f.write("y_true\ty_score\ty_pred\n")
-        for t, s, p in zip(y_true_np, y_score_np, y_pred_np): f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
-        
-    print(f"✅ ROC data saved.")
+        for t, s, p in zip(y_true_np, y_score_np, y_pred_np):
+            f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
+    print(f"ROC data saved (TXT):  {roc_txt_path}")
 
     return acc * 100, y_true_np, y_score_np
 
@@ -164,29 +210,32 @@ class MultiModelNormalization(nn.Module):
 
 
 class SimpleAveragingEnsemble(nn.Module):
-    def __init__(self, models: List[nn.Module], means: List[Tuple[float]], stds: List[Tuple[float]]):
+    def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
+                 stds: List[Tuple[float]]):
         super().__init__()
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        # ذخیره لاجیت‌های خام تمام مدل‌ها
+        # خروجی هر مدل به شکل (Batch_Size, 1) ذخیره می‌شود
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
         
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
             with torch.no_grad():
                 out = self.models[i](x_n)
-                if isinstance(out, (tuple, list)): out = out[0]
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+            # اصلاح باگ: اضافه کردن view تا ابعاد به درستی در تانسور 3 بعدی قرار بگیرد
             outputs[:, i] = out.view(x.size(0), 1)
 
-        # محاسبه میانگین لاجیت‌ها
+        # محاسبه میانگین لاجیت‌ها روی محور مدل‌ها (Dim=1)
+        # خروجی نهایی شکل (Batch_Size, 1) خواهد داشت
         final_output = outputs.mean(dim=1)
         
         if return_details:
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
-            # خروجی اول = میانگین لاجیت‌ها ، خروجی آخر = لاجیت‌های خام تک تک مدل‌ها
             return final_output, weights, None, outputs
         return final_output, None
 
@@ -252,12 +301,11 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-        
-    acc = 100. * correct_tensor.item() / total_tensor.item()
+    
+    acc = 100. * correct_tensor.item() / total_tensor.item() if total_tensor.item() > 0 else 0.0
     if is_main:
         print(f" {name}: {acc:.2f}%")
     return acc
@@ -279,13 +327,14 @@ def setup_distributed():
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         return device, 0, 0, 1
 
+
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
 # ================== MAIN FUNCTION ==================
 def main():
-    parser = argparse.ArgumentParser(description="Simple Averaging Ensemble (Standard Logit Averaging)")
+    parser = argparse.ArgumentParser(description="Simple Logit Averaging Ensemble")
     parser.add_argument('--epochs', type=int, default=1, help="Unused in Simple Averaging")
     parser.add_argument('--lr', type=float, default=0.0001, help="Unused in Simple Averaging")
     parser.add_argument('--batch_size', type=int, default=32)
@@ -306,11 +355,10 @@ def main():
     set_seed(args.seed)
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
-    is_distributed = world_size > 1
 
     if is_main:
         print("="*70)
-        print(f"SIMPLE AVERAGING ENSEMBLE (Sigmoid of Mean Logits)")
+        print(f"SIMPLE LOGIT AVERAGING ENSEMBLE")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
         print(f"Dataset: {args.dataset}")
@@ -321,14 +369,8 @@ def main():
 
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-    
-    # تنظیم mean/std برای تعداد مدل‌ها
-    if len(args.model_paths) > len(MEANS):
-        MEANS = MEANS + [MEANS[-1]] * (len(args.model_paths) - len(MEANS))
-        STDS = STDS + [STDS[-1]] * (len(args.model_paths) - len(STDS))
-    else:
-        MEANS = MEANS[:len(args.model_paths)]
-        STDS = STDS[:len(args.model_paths)]
+    MEANS = MEANS[:len(args.model_paths)]
+    STDS = STDS[:len(args.model_paths)]
 
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
@@ -337,17 +379,17 @@ def main():
         base_models, MEANS, STDS
     ).to(device)
 
-    if is_distributed:
-        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    if world_size > 1:
+        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
     if is_main:
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
         total = sum(p.numel() for p in ensemble.parameters())
-        print(f"Total params: {total:,} | Trainable: {trainable:,} (Kept trainable for DDP compatibility)\n")
+        print(f"Total params: {total:,} | Trainable: {trainable:,} (Parameters kept trainable for DDP compatibility)\n")
 
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=is_distributed, seed=args.seed, is_main=is_main)
+        is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
 
     if is_main:
         print("\n" + "="*70)
@@ -362,8 +404,8 @@ def main():
             MEANS[i], STDS[i], is_main)
         individual_accs.append(acc)
 
-    best_single = max(individual_accs)
-    best_idx = individual_accs.index(best_single)
+    best_single = max(individual_accs) if individual_accs else 0.0
+    best_idx = individual_accs.index(best_single) if individual_accs else 0
 
     if is_main:
         print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
@@ -377,6 +419,7 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
+    test_loader_full = None
     if is_main:
         os.makedirs(args.save_dir, exist_ok=True)
         
@@ -386,10 +429,10 @@ def main():
             is_distributed=False, seed=args.seed, is_main=True
         )
 
-        # اجرای ارزیابی یکپارچه با فرمول درست
+        # اجرای ارزیابی یکپارچه
         ensemble_test_acc, y_true, y_score = final_evaluation_and_report(
             ensemble_module, test_loader_full, device, args.save_dir, 
-            "Simple Averaging Ensemble", args, is_main
+            "Simple Logit Averaging Ensemble", args, is_main
         )
 
         print("\n" + "="*70)
@@ -401,14 +444,14 @@ def main():
         print("="*70)
 
         final_results = {
-            'method': 'Simple Averaging (Logit Mean)',
+            'method': 'Simple Logit Averaging',
             'best_single_model': {
                 'name': MODEL_NAMES[best_idx],
                 'accuracy': float(best_single)
             },
             'ensemble': {
                 'test_accuracy': float(ensemble_test_acc),
-                'strategy': 'Sigmoid(Mean(Logits))'
+                'strategy': 'Uniform Logit Averaging'
             },
             'improvement': float(ensemble_test_acc - best_single)
         }
@@ -436,7 +479,7 @@ def main():
 
     cleanup_distributed()
     
-    if is_main:
+    if is_main and test_loader_full is not None:
         plot_roc_and_f1(
             ensemble_module,
             test_loader_full, 
