@@ -418,11 +418,11 @@ def evaluate_single_model_ddp(model, loader, device, name, mean, std, is_main):
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    total_real_samples = len(loader.dataset)  # ✓ هر دو کد این را دارند
+    total_real_samples = len(loader.dataset)
     
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
-        #images = normalizer(images, 0)
+        images = normalizer(images, 0)
         out = model(images)
         if isinstance(out, (tuple, list)):
             out = out[0]
@@ -431,7 +431,7 @@ def evaluate_single_model_ddp(model, loader, device, name, mean, std, is_main):
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     
-    if dist.is_initialized():  # ← این بررسی اضافه شود
+    if dist.is_initialized(): 
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
     acc = 100. * correct_tensor.item() / total_real_samples
@@ -445,7 +445,6 @@ def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
     
-    # تعداد واقعی نمونه‌ها (بدون padding)
     total_real_samples = len(loader.dataset)
     
     for images, labels in loader:
@@ -457,7 +456,6 @@ def evaluate_accuracy_ddp(model, loader, device):
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
-    # محاسبه با تعداد واقعی نمونه‌ها
     return 100. * correct_tensor.item() / total_real_samples
 
 
