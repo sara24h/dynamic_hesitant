@@ -728,7 +728,8 @@ def main():
 
     best_val_acc = train_hesitant_fuzzy(
         ensemble, train_loader, val_loader,
-        args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES,world_size=world_size )
+        args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES
+    )
 
     # لود بهترین مدل
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
