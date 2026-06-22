@@ -35,10 +35,7 @@ def set_seed(seed: int = 42):
 
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
-    """
-    ارزیابی نهایی یکپارچه برای اطمینان از یکسان بودن اعداد در کنسول و لاگ.
-    شامل ذخیره داده‌های McNemar و ROC (y_true, y_score, y_pred).
-    """
+
     if not is_main: return 0.0, None, None
 
     model.eval()
@@ -141,7 +138,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print("="*70)
 
     print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
-    print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
+    print(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
     print("="*70)
 
     # ════════════════════════════════════════════════════════════════
@@ -223,7 +220,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
     output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
     output_str.append(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
-    output_str.append(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
+    output_str.append(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
     output_str.extend(lines)
     
     log_path = os.path.join(save_dir, 'prediction_log.txt')
@@ -358,7 +355,7 @@ class FuzzyHesitantEnsemble(nn.Module):
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
-        hesitancy = all_memberships.var(dim=2)
+        hesitancy = all_memberships.var(dim=2,unbiased=False)
         avg_hesitancy = hesitancy.mean(dim=1)
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
         final_weights = final_weights * mask
@@ -431,6 +428,7 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
         
     acc = 100. * correct_tensor.item() / real_total
+    return acc
 
 @torch.no_grad()
 def evaluate_accuracy_ddp(model, loader, device):
@@ -500,7 +498,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             train_total += batch_size
             
             # محاسبه آمارهای دوره
-            per_model_hesitancy = memberships.var(dim=2)
+            per_model_hesitancy = memberships.var(dim=2,unbiased=False)
             sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
             
             active_mask = (weights > 1e-4).float()
