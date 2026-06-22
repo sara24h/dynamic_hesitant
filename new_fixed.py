@@ -422,7 +422,7 @@ def evaluate_single_model_ddp(model, loader, device, name, mean, std, is_main):
     
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
-        images = normalizer(images, 0)
+        #images = normalizer(images, 0)
         out = model(images)
         if isinstance(out, (tuple, list)):
             out = out[0]
