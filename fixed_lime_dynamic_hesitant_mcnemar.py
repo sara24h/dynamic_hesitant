@@ -108,10 +108,9 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             lines.append(line)
 
     total_samples = len(all_y_true)
-    
-    # هشدار در صورت نادیده گرفته شدن نمونه‌ها
-        # هشدار در صورت نادیده گرفته شدن نمونه‌ها
+ 
     if skipped > 0:
+        # اینجا را اصلاح کنید:
         print(f"\n[WARNING] {skipped} samples skipped out of {len(local_indices)} total test samples!")
         
     if total_samples == 0:
@@ -400,12 +399,13 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
 
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
-def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
-                              name: str, mean: Tuple[float, float, float],
-                              std: Tuple[float, float, float], is_main: bool) -> float:
+@torch.no_grad()
+def evaluate_single_model_ddp(model, loader, device, name, mean, std, is_main):
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
+    total = 0  # ← شمارش واقعی نمونه‌های پردازش‌شده
+
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
@@ -413,28 +413,41 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
+        total += labels.size(0)  # ← بچ واقعی، نه کل دیتاست
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    real_total = len(loader.dataset)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    acc = 100. * correct_tensor.item() / real_total
+    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
+
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+
+    acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main: print(f" {name}: {acc:.2f}%")
     return acc
+
 
 @torch.no_grad()
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
+    total = 0  # ← همینجا هم اضافه شود
+
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-    
+        total += labels.size(0)
+
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    real_total = len(loader.dataset)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    return 100. * correct_tensor.item() / real_total
+    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
+
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+
+    return 100. * correct_tensor.item() / total_tensor.item()
 
 
 # ================== TRAINING ==================
@@ -495,7 +508,19 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             sum_cumsum_used += cumsum_used_samples
             sum_active_models += active_mask.sum(dim=0)
 
-        train_acc = 100. * train_correct / train_total
+        if dist.is_initialized():
+        train_acc_local = 100. * train_correct / train_total  # برای نمایش محلی
+
+        if dist.is_initialized():
+            tc = torch.tensor(train_correct, dtype=torch.long, device=device)
+            tt = torch.tensor(train_total,   dtype=torch.long, device=device)
+            dist.all_reduce(tc, op=dist.ReduceOp.SUM)
+            dist.all_reduce(tt, op=dist.ReduceOp.SUM)
+            train_acc = 100. * tc.item() / tt.item()
+        else:
+            train_acc = train_acc_local
+
+        train_loss = train_loss / train_total
         train_loss = train_loss / train_total
         
         avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
@@ -726,7 +751,6 @@ def main():
             'seed': args.seed
         }, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
 
-    cleanup_distributed()
     
     if is_main:
         plot_roc_and_f1(
@@ -737,6 +761,7 @@ def main():
             MODEL_NAMES,
             is_main
         )
+    cleanup_distributed()  
 
 if __name__ == "__main__":
     main()
