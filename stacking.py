@@ -144,7 +144,10 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    total = 0
+    
+    # تعداد واقعی نمونه‌ها (بدون padding)
+    total_real_samples = len(loader.dataset)
+    
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
@@ -152,16 +155,16 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         if isinstance(out, (tuple, list)):
             out = out[0]
         pred = (out.squeeze(1) > 0).long()
-        total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-    acc = 100. * correct_tensor.item() / total_tensor.item()
+    
+    # محاسبه با تعداد واقعی نمونه‌ها
+    acc = 100. * correct_tensor.item() / total_real_samples
+    
     if is_main:
-        print(f" {name}: {acc:.2f}%")
+        print(f" {name}: {acc:.2f}% (Real samples: {total_real_samples})")
     return acc
 
 
@@ -169,27 +172,30 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
-    total = 0
+    
+    # تعداد واقعی نمونه‌ها (بدون padding)
+    total_real_samples = len(loader.dataset)
+    
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
-        total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-    acc = 100. * correct_tensor.item() / total_tensor.item()
-    return acc
+    
+    # محاسبه با تعداد واقعی نمونه‌ها
+    return 100. * correct_tensor.item() / total_real_samples
 
 
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
     total_correct = 0
-    total_samples = 0
+    
+    # تعداد واقعی نمونه‌ها (بدون padding)
+    total_real_samples = len(loader.dataset)
     
     ws = dist.get_world_size() if dist.is_initialized() else 1
     
@@ -212,10 +218,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         all_y_pred.extend(pred_int.cpu().numpy().tolist())
         
         total_correct += pred_int.eq(labels.long()).sum().item()
-        total_samples += labels.size(0)
 
-    stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
-    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    correct_tensor = torch.tensor(total_correct, dtype=torch.long, device=device)
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
 
     if ws > 1:
         gathered_true = [None for _ in range(ws)]
@@ -232,9 +237,13 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
             all_y_pred = [item for sublist in gathered_pred for item in sublist]
 
     if is_main:
-        total_correct = stats[0].item()
-        total_samples = stats[1].item()
-        acc = 100. * total_correct / total_samples
+        # حذف نمونه‌های تکراری از لیست‌ها
+        all_y_true = all_y_true[:total_real_samples]
+        all_y_score = all_y_score[:total_real_samples]
+        all_y_pred = all_y_pred[:total_real_samples]
+        
+        # محاسبه دقت با تعداد واقعی
+        acc = 100. * correct_tensor.item() / total_real_samples
         
         meta_learner = model.meta_learner
         weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
@@ -244,7 +253,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"{name.upper()} SET RESULTS (Stacking - Logistic Regression)")
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
-        print(f" → Total Samples: {total_samples:,}")
+        print(f" → Total Real Samples: {total_real_samples:,}")
         
         print(f"\nMeta-Learner (Logistic Regression) Analysis:")
         print(f"  Bias (Intercept): {bias:+.4f}")
@@ -256,7 +265,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         return acc, weights.tolist(), bias, (all_y_true, all_y_score, all_y_pred)
     
     return 0.0, [0.0]*len(model_names), 0.0, ([], [], [])
-
 
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
@@ -390,10 +398,7 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
 
 # ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
-    """
-    ساخت فایل txt دقیقاً بر اساس لیست‌های y_true و y_pred که از تست کنسول آمده‌اند.
-    این تابع تضمین می‌کند که اعداد با کنسول یکی باشند.
-    """
+
     total = len(y_true)
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
@@ -606,15 +611,6 @@ def main():
                 'seed': current_seed
             }, final_model_path)
             print(f"Model saved: {final_model_path}")
-
-            # ==========================================
-            # Save Best Single Model Log (بازسازی لیست برای مدل تکی)
-            # ==========================================
-            # نکته: برای مدل تکی باید دوباره تست انجام دهیم تا لیست y_pred را داشته باشیم
-            # چون در evaluate_single_model_ddp قبلی لیست را برنمی‌گرداندیم.
-            # برای جلوگیری از اتلاف وقت، می‌توانیم یک دور مدل تکی را اجرا کنیم یا اینکه
-            # همان فایل JSON انسمبل را ملاک قرار دهیم.
-            # اما برای تکمیل کد، تابعی می‌نویسیم که لیست مدل تکی را هم بسازد:
             
             print("\nGenerating Single Best Model Log...")
             single_model = base_models[best_idx]
@@ -622,7 +618,10 @@ def main():
             single_y_true = []
             single_y_pred = []
             single_normalizer = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
-            
+
+# تعداد واقعی نمونه‌ها
+            total_real_samples = len(test_loader.dataset)
+
             for images, labels in tqdm(test_loader, desc="Eval Single for Log"):
                 images, labels = images.to(device), labels.to(device)
                 images = single_normalizer(images, 0)
@@ -630,10 +629,14 @@ def main():
                     out = single_model(images)
                     if isinstance(out, (tuple, list)): out = out[0]
                     pred = (out.squeeze(1) > 0).long()
-                    
-                single_y_true.extend(labels.cpu().numpy().tolist())
-                single_y_pred.extend(pred.cpu().numpy().tolist())
-            
+        
+            single_y_true.extend(labels.cpu().numpy().tolist())
+            single_y_pred.extend(pred.cpu().numpy().tolist())
+
+# حذف نمونه‌های تکراری
+            single_y_true = single_y_true[:total_real_samples]
+            single_y_pred = single_y_pred[:total_real_samples]
+
             log_path_single = os.path.join(current_save_dir, 'prediction_log_best_single.txt')
             save_accuracy_log_from_results(single_y_true, single_y_pred, log_path_single, MODEL_NAMES[best_idx])
 
