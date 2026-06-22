@@ -85,12 +85,11 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
         
-        # پیش‌بینی مدل
-        # final_output اکنون دقیقاً "میانگین لاجیت‌ها" است
+                # پیش‌بینی مدل (مدل لاجیت برمی‌گرداند، پس ما اینجا سیگموید می‌گیریم)
         output, _, _, stacked_logits = model(image, return_details=True)
- 
-        # تغییر اصلاحی: اعمال سیگمویید روی میانگین لاجیت‌ها (Logit Averaging)
-        probs = torch.sigmoid(output).squeeze().item()
+
+        # برای گزارش و ROC باید لاجیت‌ها را به احتمالات (بین 0 و 1) تبدیل کنیم
+        probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
         pred_int = int(probs > 0.5)
         
         # ذخیره برای ROC
@@ -124,8 +123,6 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     rec = TP / (TP + FN) if (TP + FN) > 0 else 0
     spec = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    if total == 0:
-        return 0.0, None, None
 
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
@@ -162,6 +159,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         f.write("\n".join(output_str))
     print(f"✅ Prediction log saved to: {log_path}")
 
+
     print("\nCollecting ROC data (y_true & y_score) ...")
     
     y_true_np = np.array(all_y_true)
@@ -177,7 +175,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
             "num_samples": int(total_samples),
             "positive_count": int(np.sum(y_true_np)),
             "negative_count": int(total_samples - np.sum(y_true_np)),
-            "model": "simple_logit_averaging_ensemble" # نام بهروز شد
+            "model": "simple_averaging_ensemble"
         },
         "y_true": y_true_np.tolist(),
         "y_score": y_score_np.tolist(),
@@ -218,22 +216,18 @@ class SimpleAveragingEnsemble(nn.Module):
         self.normalizations = MultiModelNormalization(means, stds)
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
-        # خروجی هر مدل به شکل (Batch_Size, 1) ذخیره می‌شود
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-        
+    
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
             with torch.no_grad():
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-            # اصلاح باگ: اضافه کردن view تا ابعاد به درستی در تانسور 3 بعدی قرار بگیرد
-            outputs[:, i] = out.view(x.size(0), 1)
+            outputs[:, i] = out # بدون سیگموید (Logit خام)
 
-        # محاسبه میانگین لاجیت‌ها روی محور مدل‌ها (Dim=1)
-        # خروجی نهایی شکل (Batch_Size, 1) خواهد داشت
-        final_output = outputs.mean(dim=1)
-        
+        final_output = outputs.mean(dim=1) # میانگین لاجیت‌ها
+    
         if return_details:
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
             return final_output, weights, None, outputs
@@ -301,11 +295,9 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-    
-    acc = 100. * correct_tensor.item() / total_tensor.item() if total_tensor.item() > 0 else 0.0
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main:
         print(f" {name}: {acc:.2f}%")
     return acc
@@ -334,7 +326,7 @@ def cleanup_distributed():
 
 # ================== MAIN FUNCTION ==================
 def main():
-    parser = argparse.ArgumentParser(description="Simple Logit Averaging Ensemble")
+    parser = argparse.ArgumentParser(description="Simple Averaging Ensemble")
     parser.add_argument('--epochs', type=int, default=1, help="Unused in Simple Averaging")
     parser.add_argument('--lr', type=float, default=0.0001, help="Unused in Simple Averaging")
     parser.add_argument('--batch_size', type=int, default=32)
@@ -358,7 +350,7 @@ def main():
 
     if is_main:
         print("="*70)
-        print(f"SIMPLE LOGIT AVERAGING ENSEMBLE")
+        print(f"SIMPLE AVERAGING ENSEMBLE")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
         print(f"Dataset: {args.dataset}")
@@ -404,8 +396,8 @@ def main():
             MEANS[i], STDS[i], is_main)
         individual_accs.append(acc)
 
-    best_single = max(individual_accs) if individual_accs else 0.0
-    best_idx = individual_accs.index(best_single) if individual_accs else 0
+    best_single = max(individual_accs)
+    best_idx = individual_accs.index(best_single)
 
     if is_main:
         print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
@@ -419,7 +411,6 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    test_loader_full = None
     if is_main:
         os.makedirs(args.save_dir, exist_ok=True)
         
@@ -432,7 +423,7 @@ def main():
         # اجرای ارزیابی یکپارچه
         ensemble_test_acc, y_true, y_score = final_evaluation_and_report(
             ensemble_module, test_loader_full, device, args.save_dir, 
-            "Simple Logit Averaging Ensemble", args, is_main
+            "Simple Averaging Ensemble", args, is_main
         )
 
         print("\n" + "="*70)
@@ -444,14 +435,14 @@ def main():
         print("="*70)
 
         final_results = {
-            'method': 'Simple Logit Averaging',
+            'method': 'Simple Averaging',
             'best_single_model': {
                 'name': MODEL_NAMES[best_idx],
                 'accuracy': float(best_single)
             },
             'ensemble': {
                 'test_accuracy': float(ensemble_test_acc),
-                'strategy': 'Uniform Logit Averaging'
+                'strategy': 'Uniform Weights'
             },
             'improvement': float(ensemble_test_acc - best_single)
         }
@@ -479,7 +470,7 @@ def main():
 
     cleanup_distributed()
     
-    if is_main and test_loader_full is not None:
+    if is_main:
         plot_roc_and_f1(
             ensemble_module,
             test_loader_full, 
