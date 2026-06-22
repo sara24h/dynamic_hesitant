@@ -50,49 +50,94 @@ class MultiModelNormalization(nn.Module):
 
 # ================== ADABN FUNCTION (اصلاح شده منطق) ==================
 @torch.no_grad()
+
 def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main, is_distributed=False):
+    """
+    AdaBN با منطق Hook-based برای محاسبه دقیق Parallel Variance روی multi-GPU.
+    در حالت single-GPU هم از همین منطق استفاده می‌کنه (یکپارچه و دقیق).
+    """
     if is_main:
         print("\n" + "="*70)
-        print("STARTING BATCHNORM ADAPTATION (AdaBN) - CLEAN DATA (NO AUGMENTATION)")
+        print(f"STARTING BATCHNORM ADAPTATION (AdaBN) - Mode: {'Distributed' if is_distributed else 'Single GPU'}")
         print("="*70)
-        
+
     normalizer = MultiModelNormalization(means, stds).to(device)
-    
-    for model in models:
-        model.eval()  # قطع شدن Dropout و لایه‌های غیرقطعی
-        # ریست کردن آمار قبلی و تنظیم برای محاسبه آمار تجمعی (Cumulative)
-        for m in model.modules():
+
+    # ساخت accumulator برای هر مدل و هر لایه BN
+    accumulators = [{} for _ in models]
+    hooks = []
+
+    for i, model in enumerate(models):
+        model.eval()  # Dropout خاموش بمونه
+        for name, m in model.named_modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.reset_running_stats()
-                m.num_batches_tracked.zero_()
-                m.momentum = None  # محاسبه میانگین/واریانس گلبال (تجمعی)
-                m.train()          # فقط BN در حالت train باشد تا آمار آپدیت شود
-                
+                accumulators[i][name] = {
+                    'n':        torch.tensor(0.0, device=device),
+                    'sum_mean': torch.zeros(m.num_features, device=device),
+                    'sum_x2':   torch.zeros(m.num_features, device=device),
+                }
+
+                def get_hook(model_idx, layer_name):
+                    def hook(module, inp, out):
+                        x = inp[0].detach()
+                        # N = batch_size * H * W (برای Conv) یا batch_size (برای Linear)
+                        n = x.numel() / x.size(1)
+                        # میانگین و واریانس روی همه ابعاد غیر از channel
+                        dims = [0] + list(range(2, x.dim()))
+                        mean = x.mean(dim=dims)
+                        var  = x.var(dim=dims, unbiased=False)
+                        acc = accumulators[model_idx][layer_name]
+                        acc['n']        += n
+                        acc['sum_mean'] += mean * n
+                        # فرمول: sum(x^2) = Var*N + Mean^2*N  →  برای Parallel Variance
+                        acc['sum_x2']   += (var + mean ** 2) * n
+                    return hook
+
+                hooks.append(m.register_forward_hook(get_hook(i, name)))
+
+    # تنظیم epoch برای DistributedSampler
+    if hasattr(adabn_loader.sampler, 'set_epoch'):
+        adabn_loader.sampler.set_epoch(0)
+
+    # یک pass روی داده‌ها — هر GPU بخشی از داده را می‌بیند
     for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
         images = images.to(device)
         for i, model in enumerate(models):
             x_n = normalizer(images, i)
-            model(x_n)  # فقط یک forward pass برای آپدیت آمار BN
-            
-    # سینک کردن آمارها در صورت استفاده از چند گرافیک
+            model(x_n)  # hookها خودکار اجرا می‌شن
+
+    # حذف hookها
+    for h in hooks:
+        h.remove()
+
+    # در حالت distributed: سینک کردن آمارها بین GPUها
     if is_distributed and dist.is_initialized():
-        for model in models:
-            for m in model.modules():
-                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    dist.all_reduce(m.running_mean, op=dist.ReduceOp.SUM)
-                    m.running_mean /= dist.get_world_size()
-                    dist.all_reduce(m.running_var, op=dist.ReduceOp.SUM)
-                    m.running_var /= dist.get_world_size()
-                    if m.num_batches_tracked is not None:
-                        dist.all_reduce(m.num_batches_tracked, op=dist.ReduceOp.SUM)
-            
-    # برگرداندن momentum به حالت پیش‌فرض و مدل به حالت eval
-    for model in models:
-        for m in model.modules():
+        if is_main:
+            print("Synchronizing BN statistics across GPUs...")
+        for i, model in enumerate(models):
+            for name in accumulators[i]:
+                acc = accumulators[i][name]
+                dist.all_reduce(acc['n'],        op=dist.ReduceOp.SUM)
+                dist.all_reduce(acc['sum_mean'], op=dist.ReduceOp.SUM)
+                dist.all_reduce(acc['sum_x2'],   op=dist.ReduceOp.SUM)
+
+    # نوشتن آمار نهایی روی running_mean و running_var
+    for i, model in enumerate(models):
+        for name, m in model.named_modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                m.momentum = 0.1
-        model.eval()
-        
+                acc = accumulators[i][name]
+                if acc['n'].item() == 0:
+                    continue
+                global_mean = acc['sum_mean'] / acc['n']
+                global_var  = acc['sum_x2']  / acc['n'] - global_mean ** 2
+                global_var  = torch.clamp(global_var, min=1e-5)
+
+                m.running_mean.copy_(global_mean)
+                m.running_var.copy_(global_var)
+                m.num_batches_tracked.fill_(1)
+                m.momentum = 0.1   # برگشت به حالت عادی
+        model.eval()  # مدل کاملاً eval بمونه
+
     if is_main:
         print("✅ BatchNorm Adaptation Completed!\n")
 # ========================================================================
