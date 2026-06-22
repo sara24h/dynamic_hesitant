@@ -465,8 +465,9 @@ def evaluate_accuracy_ddp(model, loader, device):
 
 
 # ================== TRAINING ==================
+# ================== TRAINING ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
-                        device, save_dir, is_main, model_names, world_size=1):
+                        device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -522,8 +523,8 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             sum_cumsum_used += cumsum_used_samples
             sum_active_models += active_mask.sum(dim=0)
 
-        # ✅✅✅ all_reduce باید اینجا باشد (بعد از حلقه بچ) ✅✅✅
-        if world_size > 1:  # فقط اگر DDP فعال است
+        # ✅ همگام‌سازی تمام آمارهای آموزش بین GPU ها
+        if dist.is_initialized():  # ➕ اصلاح شد (به جای world_size > 1)
             train_loss_tensor = torch.tensor(train_loss, device=device)
             train_correct_tensor = torch.tensor(train_correct, device=device)
             train_total_tensor = torch.tensor(train_total, device=device)
@@ -531,16 +532,25 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.SUM)
             dist.all_reduce(train_correct_tensor, op=dist.ReduceOp.SUM)
             dist.all_reduce(train_total_tensor, op=dist.ReduceOp.SUM)
+            
+            # ➕ اضافه شدن همگام‌سازی برای آمارهای فازی
+            dist.all_reduce(sum_per_model_hesitancy, op=dist.ReduceOp.SUM)
+            dist.all_reduce(sum_active_models, op=dist.ReduceOp.SUM)
+            
+            # برای sum_cumsum_used که یک int است:
+            sum_cumsum_used_tensor = torch.tensor(sum_cumsum_used, device=device)
+            dist.all_reduce(sum_cumsum_used_tensor, op=dist.ReduceOp.SUM)
+            sum_cumsum_used = sum_cumsum_used_tensor.item()
 
             train_loss = train_loss_tensor.item() / train_total_tensor.item()
             train_acc = 100. * train_correct_tensor.item() / train_total_tensor.item()
+            train_total = train_total_tensor.item() # ➕ آپدیت تراین توتال برای محاسبات پایین
         else:
             train_loss = train_loss / train_total
             train_acc = 100. * train_correct / train_total
         
-        # بقیه کد بدون تغییر...
+        # بقیه محاسبات با اعداد همگام شده انجام می‌شود
         avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
-       
         avg_cumsum_usage = (sum_cumsum_used / train_total) * 100
         avg_model_activation = (sum_active_models / train_total) * 100
         overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
