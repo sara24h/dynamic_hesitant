@@ -466,7 +466,7 @@ def evaluate_accuracy_ddp(model, loader, device):
 
 # ================== TRAINING ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
-                        device, save_dir, is_main, model_names):
+                        device, save_dir, is_main, model_names, world_size=1):
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.module.hesitant_fuzzy if hasattr(ensemble_model, 'module') else ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -718,7 +718,7 @@ def main():
 
     best_val_acc = train_hesitant_fuzzy(
         ensemble, train_loader, val_loader,
-        args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
+        args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES,world_size=world_size )
 
     # لود بهترین مدل
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
