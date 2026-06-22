@@ -461,7 +461,7 @@ def evaluate_accuracy_ddp(model, loader, device):
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
     # محاسبه با تعداد واقعی نمونه‌ها
-    return 100. * correct_tensor.item() / total_real_samplesاصلاح شود
+    return 100. * correct_tensor.item() / total_real_samples
 
 
 # ================== TRAINING ==================
