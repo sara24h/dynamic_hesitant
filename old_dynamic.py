@@ -431,23 +431,34 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     return acc
 
 @torch.no_grad()
-def evaluate_accuracy_ddp(model, loader, device):
+def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
+                              name: str, mean: Tuple[float, float, float],
+                              std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
+    normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    for images, labels in loader:
+    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
-        outputs, _ = model(images)
-        pred = (outputs.squeeze(1) > 0).long()
+        images = normalizer(images, 0)
+        out = model(images)
+        if isinstance(out, (tuple, list)): out = out[0]
+        pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-    
+
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     real_total = len(loader.dataset)
     
+    # فقط اگر روی چند GPU هستیم، نتایج را جمع کن
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
         
-    return 100. * correct_tensor.item() / real_total
+    acc = 100. * correct_tensor.item() / real_total
 
+    # ---- این خط را اضافه کنید تا دقت هر مدل چاپ شود ----
+    if is_main:
+        print(f"  -> Accuracy: {acc:.2f}%")
+
+    return acc  # ---- این خط اصلا شده بود و قبلا وجود نداشت ----
 
 # ================== TRAINING ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
