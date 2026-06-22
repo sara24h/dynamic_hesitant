@@ -419,6 +419,8 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
+    local_total = 0  # ➕ اضافه شود
+    
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
@@ -426,28 +428,40 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
+        local_total += images.size(0)  # ➕ اضافه شود
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    real_total = len(loader.dataset)
+    total_tensor = torch.tensor(local_total, dtype=torch.long, device=device)  # ➕ اضافه شود
+    
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    acc = 100. * correct_tensor.item() / real_total
+    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)  # ➕ اضافه شود
+    
+    acc = 100. * correct_tensor.item() / total_tensor.item()  # ➕ اصلاح شود
+    
     if is_main: print(f" {name}: {acc:.2f}%")
     return acc
 
 @torch.no_grad()
+
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
+    local_total = 0  # ➕ اضافه شود
+    
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
+        local_total += images.size(0)  # ➕ اضافه شود
     
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    real_total = len(loader.dataset)
+    total_tensor = torch.tensor(local_total, dtype=torch.long, device=device)  # ➕ اضافه شود
+    
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    return 100. * correct_tensor.item() / real_total
+    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)  # ➕ اضافه شود
+    
+    return 100. * correct_tensor.item() / total_tensor.item()  # ➕ اصلاح شود
 
 
 # ================== TRAINING ==================
@@ -508,10 +522,25 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             sum_cumsum_used += cumsum_used_samples
             sum_active_models += active_mask.sum(dim=0)
 
-        train_acc = 100. * train_correct / train_total
-        train_loss = train_loss / train_total
+        # ✅✅✅ all_reduce باید اینجا باشد (بعد از حلقه بچ) ✅✅✅
+        if world_size > 1:  # فقط اگر DDP فعال است
+            train_loss_tensor = torch.tensor(train_loss, device=device)
+            train_correct_tensor = torch.tensor(train_correct, device=device)
+            train_total_tensor = torch.tensor(train_total, device=device)
+
+            dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(train_correct_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(train_total_tensor, op=dist.ReduceOp.SUM)
+
+            train_loss = train_loss_tensor.item() / train_total_tensor.item()
+            train_acc = 100. * train_correct_tensor.item() / train_total_tensor.item()
+        else:
+            train_loss = train_loss / train_total
+            train_acc = 100. * train_correct / train_total
         
+        # بقیه کد بدون تغییر...
         avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
+       
         avg_cumsum_usage = (sum_cumsum_used / train_total) * 100
         avg_model_activation = (sum_active_models / train_total) * 100
         overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
@@ -651,7 +680,12 @@ def main():
     ).to(device)
 
     if world_size > 1:
-        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
+        ensemble = DDP(
+            ensemble, 
+            device_ids=[local_rank], 
+            output_device=local_rank,
+            find_unused_parameters=True  # ← این خط حیاتی است
+        )
 
     if is_main:
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
