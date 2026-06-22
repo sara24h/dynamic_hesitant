@@ -16,11 +16,10 @@ from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
 
-from dataset_utils import (
+from old_dataset_utils import (
     UADFVDataset, 
     CustomGenAIDataset, 
     create_dataloaders, 
-    create_adabn_dataloader, 
     get_sample_info, 
     worker_init_fn
 )
@@ -47,108 +46,6 @@ class MultiModelNormalization(nn.Module):
 
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
-
-
-# =====================================================================
-# ================== DISTRIBUTED BATCHNORM ADAPTATION ==================
-# =====================================================================
-@torch.no_grad()
-def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True, is_distributed=False):
-    """
-    اعمال AdaBN به صورت موازی روی چندین GPU.
-    اگر is_distributed=True باشد، از فرمول محاسبه واریانس موازی (Parallel Variance) استفاده می‌کند.
-    """
-    if is_main:
-        print("\n" + "="*70)
-        print(f"STARTING BATCHNORM ADAPTATION (AdaBN) - Mode: {'Distributed' if is_distributed else 'Single GPU'}")
-        print("="*70)
-        
-    normalizer = MultiModelNormalization(means, stds).to(device)
-    
-    if is_distributed:
-        # =================== منطق چند GPU ===================
-        accumulators = [{} for _ in models]
-        hooks = []
-        
-        for i, model in enumerate(models):
-            model.eval() # مدل در حالت eval میماند تا dropout خاموش شود
-            for name, m in model.named_modules():
-                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    accumulators[i][name] = {
-                        'n': torch.tensor(0.0, device=device),
-                        'sum_mean': torch.zeros(m.num_features, device=device),
-                        'sum_x2': torch.zeros(m.num_features, device=device)
-                    }
-                    
-                    def get_hook(model_idx, layer_name):
-                        def hook(module, inp, out):
-                            x = inp[0]
-                            n = x.numel() / x.size(1) 
-                            mean = x.mean(dim=[0, 2, 3])
-                            var = x.var(dim=[0, 2, 3], unbiased=False) 
-                            
-                            accumulators[model_idx][layer_name]['n'] += n
-                            accumulators[model_idx][layer_name]['sum_mean'] += mean * n
-                            accumulators[model_idx][layer_name]['sum_x2'] += (var * n) + (mean ** 2 * n)
-                        return hook
-                    hooks.append(m.register_forward_hook(get_hook(i, name)))
-
-        if hasattr(adabn_loader.sampler, 'set_epoch'):
-            adabn_loader.sampler.set_epoch(0)
-
-        for images, _ in tqdm(adabn_loader, desc="Adapting BN (Dist)", disable=not is_main):
-            images = images.to(device)
-            for i, model in enumerate(models):
-                x_n = normalizer(images, i)
-                model(x_n)
-
-        for h in hooks: h.remove()
-
-        if is_main: print("Synchronizing BN statistics across GPUs...")
-        
-        for i, model in enumerate(models):
-            for name, m in model.named_modules():
-                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    acc = accumulators[i][name]
-                    
-                    dist.all_reduce(acc['n'], op=dist.ReduceOp.SUM)
-                    dist.all_reduce(acc['sum_mean'], op=dist.ReduceOp.SUM)
-                    dist.all_reduce(acc['sum_x2'], op=dist.ReduceOp.SUM)
-                    
-                    global_mean = acc['sum_mean'] / acc['n']
-                    global_var = (acc['sum_x2'] / acc['n']) - (global_mean ** 2)
-                    global_var = torch.clamp(global_var, min=1e-5)
-                    
-                    m.running_mean.copy_(global_mean)
-                    m.running_var.copy_(global_var)
-                    m.num_batches_tracked.copy_(torch.tensor(1, dtype=torch.long, device=device))
-        
-        if is_main: print("✅ Distributed BatchNorm Adaptation Completed!\n")
-
-    else:
-        # =================== منطق تک GPU (کد قبلی) ===================
-        for model in models:
-            model.eval()  
-            for m in model.modules():
-                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    m.reset_running_stats()
-                    m.momentum = None  
-                    m.train()          
-                    
-        for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
-            images = images.to(device)
-            for i, model in enumerate(models):
-                x_n = normalizer(images, i)
-                model(x_n) 
-                
-        for model in models:
-            for m in model.modules():
-                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    m.momentum = 0.1
-            model.eval()
-            
-        if is_main: print("✅ BatchNorm Adaptation Completed!\n")
-# =====================================================================
 
 
 # ================== STACKING META LEARNER (Logistic Regression) ==================
@@ -260,9 +157,8 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     acc = 100. * correct_tensor.item() / total_tensor.item()
     if is_main:
         print(f" {name}: {acc:.2f}%")
@@ -283,9 +179,8 @@ def evaluate_accuracy_ddp(model, loader, device):
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
-    if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     acc = 100. * correct_tensor.item() / total_tensor.item()
     return acc
 
@@ -320,8 +215,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_samples += labels.size(0)
 
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
-    if dist.is_initialized():
-        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
     if ws > 1:
         gathered_true = [None for _ in range(ws)]
@@ -342,7 +236,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_samples = stats[1].item()
         acc = 100. * total_correct / total_samples
         
-        meta_learner = model.meta_learner if not hasattr(model, 'module') else model.module.meta_learner
+        meta_learner = model.meta_learner
         weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
         bias = meta_learner.linear.bias.data.cpu().item()
 
@@ -496,10 +390,15 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
 
 # ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
+    """
+    ساخت فایل txt دقیقاً بر اساس لیست‌های y_true و y_pred که از تست کنسول آمده‌اند.
+    این تابع تضمین می‌کند که اعداد با کنسول یکی باشند.
+    """
     total = len(y_true)
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
     
+    # محاسبه ماتریس آشفتگی
     TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
     TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
     FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
@@ -572,7 +471,6 @@ def main():
         set_seed(current_seed)
         device, local_rank, rank, world_size = setup_distributed()
         is_main = rank == 0
-        is_distributed = (world_size > 1)  # 🔴 تعریف متغیر is_distributed
 
         current_save_dir = os.path.join(args.save_dir, f'seed_{current_seed}')
         
@@ -596,31 +494,6 @@ def main():
         base_models = load_pruned_models(args.model_paths, device, is_main)
         MODEL_NAMES = args.model_names[:len(base_models)]
 
-        # =================== فراخوانی و اعمال AdaBN ===================
-                # =================== فراخوانی و اعمال AdaBN ===================
-        # استفاده از تابع اختصاصی AdaBN که در dataset_utils.py قرار دارد
-        adabn_loader = create_adabn_dataloader(
-            base_dir=args.data_dir, 
-            batch_size=args.batch_size, 
-            num_workers=4,
-            dataset_type=args.dataset, 
-            seed=current_seed, 
-            is_main=is_main,
-            is_distributed=is_distributed  # <-- این باعث میشه داده بین 2 گرافیک تقسیم بشه
-        )
-        
-        # اعمال AdaBN به صورت موازی روی هر دو گرافیک
-        adapt_batchnorm_for_new_dataset(
-            base_models, MEANS, STDS, adabn_loader, device, is_main=is_main,
-            is_distributed=is_distributed  # <-- ارسال پرچم توزیع شده به تابع آداپت
-        )
-        
-        # پاکسازی حافظه
-        del adabn_loader
-        torch.cuda.empty_cache()
-        # ===============================================================
-        # ===============================================================
-
         ensemble = StackingEnsemble(
             base_models, MEANS, STDS,
             freeze_models=True
@@ -638,24 +511,12 @@ def main():
             args.data_dir, args.batch_size, dataset_type=args.dataset,
             is_distributed=(world_size > 1), seed=current_seed, is_main=is_main)
 
-        # ==========================================
-        # FIX BUG 3: جلوگیری از تکرار نمونه‌ها در ارزیابی
-        # ==========================================
-        if world_size > 1:
-            if hasattr(val_loader.sampler, 'drop_last'):
-                val_loader.sampler.drop_last = True
-            if hasattr(test_loader.sampler, 'drop_last'):
-                test_loader.sampler.drop_last = True
-
         if is_main:
             print("\n" + "="*70)
-            print("INDIVIDUAL MODEL PERFORMANCE (After AdaBN)")
+            print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
             print("="*70)
 
         individual_accs = []
-        if hasattr(test_loader.sampler, 'set_epoch'):
-            test_loader.sampler.set_epoch(0)
-
         for i, model in enumerate(base_models):
             acc = evaluate_single_model_ddp(
                 model, test_loader, device,
@@ -689,9 +550,7 @@ def main():
 
         ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
         
-        if hasattr(test_loader.sampler, 'set_epoch'):
-            test_loader.sampler.set_epoch(1)
-
+        # دریافت خروجی‌ها برای JSON و Log
         ensemble_test_acc, learned_weights, learned_bias, predictions_data = evaluate_ensemble_final_ddp(
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
@@ -704,11 +563,14 @@ def main():
             print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
             print("="*70)
 
+            # استخراج لیست‌ها
             y_true, y_score, y_pred = predictions_data
             
+            # 1. ذخیره JSON
             json_path = os.path.join(current_save_dir, 'test_predictions.json')
             save_predictions_json(y_true, y_score, y_pred, json_path, current_seed, args.dataset)
 
+            # 2. ذخیره فایل txt دقیقاً مطابق با کنسول (جایگزین save_prediction_log قبلی)
             log_path_ensemble = os.path.join(current_save_dir, 'prediction_log_stacking.txt')
             save_accuracy_log_from_results(y_true, y_pred, log_path_ensemble, "Stacking Ensemble")
 
@@ -745,41 +607,33 @@ def main():
             }, final_model_path)
             print(f"Model saved: {final_model_path}")
 
-        single_model = base_models[best_idx]
-        single_model.eval()
-        single_y_true_local = []
-        single_y_pred_local = []
-        single_normalizer = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
-        
-        if hasattr(test_loader.sampler, 'set_epoch'):
-            test_loader.sampler.set_epoch(2)
-
-        for images, labels in tqdm(test_loader, desc="Eval Single for Log", disable=not is_main):
-            images, labels = images.to(device), labels.to(device)
-            images = single_normalizer(images, 0)
-            with torch.no_grad():
-                out = single_model(images)
-                if isinstance(out, (tuple, list)): out = out[0]
-                pred = (out.squeeze(1) > 0).long()
-                
-            single_y_true_local.extend(labels.cpu().numpy().tolist())
-            single_y_pred_local.extend(pred.cpu().numpy().tolist())
-        
-        if world_size > 1:
-            gathered_true = [None for _ in range(world_size)]
-            gathered_pred = [None for _ in range(world_size)]
-            dist.all_gather_object(gathered_true, single_y_true_local)
-            dist.all_gather_object(gathered_pred, single_y_pred_local)
+            # ==========================================
+            # Save Best Single Model Log (بازسازی لیست برای مدل تکی)
+            # ==========================================
+            # نکته: برای مدل تکی باید دوباره تست انجام دهیم تا لیست y_pred را داشته باشیم
+            # چون در evaluate_single_model_ddp قبلی لیست را برنمی‌گرداندیم.
+            # برای جلوگیری از اتلاف وقت، می‌توانیم یک دور مدل تکی را اجرا کنیم یا اینکه
+            # همان فایل JSON انسمبل را ملاک قرار دهیم.
+            # اما برای تکمیل کد، تابعی می‌نویسیم که لیست مدل تکی را هم بسازد:
             
-            if is_main:
-                single_y_true = [item for sublist in gathered_true for item in sublist]
-                single_y_pred = [item for sublist in gathered_pred for item in sublist]
-        else:
-            if is_main:
-                single_y_true = single_y_true_local
-                single_y_pred = single_y_pred_local
-
-        if is_main:
+            print("\nGenerating Single Best Model Log...")
+            single_model = base_models[best_idx]
+            single_model.eval()
+            single_y_true = []
+            single_y_pred = []
+            single_normalizer = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
+            
+            for images, labels in tqdm(test_loader, desc="Eval Single for Log"):
+                images, labels = images.to(device), labels.to(device)
+                images = single_normalizer(images, 0)
+                with torch.no_grad():
+                    out = single_model(images)
+                    if isinstance(out, (tuple, list)): out = out[0]
+                    pred = (out.squeeze(1) > 0).long()
+                    
+                single_y_true.extend(labels.cpu().numpy().tolist())
+                single_y_pred.extend(pred.cpu().numpy().tolist())
+            
             log_path_single = os.path.join(current_save_dir, 'prediction_log_best_single.txt')
             save_accuracy_log_from_results(single_y_true, single_y_pred, log_path_single, MODEL_NAMES[best_idx])
 
@@ -789,15 +643,17 @@ def main():
                 args.num_grad_cam_samples, args.num_lime_samples,
                 args.dataset, is_main)
 
-            plot_roc_and_f1(
-                y_true=y_true,
-                y_score=y_score,
-                save_dir=current_save_dir, 
-                model_names=MODEL_NAMES,
-                is_main=is_main
-            )
-
         cleanup_distributed()
+        
+        if is_main:
+            plot_roc_and_f1(
+                ensemble_module,
+                test_loader, 
+                device, 
+                current_save_dir, 
+                MODEL_NAMES,
+                is_main
+            )
 
 if __name__ == "__main__":
     main()
