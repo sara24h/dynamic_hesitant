@@ -148,21 +148,21 @@ class TransformSubset(Subset):
         original_idx = self.indices[idx]
         
         # Try to get raw data (path, label) to avoid double transform if dataset already has one
-        # This logic assumes the base dataset (like CustomGenAIDataset) has a 'samples' list
         if hasattr(self.dataset, 'samples'):
             img_path, label = self.dataset.samples[original_idx]
             img = Image.open(img_path).convert('RGB')
         else:
-            # Fallback for datasets that don't expose samples directly (e.g. standard ImageFolder)
-            # We rely on the underlying dataset to load the image. 
-            # Note: If the underlying dataset has a transform, it will be applied here. 
-            # We then apply our transform on top, which is redundant but safe for compatibility.
-            # For ImageFolder created with ToTensor, this is fine.
             img, label = self.dataset[original_idx]
 
         if self.transform:
             img = self.transform(img)
         return img, label
+    
+    # ════════════════════════════════════════════════════════════════
+    #  اضافه شده برای سازگاری با PyTorch 2.4+
+    # ════════════════════════════════════════════════════════════════
+    def __getitems__(self, indices):
+        return [self.__getitem__(idx) for idx in indices]
 
 # ================== UTILITY FUNCTIONS ==================
 
