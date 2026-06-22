@@ -35,7 +35,10 @@ def set_seed(seed: int = 42):
 
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
-
+    """
+    ارزیابی نهایی یکپارچه برای اطمینان از یکسان بودن اعداد در کنسول و لاگ.
+    شامل ذخیره داده‌های McNemar و ROC (y_true, y_score, y_pred).
+    """
     if not is_main: return 0.0, None, None
 
     model.eval()
@@ -137,8 +140,8 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
     print("="*70)
 
-    print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
-    print(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
+        print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
+    print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     print("="*70)
 
     # ════════════════════════════════════════════════════════════════
@@ -220,7 +223,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
     output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
     output_str.append(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
-    output_str.append(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
+    output_str.append(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     output_str.extend(lines)
     
     log_path = os.path.join(save_dir, 'prediction_log.txt')
@@ -335,12 +338,6 @@ class FuzzyHesitantEnsemble(nn.Module):
                 for p in model.parameters():
                     p.requires_grad = False
 
-    def train(self, mode=True):
-        super().train(mode)
-        for model in self.models:
-            model.eval()   # frozen models stay in eval always
-        return self
-
     def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
         batch_size = final_weights.size(0)
         sorted_weights, sorted_indices = torch.sort(final_weights, dim=1, descending=True)
@@ -355,7 +352,7 @@ class FuzzyHesitantEnsemble(nn.Module):
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
-        hesitancy = all_memberships.var(dim=2,unbiased=False)
+        hesitancy = all_memberships.var(dim=2)
         avg_hesitancy = hesitancy.mean(dim=1)
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
         final_weights = final_weights * mask
@@ -422,43 +419,26 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     real_total = len(loader.dataset)
-    
-    # فقط اگر روی چند GPU هستیم، نتایج را جمع کن
-    if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     acc = 100. * correct_tensor.item() / real_total
+    if is_main: print(f" {name}: {acc:.2f}%")
     return acc
 
 @torch.no_grad()
-def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
-                              name: str, mean: Tuple[float, float, float],
-                              std: Tuple[float, float, float], is_main: bool) -> float:
+def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
-    normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
+    for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
-        images = normalizer(images, 0)
-        out = model(images)
-        if isinstance(out, (tuple, list)): out = out[0]
-        pred = (out.squeeze(1) > 0).long()
+        outputs, _ = model(images)
+        pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-
+    
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     real_total = len(loader.dataset)
-    
-    # فقط اگر روی چند GPU هستیم، نتایج را جمع کن
-    if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-        
-    acc = 100. * correct_tensor.item() / real_total
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    return 100. * correct_tensor.item() / real_total
 
-    # ---- این خط را اضافه کنید تا دقت هر مدل چاپ شود ----
-    if is_main:
-        print(f"  -> Accuracy: {acc:.2f}%")
-
-    return acc  # ---- این خط اصلا شده بود و قبلا وجود نداشت ----
 
 # ================== TRAINING ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
@@ -509,7 +489,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             train_total += batch_size
             
             # محاسبه آمارهای دوره
-            per_model_hesitancy = memberships.var(dim=2,unbiased=False)
+            per_model_hesitancy = memberships.var(dim=2)
             sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
             
             active_mask = (weights > 1e-4).float()
@@ -661,8 +641,7 @@ def main():
     ).to(device)
 
     if world_size > 1:
-        ensemble = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ensemble)
-        ensemble = DDP(ensemble, device_ids=[local_rank])
+        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
     if is_main:
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
