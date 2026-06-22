@@ -48,7 +48,7 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
-# ================== ADABN FUNCTION (اضافه شده) ==================
+# ================== ADABN FUNCTION (اصلاح شده منطق) ==================
 @torch.no_grad()
 def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main, is_distributed=False):
     if is_main:
@@ -59,19 +59,21 @@ def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, i
     normalizer = MultiModelNormalization(means, stds).to(device)
     
     for model in models:
-        model.eval()  
+        model.eval()  # قطع شدن Dropout و لایه‌های غیرقطعی
+        # ریست کردن آمار قبلی و تنظیم برای محاسبه آمار تجمعی (Cumulative)
         for m in model.modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
                 m.reset_running_stats()
-                m.num_batches_tracked.zero_()  
-                m.train()          
+                m.num_batches_tracked.zero_()
+                m.momentum = None  # محاسبه میانگین/واریانس گلبال (تجمعی)
+                m.train()          # فقط BN در حالت train باشد تا آمار آپدیت شود
                 
     for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
         images = images.to(device)
         for i, model in enumerate(models):
             x_n = normalizer(images, i)
-            model(x_n)  
-
+            model(x_n)  # فقط یک forward pass برای آپدیت آمار BN
+            
     # سینک کردن آمارها در صورت استفاده از چند گرافیک
     if is_distributed and dist.is_initialized():
         for model in models:
@@ -81,9 +83,15 @@ def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, i
                     m.running_mean /= dist.get_world_size()
                     dist.all_reduce(m.running_var, op=dist.ReduceOp.SUM)
                     m.running_var /= dist.get_world_size()
+                    if m.num_batches_tracked is not None:
+                        dist.all_reduce(m.num_batches_tracked, op=dist.ReduceOp.SUM)
             
+    # برگرداندن momentum به حالت پیش‌فرض و مدل به حالت eval
     for model in models:
-        model.eval() 
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.momentum = 0.1
+        model.eval()
         
     if is_main:
         print("✅ BatchNorm Adaptation Completed!\n")
