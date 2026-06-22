@@ -506,7 +506,7 @@ def main():
     STDS = STDS[:len(base_models)]
 
     ensemble = MajorityVotingEnsemble(base_models, MEANS, STDS, freeze_models=True).to(device)
-
+    set_seed(args.seed)
     try:
         train_loader, val_loader, test_loader = create_dataloaders(
             args.data_dir, args.batch_size, dataset_type=args.dataset,
@@ -524,6 +524,7 @@ def main():
 
     if is_main: print("\n" + "="*70); print("INDIVIDUAL MODEL PERFORMANCE"); print("="*70)
     individual_accs = []
+    set_seed(args.seed)
     for i, model in enumerate(base_models):
         acc = evaluate_single_model_ddp(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i], is_main)
         individual_accs.append(acc)
