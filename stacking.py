@@ -269,7 +269,10 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
-    meta_learner = ensemble_model.module.meta_learner if hasattr(ensemble_model, 'module') else ensemble_model.meta_learner
+    
+    # استخراج ماژول واقعی (بدون پوشش DDP)
+    actual_module = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
+    meta_learner = actual_module.meta_learner
     
     optimizer = torch.optim.AdamW(meta_learner.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
@@ -291,6 +294,17 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             train_loader.sampler.set_epoch(epoch)
         
         ensemble_model.train()
+        
+        # ====== اصلاح باگ: بازگرداندن مدل‌های پایه به حالت eval ======
+        # دلیل: فراخوانی ensemble_model.train() به صورت بازگشتی تمام زیرماژول‌ها
+        # (از جمله مدل‌های پایه فریز شده) را به حالت train برمی‌گرداند.
+        # در حالت train، لایه‌های BatchNorm آمار running_mean و running_var را
+        # با داده‌های بچ فعلی آپدیت می‌کنند که ناخواسته است.
+        # با eval() کردن مجدد مدل‌های پایه، این آپدیت غیرفعال می‌شود.
+        for model in actual_module.models:
+            model.eval()
+        # =============================================================
+        
         train_loss = 0.0
         train_correct = 0
         train_total = 0
