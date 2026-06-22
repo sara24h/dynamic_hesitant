@@ -140,7 +140,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
     print("="*70)
 
-    print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
+        print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
     print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     print("="*70)
 
@@ -337,6 +337,16 @@ class FuzzyHesitantEnsemble(nn.Module):
                 model.eval()
                 for p in model.parameters():
                     p.requires_grad = False
+
+
+    def train(self, mode=True):
+      
+        super().train(mode)
+        # Force base models to remain in eval mode
+        for model in self.models:
+            model.eval()
+        return self
+  
 
     def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
         batch_size = final_weights.size(0)
@@ -641,8 +651,6 @@ def main():
     ).to(device)
 
     if world_size > 1:
-        # این خط الزامی است تا آمار BatchNorm بین دو GPU به درستی همگام شود
-        ensemble = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ensemble)
         ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
     if is_main:
