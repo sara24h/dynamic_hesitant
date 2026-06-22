@@ -110,8 +110,9 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     total_samples = len(all_y_true)
     
     # هشدار در صورت نادیده گرفته شدن نمونه‌ها
+        # هشدار در صورت نادیده گرفته شدن نمونه‌ها
     if skipped > 0:
-        print(f"\n[WARNING] {skipped} samples skipped due to errors out of {len(test_indices)} total test samples!")
+        print(f"\n[WARNING] {skipped} samples skipped out of {len(local_indices)} total test samples!")
         
     if total_samples == 0:
         print("[ERROR] No samples successfully evaluated!")
