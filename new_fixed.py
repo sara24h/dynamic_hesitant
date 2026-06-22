@@ -698,6 +698,7 @@ def main():
         total = sum(p.numel() for p in ensemble.parameters())
         print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
+    set_seed(args.seed)
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
@@ -708,6 +709,7 @@ def main():
         print("="*70)
 
     individual_accs = []
+    set_seed(args.seed)
     for i, model in enumerate(base_models):
         acc = evaluate_single_model_ddp(
             model, test_loader, device,
