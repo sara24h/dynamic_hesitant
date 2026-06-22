@@ -399,12 +399,13 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
 
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
+# ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
 def evaluate_single_model_ddp(model, loader, device, name, mean, std, is_main):
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    total = 0  # ← شمارش واقعی نمونه‌های پردازش‌شده
+    total = 0
 
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
@@ -413,7 +414,7 @@ def evaluate_single_model_ddp(model, loader, device, name, mean, std, is_main):
         if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-        total += labels.size(0)  # ← بچ واقعی، نه کل دیتاست
+        total += labels.size(0)
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
@@ -431,7 +432,7 @@ def evaluate_single_model_ddp(model, loader, device, name, mean, std, is_main):
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
-    total = 0  # ← همینجا هم اضافه شود
+    total = 0
 
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
@@ -508,8 +509,8 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             sum_cumsum_used += cumsum_used_samples
             sum_active_models += active_mask.sum(dim=0)
 
-        if dist.is_initialized():
-        train_acc_local = 100. * train_correct / train_total  # برای نمایش محلی
+        # --- محاسبه Train Acc به صورت ایمن برای تک و چند GPU ---
+        train_acc_local = 100. * train_correct / train_total if train_total > 0 else 0.0
 
         if dist.is_initialized():
             tc = torch.tensor(train_correct, dtype=torch.long, device=device)
@@ -520,7 +521,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         else:
             train_acc = train_acc_local
 
-        train_loss = train_loss / train_total
         train_loss = train_loss / train_total
         
         avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
