@@ -413,13 +413,16 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
 
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
+
 def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
                               name: str, mean: Tuple[float, float, float],
                               std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    local_total = 0  # ➕ اضافه شود
+    
+    # تعداد واقعی نمونه‌ها (بدون padding)
+    total_real_samples = len(loader.dataset)
     
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
@@ -428,17 +431,15 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-        local_total += images.size(0)  # ➕ اضافه شود
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(local_total, dtype=torch.long, device=device)  # ➕ اضافه شود
-    
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)  # ➕ اضافه شود
     
-    acc = 100. * correct_tensor.item() / total_tensor.item()  # ➕ اصلاح شود
+    # محاسبه با تعداد واقعی نمونه‌ها
+    acc = 100. * correct_tensor.item() / total_real_samples
     
-    if is_main: print(f" {name}: {acc:.2f}%")
+    if is_main: 
+        print(f" {name}: {acc:.2f}% (Real samples: {total_real_samples})")
     return acc
 
 @torch.no_grad()
@@ -446,25 +447,23 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
-    local_total = 0  # ➕ اضافه شود
+    
+    # تعداد واقعی نمونه‌ها (بدون padding)
+    total_real_samples = len(loader.dataset)
     
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-        local_total += images.size(0)  # ➕ اضافه شود
     
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    total_tensor = torch.tensor(local_total, dtype=torch.long, device=device)  # ➕ اضافه شود
-    
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)  # ➕ اضافه شود
     
-    return 100. * correct_tensor.item() / total_tensor.item()  # ➕ اصلاح شود
+    # محاسبه با تعداد واقعی نمونه‌ها
+    return 100. * correct_tensor.item() / total_real_samplesاصلاح شود
 
 
-# ================== TRAINING ==================
 # ================== TRAINING ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
@@ -475,6 +474,9 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     criterion = nn.BCEWithLogitsLoss()
     best_val_acc = 0.0
 
+    # تعداد واقعی نمونه‌ها در train
+    total_real_samples = len(train_loader.dataset)
+
     if is_main:
         print("="*70)
         print("Training Fuzzy Hesitant Network")
@@ -482,7 +484,8 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
         print(f"Epochs: {num_epochs} | Initial LR: {lr}")
         print(f"Hesitant memberships per model: {hesitant_net.num_memberships}")
-        print(f"Number of models: {len(model_names)}\n")
+        print(f"Number of models: {len(model_names)}")
+        print(f"Total real training samples: {total_real_samples:,}\n")
 
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
@@ -490,7 +493,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         
         train_loss = 0.0
         train_correct = 0
-        train_total = 0
         
         # متغیرهای برای آمارهای دوره
         sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
@@ -511,10 +513,9 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             train_loss += loss.item() * batch_size
             pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
-            train_total += batch_size
             
             # محاسبه آمارهای دوره
-            per_model_hesitancy = memberships.var(dim=2,unbiased=False)
+            per_model_hesitancy = memberships.var(dim=2, unbiased=False)
             sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
             
             active_mask = (weights > 1e-4).float()
@@ -523,17 +524,15 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             sum_cumsum_used += cumsum_used_samples
             sum_active_models += active_mask.sum(dim=0)
 
-        # ✅ همگام‌سازی تمام آمارهای آموزش بین GPU ها
-        if dist.is_initialized():  # ➕ اصلاح شد (به جای world_size > 1)
+        # همگام‌سازی تمام آمارهای آموزش بین GPU ها
+        if dist.is_initialized():
             train_loss_tensor = torch.tensor(train_loss, device=device)
             train_correct_tensor = torch.tensor(train_correct, device=device)
-            train_total_tensor = torch.tensor(train_total, device=device)
 
             dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.SUM)
             dist.all_reduce(train_correct_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(train_total_tensor, op=dist.ReduceOp.SUM)
             
-            # ➕ اضافه شدن همگام‌سازی برای آمارهای فازی
+            # همگام‌سازی برای آمارهای فازی
             dist.all_reduce(sum_per_model_hesitancy, op=dist.ReduceOp.SUM)
             dist.all_reduce(sum_active_models, op=dist.ReduceOp.SUM)
             
@@ -542,17 +541,17 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             dist.all_reduce(sum_cumsum_used_tensor, op=dist.ReduceOp.SUM)
             sum_cumsum_used = sum_cumsum_used_tensor.item()
 
-            train_loss = train_loss_tensor.item() / train_total_tensor.item()
-            train_acc = 100. * train_correct_tensor.item() / train_total_tensor.item()
-            train_total = train_total_tensor.item() # ➕ آپدیت تراین توتال برای محاسبات پایین
+            # محاسبه با تعداد واقعی نمونه‌ها
+            train_loss = train_loss_tensor.item() / total_real_samples
+            train_acc = 100. * train_correct_tensor.item() / total_real_samples
         else:
-            train_loss = train_loss / train_total
-            train_acc = 100. * train_correct / train_total
+            train_loss = train_loss / total_real_samples
+            train_acc = 100. * train_correct / total_real_samples
         
         # بقیه محاسبات با اعداد همگام شده انجام می‌شود
-        avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
-        avg_cumsum_usage = (sum_cumsum_used / train_total) * 100
-        avg_model_activation = (sum_active_models / train_total) * 100
+        avg_per_model_hesitancy = sum_per_model_hesitancy / total_real_samples
+        avg_cumsum_usage = (sum_cumsum_used / total_real_samples) * 100
+        avg_model_activation = (sum_active_models / total_real_samples) * 100
         overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
         
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
