@@ -163,9 +163,6 @@ class TransformSubset(Subset):
         if self.transform:
             img = self.transform(img)
         return img, label
-        
-    def __getitems__(self, indices):
-        return [self.__getitem__(idx) for idx in indices]
 
 # ================== UTILITY FUNCTIONS ==================
 
