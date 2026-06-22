@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 # فرض بر این است که این فایل‌ها در مسیر شما موجود هستند
 from metrics_utils import plot_roc_and_f1
-from dataset_utils import (
+from old_dataset_utils import (
     UADFVDataset, CustomGenAIDataset, NewGenAIDataset,
     create_dataloaders, get_sample_info
 )
@@ -414,29 +414,32 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
 
-def evaluate_single_model_ddp(model, loader, device, name, mean, std, is_main):
+def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
+                              name: str, mean: Tuple[float, float, float],
+                              std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
+    
+    # تعداد واقعی نمونه‌ها (بدون padding)
     total_real_samples = len(loader.dataset)
     
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
         out = model(images)
-        if isinstance(out, (tuple, list)):
-            out = out[0]
+        if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
-    if dist.is_initialized(): 
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    
+    # محاسبه با تعداد واقعی نمونه‌ها
     acc = 100. * correct_tensor.item() / total_real_samples
-    if is_main:
-        print(f" {name}: {acc:.2f}%")
+    
+    if is_main: 
+        print(f" {name}: {acc:.2f}% (Real samples: {total_real_samples})")
     return acc
 
 @torch.no_grad()
@@ -445,6 +448,7 @@ def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
     
+    # تعداد واقعی نمونه‌ها (بدون padding)
     total_real_samples = len(loader.dataset)
     
     for images, labels in loader:
@@ -456,6 +460,7 @@ def evaluate_accuracy_ddp(model, loader, device):
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
+    # محاسبه با تعداد واقعی نمونه‌ها
     return 100. * correct_tensor.item() / total_real_samples
 
 
@@ -696,7 +701,6 @@ def main():
         total = sum(p.numel() for p in ensemble.parameters())
         print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
-    set_seed(args.seed)
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
@@ -707,7 +711,6 @@ def main():
         print("="*70)
 
     individual_accs = []
-    set_seed(args.seed)
     for i, model in enumerate(base_models):
         acc = evaluate_single_model_ddp(
             model, test_loader, device,
