@@ -19,7 +19,6 @@ warnings.filterwarnings("ignore")
 from dataset_utils import (
     UADFVDataset, 
     create_dataloaders, 
-    create_adabn_dataloader, 
     get_sample_info, 
     worker_init_fn
 )
@@ -37,133 +36,24 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
-# =====================================================================
-# ================== DISTRIBUTED BATCHNORM ADAPTATION ==================
-# =====================================================================
-@torch.no_grad()
-def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main=True, is_distributed=False):
-    """
-    اعمال AdaBN به صورت موازی روی چندین GPU.
-    اگر is_distributed=True باشد، از فرمول محاسبه واریانس موازی (Parallel Variance) استفاده می‌کند.
-    """
-    if is_main:
-        print("\n" + "="*70)
-        print(f"STARTING BATCHNORM ADAPTATION (AdaBN) - Mode: {'Distributed' if is_distributed else 'Single GPU'}")
-        print("="*70)
-        
-    normalizer = MultiModelNormalization(means, stds).to(device)
-    
-    if is_distributed:
-        # =================== منطق چند GPU ===================
-        accumulators = [{} for _ in models]
-        hooks = []
-        
-        for i, model in enumerate(models):
-            model.eval() # مدل در حالت eval میماند تا dropout خاموش شود
-            for name, m in model.named_modules():
-                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    # ساخت بافرهای accumulator برای هر لایه BN
-                    accumulators[i][name] = {
-                        'n': torch.tensor(0.0, device=device),
-                        'sum_mean': torch.zeros(m.num_features, device=device),
-                        'sum_x2': torch.zeros(m.num_features, device=device) # مجموع مربعات برای محاسبه واریانس
-                    }
-                    
-                    def get_hook(model_idx, layer_name):
-                        def hook(module, inp, out):
-                            x = inp[0]
-                            # N در اینجا برابر با (Batch_size * H * W) است
-                            n = x.numel() / x.size(1) 
-                            
-                            # محاسبه mean و var دقیقاً مشابه نحوه محاسبه داخلی PyTorch (unbiased=False)
-                            mean = x.mean(dim=[0, 2, 3])
-                            var = x.var(dim=[0, 2, 3], unbiased=False) 
-                            
-                            # آپدیت مقادیر تجمعی
-                            accumulators[model_idx][layer_name]['n'] += n
-                            accumulators[model_idx][layer_name]['sum_mean'] += mean * n
-                            # فرمول ریاضی: sum(x^2) = Var(x) * N + Mean(x)^2 * N
-                            accumulators[model_idx][layer_name]['sum_x2'] += (var * n) + (mean ** 2 * n)
-                        return hook
-                    # ثبت Hook روی لایه
-                    hooks.append(m.register_forward_hook(get_hook(i, name)))
-
-        # تنظیم epoch برای sampler در صورت وجود
-        if hasattr(adabn_loader.sampler, 'set_epoch'):
-            adabn_loader.sampler.set_epoch(0)
-
-        # پاس دادن داده‌ها (هر GPU فقط بخشی از داده را می‌بیند)
-        for images, _ in tqdm(adabn_loader, desc="Adapting BN (Dist)", disable=not is_main):
-            images = images.to(device)
-            for i, model in enumerate(models):
-                x_n = normalizer(images, i)
-                model(x_n) # Hook ها به صورت خودکار اجرا و مقادیر را جمع می‌کنند
-
-        # حذف Hook ها
-        for h in hooks: h.remove()
-
-        if is_main: print("Synchronizing BN statistics across GPUs...")
-        
-        # جمع کردن آمارهای محاسبه شده از تمام GPUها
-        for i, model in enumerate(models):
-            for name, m in model.named_modules():
-                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    acc = accumulators[i][name]
-                    
-                    # جمع کردن مقادیر روی تمام پردازنده‌ها
-                    dist.all_reduce(acc['n'], op=dist.ReduceOp.SUM)
-                    dist.all_reduce(acc['sum_mean'], op=dist.ReduceOp.SUM)
-                    dist.all_reduce(acc['sum_x2'], op=dist.ReduceOp.SUM)
-                    
-                    # محاسبه آمار نهایی و جامع (Global Mean & Variance)
-                    global_mean = acc['sum_mean'] / acc['n']
-                    global_var = (acc['sum_x2'] / acc['n']) - (global_mean ** 2)
-                    global_var = torch.clamp(global_var, min=1e-5) # جلوگیری از صفر شدن واریانس
-                    
-                    # ست کردن آمارهای محاسبه شده
-                    m.running_mean.copy_(global_mean)
-                    m.running_var.copy_(global_var)
-                    m.num_batches_tracked.copy_(torch.tensor(1, dtype=torch.long, device=device))
-        
-        if is_main: print("✅ Distributed BatchNorm Adaptation Completed!\n")
-
-    else:
-        # =================== منطق تک GPU (کد قبلی) ===================
-        for model in models:
-            model.eval()  
-            for m in model.modules():
-                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    m.reset_running_stats()
-                    m.momentum = None  
-                    m.train()          
-                    
-        for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
-            images = images.to(device)
-            for i, model in enumerate(models):
-                x_n = normalizer(images, i)
-                model(x_n) 
-                
-        for model in models:
-            for m in model.modules():
-                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    m.momentum = 0.1
-            model.eval()
-            
-        if is_main: print("✅ BatchNorm Adaptation Completed!\n")
-# =====================================================================
-
-
 # ================== UNIFIED FINAL EVALUATION & REPORT ==================
 @torch.no_grad()
 def final_evaluation_and_report(model, loader, device, save_dir, model_name, args, is_main):
+    """
+    ارزیابی نهایی با فرمول درست: Sigmoid(Mean(Logits))
+    و با رعایت اعمال ترنسفورم‌های تصویر (256x256).
+    """
     if not is_main or loader is None: return 0.0, None, None
 
     model.eval()
-    base_dataset = loader.dataset
-    if hasattr(base_dataset, 'dataset'): base_dataset = base_dataset.dataset
-    if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'indices'): test_indices = loader.sampler.indices
-    elif hasattr(loader.dataset, 'indices'): test_indices = loader.dataset.indices
-    else: test_indices = list(range(len(base_dataset)))
+    
+    # استخراج اندیس‌های تست بدون دور زدن TransformSubset
+    if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'indices'):
+        test_indices = loader.sampler.indices
+    elif hasattr(loader.dataset, 'indices'):
+        test_indices = loader.dataset.indices
+    else:
+        test_indices = list(range(len(loader.dataset)))
 
     all_y_true, all_y_score, all_y_pred, lines = [], [], [], []
     lines.extend(["="*100, "SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):", "="*100])
@@ -175,16 +65,27 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
 
     print(f"\nRunning Final Evaluation on {len(test_indices)} samples...")
     
-    for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
+    for i, idx_in_subset in enumerate(tqdm(test_indices, desc="Final Eval")):
         try:
-            image, label = base_dataset[global_idx]
-            path, _ = get_sample_info(base_dataset, global_idx)
-        except Exception as e: continue
+            # استفاده از loader.dataset تا ترنسفورم‌های Resize و CenterCrop اعمال شوند
+            image, label = loader.dataset[idx_in_subset]
+            
+            # پیدا کردن مسیر فایل اصلی برای لاگ
+            if hasattr(loader.dataset, 'dataset') and hasattr(loader.dataset, 'indices'):
+                original_idx = loader.dataset.indices[idx_in_subset]
+                path, _ = get_sample_info(loader.dataset.dataset, original_idx)
+            else:
+                path, _ = get_sample_info(loader.dataset, idx_in_subset)
+        except Exception as e: 
+            continue
 
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
         
+        # پیش‌بینی مدل
         output, _, _, _ = model(image, return_details=True)
+        
+        # فرمول درست: Sigmoid روی میانگین لاجیت‌ها
         prob = torch.sigmoid(output.squeeze()).item()
         pred_int = int(prob > 0.5)
 
@@ -231,13 +132,22 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     y_true_np, y_score_np, y_pred_np = np.array(all_y_true), np.array(all_y_score), np.array(all_y_pred)
 
     roc_json_path = os.path.join(save_dir, "roc_data_test.json")
-    roc_data_json = {"metadata": {"seed": args.seed, "dataset": args.dataset, "num_samples": int(total_samples), "positive_count": int(np.sum(y_true_np)), "negative_count": int(total_samples - np.sum(y_true_np)), "model": "simple_averaging_ensemble_AdaBN_Dist"}, "y_true": y_true_np.tolist(), "y_score": y_score_np.tolist(), "y_pred": y_pred_np.tolist()}
+    roc_data_json = {
+        "metadata": {
+            "seed": args.seed, "dataset": args.dataset, "num_samples": int(total_samples), 
+            "positive_count": int(np.sum(y_true_np)), "negative_count": int(total_samples - np.sum(y_true_np)), 
+            "model": "simple_averaging_ensemble"
+        }, 
+        "y_true": y_true_np.tolist(), "y_score": y_score_np.tolist(), "y_pred": y_pred_np.tolist()
+    }
     with open(roc_json_path, 'w', encoding='utf-8') as f: json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
     
     roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
-    with open(roc_txt_path, 'w', encoding='utf-8') as f:
+    with open(roc_txt_path, 'w') as f:
         f.write("y_true\ty_score\ty_pred\n")
         for t, s, p in zip(y_true_np, y_score_np, y_pred_np): f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
+        
+    print(f"✅ ROC data saved.")
 
     return acc * 100, y_true_np, y_score_np
 
@@ -261,7 +171,9 @@ class SimpleAveragingEnsemble(nn.Module):
         self.normalizations = MultiModelNormalization(means, stds)
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
+        # ذخیره لاجیت‌های خام تمام مدل‌ها
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
+        
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
             with torch.no_grad():
@@ -269,9 +181,12 @@ class SimpleAveragingEnsemble(nn.Module):
                 if isinstance(out, (tuple, list)): out = out[0]
             outputs[:, i] = out.view(x.size(0), 1)
 
+        # محاسبه میانگین لاجیت‌ها
         final_output = outputs.mean(dim=1)
+        
         if return_details:
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
+            # خروجی اول = میانگین لاجیت‌ها ، خروجی آخر = لاجیت‌های خام تک تک مدل‌ها
             return final_output, weights, None, outputs
         return final_output, None
 
@@ -284,50 +199,67 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
         raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
 
     models = []
-    if is_main: print(f"Loading {len(model_paths)} pruned models...")
+    if is_main:
+        print(f"Loading {len(model_paths)} pruned models...")
 
     for i, path in enumerate(model_paths):
         if not os.path.exists(path):
-            if is_main: print(f" [WARNING] File not found: {path}")
+            if is_main:
+                print(f" [WARNING] File not found: {path}")
             continue
-        if is_main: print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
+        if is_main:
+            print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
         try:
             ckpt = torch.load(path, map_location='cpu', weights_only=False)
             model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
             model.load_state_dict(ckpt['model_state_dict'])
             model = model.to(device).eval()
-            if is_main: print(f" → Parameters: {sum(p.numel() for p in model.parameters()):,}")
+            
+            param_count = sum(p.numel() for p in model.parameters())
+            if is_main:
+                print(f" → Parameters: {param_count:,}")
             models.append(model)
         except Exception as e:
-            if is_main: print(f" [ERROR] Failed to load {path}: {e}")
+            if is_main:
+                print(f" [ERROR] Failed to load {path}: {e}")
+            continue
 
-    if len(models) == 0: raise ValueError("No models loaded!")
-    if is_main: print(f"All {len(models)} models loaded!\n")
+    if len(models) == 0:
+        raise ValueError("No models loaded!")
+    if is_main:
+        print(f"All {len(models)} models loaded!\n")
     return models
 
 
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
-def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device, name: str, mean: Tuple[float, float, float], std: Tuple[float, float, float], is_main: bool) -> float:
+def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device,
+                              name: str, mean: Tuple[float, float, float],
+                              std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
-    correct, total = 0, 0
+    correct = 0
+    total = 0
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
         out = model(images)
-        if isinstance(out, (tuple, list)): out = out[0]
+        if isinstance(out, (tuple, list)):
+            out = out[0]
         pred = (out.squeeze(1) > 0).long()
         total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     total_tensor = torch.tensor(total, dtype=torch.long, device=device)
+    
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        
     acc = 100. * correct_tensor.item() / total_tensor.item()
-    if is_main: print(f" {name}: {acc:.2f}%")
+    if is_main:
+        print(f" {name}: {acc:.2f}%")
     return acc
 
 
@@ -340,25 +272,27 @@ def setup_distributed():
         dist.init_process_group(backend='nccl')
         torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
-        if rank == 0: print(f"Distributed: rank {rank}/{world_size}, local_rank {local_rank}")
+        if rank == 0:
+            print(f"Distributed: rank {rank}/{world_size}, local_rank {local_rank}")
         return device, local_rank, rank, world_size
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         return device, 0, 0, 1
 
 def cleanup_distributed():
-    if dist.is_initialized(): dist.destroy_process_group()
-
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 # ================== MAIN FUNCTION ==================
 def main():
-    parser = argparse.ArgumentParser(description="Simple Averaging Ensemble + Distributed AdaBN")
+    parser = argparse.ArgumentParser(description="Simple Averaging Ensemble (Standard Logit Averaging)")
     parser.add_argument('--epochs', type=int, default=1, help="Unused in Simple Averaging")
     parser.add_argument('--lr', type=float, default=0.0001, help="Unused in Simple Averaging")
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
-    parser.add_argument('--dataset', type=str, required=True, choices=['wild', 'deepfake_lab', 'hard_fake_real', 'uadfV','real_fake_dataset'])
+    parser.add_argument('--dataset', type=str, required=True,
+                       choices=['wild', 'deepfake_lab', 'hard_fake_real', 'uadfV','real_fake_dataset'])
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
@@ -366,44 +300,42 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
-    if len(args.model_names) != len(args.model_paths): raise ValueError("Number of model_names must match model_paths")
+    if len(args.model_names) != len(args.model_paths):
+        raise ValueError("Number of model_names must match model_paths")
 
     set_seed(args.seed)
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
-    is_distributed = world_size > 1 # <--- متغیر کمکی
+    is_distributed = world_size > 1
 
     if is_main:
         print("="*70)
-        print(f"SIMPLE AVERAGING ENSEMBLE + Distributed AdaBN")
+        print(f"SIMPLE AVERAGING ENSEMBLE (Sigmoid of Mean Logits)")
         print(f"Distributed on {world_size} GPU(s) | Seed: {args.seed}")
         print("="*70)
-        print(f"Dataset: {args.dataset}\nData directory: {args.data_dir}\nBatch size: {args.batch_size}\nModels: {len(args.model_paths)}")
+        print(f"Dataset: {args.dataset}")
+        print(f"Data directory: {args.data_dir}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Models: {len(args.model_paths)}")
         print("="*70 + "\n")
 
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-    MEANS = MEANS[:len(args.model_paths)]
-    STDS = STDS[:len(args.model_paths)]
+    
+    # تنظیم mean/std برای تعداد مدل‌ها
+    if len(args.model_paths) > len(MEANS):
+        MEANS = MEANS + [MEANS[-1]] * (len(args.model_paths) - len(MEANS))
+        STDS = STDS + [STDS[-1]] * (len(args.model_paths) - len(STDS))
+    else:
+        MEANS = MEANS[:len(args.model_paths)]
+        STDS = STDS[:len(args.model_paths)]
 
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    # =================== فراخوانی AdaBN به صورت موازی ===================
-    adabn_loader = create_adabn_dataloader(
-        args.data_dir, args.batch_size, num_workers=0,
-        dataset_type=args.dataset, seed=args.seed, is_main=is_main,
-        is_distributed=is_distributed # <--- فعال سازی موازی سازی دیتا
-    )
-    adapt_batchnorm_for_new_dataset(
-        base_models, MEANS, STDS, adabn_loader, device, is_main,
-        is_distributed=is_distributed # <--- فعال سازی محاسبات موازی روی GPUها
-    )
-    del adabn_loader
-    if is_main: torch.cuda.empty_cache()
-    # ====================================================================
-
-    ensemble = SimpleAveragingEnsemble(base_models, MEANS, STDS).to(device)
+    ensemble = SimpleAveragingEnsemble(
+        base_models, MEANS, STDS
+    ).to(device)
 
     if is_distributed:
         ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
@@ -411,7 +343,7 @@ def main():
     if is_main:
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
         total = sum(p.numel() for p in ensemble.parameters())
-        print(f"Total params: {total:,} | Trainable: {trainable:,}\n")
+        print(f"Total params: {total:,} | Trainable: {trainable:,} (Kept trainable for DDP compatibility)\n")
 
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
@@ -419,12 +351,15 @@ def main():
 
     if is_main:
         print("\n" + "="*70)
-        print("INDIVIDUAL MODEL PERFORMANCE (After Distributed AdaBN)")
+        print("INDIVIDUAL MODEL PERFORMANCE")
         print("="*70)
 
     individual_accs = []
     for i, model in enumerate(base_models):
-        acc = evaluate_single_model_ddp(model, test_loader, device, f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i], is_main)
+        acc = evaluate_single_model_ddp(
+            model, test_loader, device,
+            f"Model {i+1} ({MODEL_NAMES[i]})",
+            MEANS[i], STDS[i], is_main)
         individual_accs.append(acc)
 
     best_single = max(individual_accs)
@@ -434,6 +369,8 @@ def main():
         print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
         print("="*70)
         print("\nSkipping Training (Simple Averaging does not learn parameters)...\n")
+
+    if is_main:
         print("\n" + "="*70)
         print("FINAL ENSEMBLE EVALUATION")
         print("="*70)
@@ -442,9 +379,18 @@ def main():
     
     if is_main:
         os.makedirs(args.save_dir, exist_ok=True)
-        _, _, test_loader_full = create_dataloaders(args.data_dir, args.batch_size, dataset_type=args.dataset, is_distributed=False, seed=args.seed, is_main=True)
+        
+        # ساخت دیتالودر تست غیرتوزیع‌شده
+        _, _, test_loader_full = create_dataloaders(
+            args.data_dir, args.batch_size, dataset_type=args.dataset,
+            is_distributed=False, seed=args.seed, is_main=True
+        )
 
-        ensemble_test_acc, y_true, y_score = final_evaluation_and_report(ensemble_module, test_loader_full, device, args.save_dir, "Simple Averaging Ensemble", args, is_main)
+        # اجرای ارزیابی یکپارچه با فرمول درست
+        ensemble_test_acc, y_true, y_score = final_evaluation_and_report(
+            ensemble_module, test_loader_full, device, args.save_dir, 
+            "Simple Averaging Ensemble", args, is_main
+        )
 
         print("\n" + "="*70)
         print("FINAL COMPARISON")
@@ -454,21 +400,51 @@ def main():
         print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
 
-        final_results = {'method': 'Simple Averaging + Distributed AdaBN', 'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)}, 'ensemble': {'test_accuracy': float(ensemble_test_acc), 'strategy': 'Uniform Weights'}, 'improvement': float(ensemble_test_acc - best_single)}
-        
+        final_results = {
+            'method': 'Simple Averaging (Logit Mean)',
+            'best_single_model': {
+                'name': MODEL_NAMES[best_idx],
+                'accuracy': float(best_single)
+            },
+            'ensemble': {
+                'test_accuracy': float(ensemble_test_acc),
+                'strategy': 'Sigmoid(Mean(Logits))'
+            },
+            'improvement': float(ensemble_test_acc - best_single)
+        }
+
         results_path = os.path.join(args.save_dir, 'final_results_simple_avg.json')
-        with open(results_path, 'w') as f: json.dump(final_results, f, indent=4)
+        with open(results_path, 'w') as f:
+            json.dump(final_results, f, indent=4)
         print(f"\nResults saved: {results_path}")
 
         final_model_path = os.path.join(args.save_dir, 'final_ensemble_model_simple_avg.pt')
-        torch.save({'ensemble_state_dict': ensemble_module.state_dict(), 'test_accuracy': ensemble_test_acc, 'model_names': MODEL_NAMES, 'means': MEANS, 'stds': STDS}, final_model_path)
+        torch.save({
+            'ensemble_state_dict': ensemble_module.state_dict(),
+            'test_accuracy': ensemble_test_acc,
+            'model_names': MODEL_NAMES,
+            'means': MEANS,
+            'stds': STDS
+        }, final_model_path)
         print(f"Model saved: {final_model_path}")
 
         vis_dir = os.path.join(args.save_dir, 'visualizations')
-        generate_visualizations(ensemble_module, test_loader_full, device, vis_dir, MODEL_NAMES, args.num_grad_cam_samples, args.num_lime_samples, args.dataset, is_main)
-        plot_roc_and_f1(ensemble_module, test_loader_full, device, args.save_dir, MODEL_NAMES, is_main)
+        generate_visualizations(
+            ensemble_module, test_loader_full, device, vis_dir, MODEL_NAMES,
+            args.num_grad_cam_samples, args.num_lime_samples,
+            args.dataset, is_main)
 
     cleanup_distributed()
+    
+    if is_main:
+        plot_roc_and_f1(
+            ensemble_module,
+            test_loader_full, 
+            device, 
+            args.save_dir, 
+            MODEL_NAMES,
+            is_main
+        )
 
 if __name__ == "__main__":
     main()
