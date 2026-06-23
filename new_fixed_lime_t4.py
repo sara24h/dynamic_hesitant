@@ -33,6 +33,25 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
+# ================== DISTRIBUTED SETUP ==================
+def setup_distributed():
+    """تنظیمات اجرای توزیع‌شده روی چند GPU"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f'cuda:{local_rank}')
+        if rank == 0: print(f"Distributed: rank {rank}/{world_size}, local_rank {local_rank}")
+        return device, local_rank, rank, world_size
+    else:
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 0, 0, 1
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
     """
@@ -85,8 +104,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
             
-            # پیش‌بینی مدل
-                        # پیش‌بینی مدل با دریافت جزئیات وزن‌ها
+            # پیش‌بینی مدل با دریافت جزئیات وزن‌ها
             output, final_weights, _, _ = model(image, return_details=True)
             
             # محاسبه احتمال (Score) و کلاس پیش‌بینی شده
@@ -138,10 +156,6 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"    Actual Fake      {FP:<15} {TN:<15}")
     print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
     print(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
-    print("="*70)
-
-    print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
-    print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     print("="*70)
 
     # ════════════════════════════════════════════════════════════════
@@ -338,15 +352,12 @@ class FuzzyHesitantEnsemble(nn.Module):
                 for p in model.parameters():
                     p.requires_grad = False
 
-
     def train(self, mode=True):
-      
         super().train(mode)
         # Force base models to remain in eval mode
         for model in self.models:
             model.eval()
         return self
-  
 
     def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
         batch_size = final_weights.size(0)
@@ -362,7 +373,7 @@ class FuzzyHesitantEnsemble(nn.Module):
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
-        hesitancy = all_memberships.var(dim=2,unbiased=False)
+        hesitancy = all_memberships.var(dim=2, unbiased=False)
         avg_hesitancy = hesitancy.mean(dim=1)
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
         final_weights = final_weights * mask
@@ -407,23 +418,19 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
             models.append(model)
         except Exception as e:
             if is_main: print(f" [ERROR] Failed to load {path}: {e}")
-    if len(models) == 0: raise ValueError("No models loaded!")
+    if len(models) == 0:
+        raise ValueError("No models loaded!")
     return models
 
 
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
-
 def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
                               name: str, mean: Tuple[float, float, float],
                               std: Tuple[float, float, float], is_main: bool) -> float:
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    
-    # تعداد واقعی نمونه‌ها (بدون padding)
-    total_real_samples = len(loader.dataset)
-    
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
@@ -433,24 +440,16 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+    real_total = len(loader.dataset)
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    
-    # محاسبه با تعداد واقعی نمونه‌ها
-    acc = 100. * correct_tensor.item() / total_real_samples
-    
-    if is_main: 
-        print(f" {name}: {acc:.2f}% (Real samples: {total_real_samples})")
+    acc = 100. * correct_tensor.item() / real_total
+    if is_main: print(f" {name}: {acc:.2f}%")
     return acc
 
 @torch.no_grad()
-
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
-    
-    # تعداد واقعی نمونه‌ها (بدون padding)
-    total_real_samples = len(loader.dataset)
-    
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
@@ -458,10 +457,9 @@ def evaluate_accuracy_ddp(model, loader, device):
         correct += pred.eq(labels.long()).sum().item()
     
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+    real_total = len(loader.dataset)
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    
-    # محاسبه با تعداد واقعی نمونه‌ها
-    return 100. * correct_tensor.item() / total_real_samples
+    return 100. * correct_tensor.item() / real_total
 
 
 # ================== TRAINING ==================
@@ -474,9 +472,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     criterion = nn.BCEWithLogitsLoss()
     best_val_acc = 0.0
 
-    # تعداد واقعی نمونه‌ها در train
-    total_real_samples = len(train_loader.dataset)
-
     if is_main:
         print("="*70)
         print("Training Fuzzy Hesitant Network")
@@ -484,8 +479,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
         print(f"Epochs: {num_epochs} | Initial LR: {lr}")
         print(f"Hesitant memberships per model: {hesitant_net.num_memberships}")
-        print(f"Number of models: {len(model_names)}")
-        print(f"Total real training samples: {total_real_samples:,}\n")
+        print(f"Number of models: {len(model_names)}\n")
 
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
@@ -493,6 +487,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         
         train_loss = 0.0
         train_correct = 0
+        train_total = 0
         
         # متغیرهای برای آمارهای دوره
         sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
@@ -513,6 +508,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             train_loss += loss.item() * batch_size
             pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
+            train_total += batch_size
             
             # محاسبه آمارهای دوره
             per_model_hesitancy = memberships.var(dim=2, unbiased=False)
@@ -524,34 +520,12 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             sum_cumsum_used += cumsum_used_samples
             sum_active_models += active_mask.sum(dim=0)
 
-        # همگام‌سازی تمام آمارهای آموزش بین GPU ها
-        if dist.is_initialized():
-            train_loss_tensor = torch.tensor(train_loss, device=device)
-            train_correct_tensor = torch.tensor(train_correct, device=device)
-
-            dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(train_correct_tensor, op=dist.ReduceOp.SUM)
-            
-            # همگام‌سازی برای آمارهای فازی
-            dist.all_reduce(sum_per_model_hesitancy, op=dist.ReduceOp.SUM)
-            dist.all_reduce(sum_active_models, op=dist.ReduceOp.SUM)
-            
-            # برای sum_cumsum_used که یک int است:
-            sum_cumsum_used_tensor = torch.tensor(sum_cumsum_used, device=device)
-            dist.all_reduce(sum_cumsum_used_tensor, op=dist.ReduceOp.SUM)
-            sum_cumsum_used = sum_cumsum_used_tensor.item()
-
-            # محاسبه با تعداد واقعی نمونه‌ها
-            train_loss = train_loss_tensor.item() / total_real_samples
-            train_acc = 100. * train_correct_tensor.item() / total_real_samples
-        else:
-            train_loss = train_loss / total_real_samples
-            train_acc = 100. * train_correct / total_real_samples
+        train_acc = 100. * train_correct / train_total
+        train_loss = train_loss / train_total
         
-        # بقیه محاسبات با اعداد همگام شده انجام می‌شود
-        avg_per_model_hesitancy = sum_per_model_hesitancy / total_real_samples
-        avg_cumsum_usage = (sum_cumsum_used / total_real_samples) * 100
-        avg_model_activation = (sum_active_models / total_real_samples) * 100
+        avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
+        avg_cumsum_usage = (sum_cumsum_used / train_total) * 100
+        avg_model_activation = (sum_active_models / train_total) * 100
         overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
         
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
@@ -603,27 +577,9 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     return best_val_acc
 
 
-# ================== DISTRIBUTED SETUP ==================
-def setup_distributed():
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ['LOCAL_RANK'])
-        dist.init_process_group(backend='nccl')
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f'cuda:{local_rank}')
-        if rank == 0: print(f"Distributed: rank {rank}/{world_size}, local_rank {local_rank}")
-        return device, local_rank, rank, world_size
-    else:
-        return torch.device('cuda' if torch.cuda.is_available() else 'cpu'), 0, 0, 1
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
 # ================== MAIN FUNCTION ==================
 def main():
-    parser = argparse.ArgumentParser(description="Optimized Fuzzy Hesitant Ensemble Training")
+    parser = argparse.ArgumentParser(description="Optimized Fuzzy Hesitant Ensemble Training (Multi-GPU)")
     # آرگومان‌های اصلی
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.0001)
@@ -689,12 +645,7 @@ def main():
     ).to(device)
 
     if world_size > 1:
-        ensemble = DDP(
-            ensemble, 
-            device_ids=[local_rank], 
-            output_device=local_rank,
-            find_unused_parameters=True  # ← این خط حیاتی است
-        )
+        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
     if is_main:
         trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
@@ -712,10 +663,9 @@ def main():
 
     individual_accs = []
     for i, model in enumerate(base_models):
-        acc = evaluate_single_model_ddp(
-            model, test_loader, device,
-            f"Model {i+1} ({MODEL_NAMES[i]})",
-            MEANS[i], STDS[i], is_main)
+        acc = evaluate_single_model_ddp(model, test_loader, device, 
+                                          f"Model {i+1} ({MODEL_NAMES[i]})", 
+                                          MEANS[i], STDS[i], is_main)
         individual_accs.append(acc)
 
     best_single = max(individual_accs)
@@ -734,7 +684,7 @@ def main():
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
     
-    # --- FIX: فقط GPU اصلی فایل را بخواند تا ارور PytorchStreamReader برطرف شود ---
+    # --- فقط GPU اصلی فایل را بخواند تا ارور برطرف شود ---
     if is_main and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device)
         ensemble_module.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
@@ -745,7 +695,7 @@ def main():
         print("FINAL ENSEMBLE EVALUATION")
         print("="*70)
 
-        # ساخت دیتالودر تست غیرتوزیع‌شده
+        # ساخت دیتالودر تست غیرتوزیع‌شده برای ارزیابی نهایی
         _, _, test_loader_full = create_dataloaders(
             args.data_dir, args.batch_size, dataset_type=args.dataset,
             is_distributed=False, seed=args.seed, is_main=True
