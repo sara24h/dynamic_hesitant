@@ -145,7 +145,6 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
     
-    # تعداد واقعی نمونه‌ها (بدون padding)
     total_real_samples = len(loader.dataset)
     
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
@@ -158,9 +157,11 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
-    # محاسبه با تعداد واقعی نمونه‌ها
+    # ---> اصلاح باگ: فقط در صورت فعال بودن DDP آل ردوس کن <---
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    
     acc = 100. * correct_tensor.item() / total_real_samples
     
     if is_main:
@@ -172,8 +173,6 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
-    
-    # تعداد واقعی نمونه‌ها (بدون padding)
     total_real_samples = len(loader.dataset)
     
     for images, labels in loader:
@@ -183,9 +182,11 @@ def evaluate_accuracy_ddp(model, loader, device):
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
-    # محاسبه با تعداد واقعی نمونه‌ها
+    # ---> اصلاح باگ: فقط در صورت فعال بودن DDP آل ردوس کن <---
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    
     return 100. * correct_tensor.item() / total_real_samples
 
 
@@ -193,10 +194,7 @@ def evaluate_accuracy_ddp(model, loader, device):
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
     total_correct = 0
-    
-    # تعداد واقعی نمونه‌ها (بدون padding)
     total_real_samples = len(loader.dataset)
-    
     ws = dist.get_world_size() if dist.is_initialized() else 1
     
     all_y_true = []
@@ -220,7 +218,10 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_correct += pred_int.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(total_correct, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    
+    # ---> اصلاح باگ: فقط در صورت فعال بودن DDP آل ردوس کن <---
+    if dist.is_initialized():
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
 
     if ws > 1:
         gathered_true = [None for _ in range(ws)]
@@ -237,12 +238,10 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
             all_y_pred = [item for sublist in gathered_pred for item in sublist]
 
     if is_main:
-        # حذف نمونه‌های تکراری از لیست‌ها
         all_y_true = all_y_true[:total_real_samples]
         all_y_score = all_y_score[:total_real_samples]
         all_y_pred = all_y_pred[:total_real_samples]
         
-        # محاسبه دقت با تعداد واقعی
         acc = 100. * correct_tensor.item() / total_real_samples
         
         meta_learner = model.meta_learner
@@ -270,7 +269,6 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
     
-    # استخراج ماژول واقعی (بدون پوشش DDP)
     actual_module = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
     meta_learner = actual_module.meta_learner
     
@@ -295,15 +293,8 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
         
         ensemble_model.train()
         
-        # ====== اصلاح باگ: بازگرداندن مدل‌های پایه به حالت eval ======
-        # دلیل: فراخوانی ensemble_model.train() به صورت بازگشتی تمام زیرماژول‌ها
-        # (از جمله مدل‌های پایه فریز شده) را به حالت train برمی‌گرداند.
-        # در حالت train، لایه‌های BatchNorm آمار running_mean و running_var را
-        # با داده‌های بچ فعلی آپدیت می‌کنند که ناخواسته است.
-        # با eval() کردن مجدد مدل‌های پایه، این آپدیت غیرفعال می‌شود.
         for model in actual_module.models:
             model.eval()
-        # =============================================================
         
         train_loss = 0.0
         train_correct = 0
@@ -377,7 +368,8 @@ def setup_distributed():
             print(f"Distributed: rank {rank}/{world_size}, local_rank {local_rank}")
         return device, local_rank, rank, world_size
     else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # ---> اصلاح: برای یک GPU هم به طور صریح cuda:0 بده تا تداخلی پیش نیاید <---
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         return device, 0, 0, 1
 
 
@@ -417,7 +409,6 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
     
-    # محاسبه ماتریس آشفتگی
     TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
     TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
     FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
@@ -569,7 +560,6 @@ def main():
 
         ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
         
-        # دریافت خروجی‌ها برای JSON و Log
         ensemble_test_acc, learned_weights, learned_bias, predictions_data = evaluate_ensemble_final_ddp(
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
@@ -582,14 +572,11 @@ def main():
             print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
             print("="*70)
 
-            # استخراج لیست‌ها
             y_true, y_score, y_pred = predictions_data
             
-            # 1. ذخیره JSON
             json_path = os.path.join(current_save_dir, 'test_predictions.json')
             save_predictions_json(y_true, y_score, y_pred, json_path, current_seed, args.dataset)
 
-            # 2. ذخیره فایل txt دقیقاً مطابق با کنسول (جایگزین save_prediction_log قبلی)
             log_path_ensemble = os.path.join(current_save_dir, 'prediction_log_stacking.txt')
             save_accuracy_log_from_results(y_true, y_pred, log_path_ensemble, "Stacking Ensemble")
 
@@ -633,7 +620,6 @@ def main():
             single_y_pred = []
             single_normalizer = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
 
-# تعداد واقعی نمونه‌ها
             total_real_samples = len(test_loader.dataset)
 
             for images, labels in tqdm(test_loader, desc="Eval Single for Log"):
@@ -644,10 +630,9 @@ def main():
                     if isinstance(out, (tuple, list)): out = out[0]
                     pred = (out.squeeze(1) > 0).long()
         
-            single_y_true.extend(labels.cpu().numpy().tolist())
-            single_y_pred.extend(pred.cpu().numpy().tolist())
+                single_y_true.extend(labels.cpu().numpy().tolist())
+                single_y_pred.extend(pred.cpu().numpy().tolist())
 
-# حذف نمونه‌های تکراری
             single_y_true = single_y_true[:total_real_samples]
             single_y_pred = single_y_pred[:total_real_samples]
 
