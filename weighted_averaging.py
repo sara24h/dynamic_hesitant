@@ -18,8 +18,7 @@ warnings.filterwarnings("ignore")
 
 from dataset_utils import (
     UADFVDataset, 
-    create_dataloaders,
-    create_adabn_dataloader,  # <-- ایمپورت تابع لودر AdaBN اضافه شد
+    create_dataloaders, 
     get_sample_info, 
     worker_init_fn
 )
@@ -48,101 +47,6 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
-# ================== ADABN FUNCTION (اصلاح شده منطق) ==================
-@torch.no_grad()
-
-def adapt_batchnorm_for_new_dataset(models, means, stds, adabn_loader, device, is_main, is_distributed=False):
-    """
-    AdaBN با منطق Hook-based برای محاسبه دقیق Parallel Variance روی multi-GPU.
-    در حالت single-GPU هم از همین منطق استفاده می‌کنه (یکپارچه و دقیق).
-    """
-    if is_main:
-        print("\n" + "="*70)
-        print(f"STARTING BATCHNORM ADAPTATION (AdaBN) - Mode: {'Distributed' if is_distributed else 'Single GPU'}")
-        print("="*70)
-
-    normalizer = MultiModelNormalization(means, stds).to(device)
-
-    # ساخت accumulator برای هر مدل و هر لایه BN
-    accumulators = [{} for _ in models]
-    hooks = []
-
-    for i, model in enumerate(models):
-        model.eval()  # Dropout خاموش بمونه
-        for name, m in model.named_modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                accumulators[i][name] = {
-                    'n':        torch.tensor(0.0, device=device),
-                    'sum_mean': torch.zeros(m.num_features, device=device),
-                    'sum_x2':   torch.zeros(m.num_features, device=device),
-                }
-
-                def get_hook(model_idx, layer_name):
-                    def hook(module, inp, out):
-                        x = inp[0].detach()
-                        # N = batch_size * H * W (برای Conv) یا batch_size (برای Linear)
-                        n = x.numel() / x.size(1)
-                        # میانگین و واریانس روی همه ابعاد غیر از channel
-                        dims = [0] + list(range(2, x.dim()))
-                        mean = x.mean(dim=dims)
-                        var  = x.var(dim=dims, unbiased=False)
-                        acc = accumulators[model_idx][layer_name]
-                        acc['n']        += n
-                        acc['sum_mean'] += mean * n
-                        # فرمول: sum(x^2) = Var*N + Mean^2*N  →  برای Parallel Variance
-                        acc['sum_x2']   += (var + mean ** 2) * n
-                    return hook
-
-                hooks.append(m.register_forward_hook(get_hook(i, name)))
-
-    # تنظیم epoch برای DistributedSampler
-    if hasattr(adabn_loader.sampler, 'set_epoch'):
-        adabn_loader.sampler.set_epoch(0)
-
-    # یک pass روی داده‌ها — هر GPU بخشی از داده را می‌بیند
-    for images, _ in tqdm(adabn_loader, desc="Adapting BN", disable=not is_main):
-        images = images.to(device)
-        for i, model in enumerate(models):
-            x_n = normalizer(images, i)
-            model(x_n)  # hookها خودکار اجرا می‌شن
-
-    # حذف hookها
-    for h in hooks:
-        h.remove()
-
-    # در حالت distributed: سینک کردن آمارها بین GPUها
-    if is_distributed and dist.is_initialized():
-        if is_main:
-            print("Synchronizing BN statistics across GPUs...")
-        for i, model in enumerate(models):
-            for name in accumulators[i]:
-                acc = accumulators[i][name]
-                dist.all_reduce(acc['n'],        op=dist.ReduceOp.SUM)
-                dist.all_reduce(acc['sum_mean'], op=dist.ReduceOp.SUM)
-                dist.all_reduce(acc['sum_x2'],   op=dist.ReduceOp.SUM)
-
-    # نوشتن آمار نهایی روی running_mean و running_var
-    for i, model in enumerate(models):
-        for name, m in model.named_modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                acc = accumulators[i][name]
-                if acc['n'].item() == 0:
-                    continue
-                global_mean = acc['sum_mean'] / acc['n']
-                global_var  = acc['sum_x2']  / acc['n'] - global_mean ** 2
-                global_var  = torch.clamp(global_var, min=1e-5)
-
-                m.running_mean.copy_(global_mean)
-                m.running_var.copy_(global_var)
-                m.num_batches_tracked.fill_(1)
-                m.momentum = 0.1   # برگشت به حالت عادی
-        model.eval()  # مدل کاملاً eval بمونه
-
-    if is_main:
-        print("✅ BatchNorm Adaptation Completed!\n")
-# ========================================================================
-
-
 # ================== WEIGHTED AVERAGING ENSEMBLE ==================
 class WeightedAverageEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
@@ -161,22 +65,24 @@ class WeightedAverageEnsemble(nn.Module):
                 for p in model.parameters():
                     p.requires_grad = False
 
-    def forward(self, x, return_details=False):
+    def forward(self, x: torch.Tensor, return_details: bool = False):
         norm_weights = F.softmax(self.weights, dim=0)
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-    
+        
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            out = self.models[i](x_n)
-            if isinstance(out, (tuple, list)):
-                out = out[0]
-            outputs[:, i] = out.view(x.size(0), 1)
+            with torch.no_grad():
+                out = self.models[i](x_n)
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+            outputs[:, i] = out
 
         final_output = (outputs * norm_weights.view(1, -1, 1)).sum(dim=1)
-
+        
         if return_details:
             return final_output, norm_weights, None, outputs
         return final_output, norm_weights
+
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
@@ -216,27 +122,24 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    
-    # تعداد واقعی نمونه‌ها (بدون padding)
-    total_real_samples = len(loader.dataset)
-    
+    total = 0
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
         out = model(images)
         if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
+        total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
     
-    # محاسبه با تعداد واقعی نمونه‌ها
-    acc = 100. * correct_tensor.item() / total_real_samples
-    
-    if is_main: 
-        print(f" {name}: {acc:.2f}% (Real samples: {total_real_samples})")
+    acc = 100. * correct_tensor.item() / total_tensor.item() if total_tensor.item() > 0 else 0.0
+    if is_main: print(f" {name}: {acc:.2f}%")
     return acc
 
 
@@ -244,31 +147,28 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
-    
-    # تعداد واقعی نمونه‌ها (بدون padding)
-    total_real_samples = len(loader.dataset)
-    
+    total = 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
+        total += labels.size(0)
         correct += pred.eq(labels.long()).sum().item()
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+    total_tensor = torch.tensor(total, dtype=torch.long, device=device)
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    
-    # محاسبه با تعداد واقعی نمونه‌ها
-    return 100. * correct_tensor.item() / total_real_samples
+        dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+    acc = 100. * correct_tensor.item() / total_tensor.item() if total_tensor.item() > 0 else 0.0
+    return acc
 
 
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
     total_correct = 0
-    
-    # تعداد واقعی نمونه‌ها (بدون padding)
-    total_real_samples = len(loader.dataset)
+    total_samples = 0
     
     ws = dist.get_world_size() if dist.is_initialized() else 1
     
@@ -296,10 +196,11 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         all_y_pred.extend(pred_int.cpu().numpy().tolist())
         
         total_correct += pred_int.eq(labels.long()).sum().item()
+        total_samples += labels.size(0)
 
-    correct_tensor = torch.tensor(total_correct, dtype=torch.long, device=device)
+    stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
     if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
     if ws > 1:
         gathered_true = [None for _ in range(ws)]
@@ -317,13 +218,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
             all_y_pred = [item for sublist in gathered_pred for item in sublist]
 
     if is_main:
-        # حذف نمونه‌های تکراری از لیست‌ها
-        all_y_true = all_y_true[:total_real_samples]
-        all_y_score = all_y_score[:total_real_samples]
-        all_y_pred = all_y_pred[:total_real_samples]
-        
-        # محاسبه دقت با تعداد واقعی
-        acc = 100. * correct_tensor.item() / total_real_samples
+        total_correct = stats[0].item()
+        total_samples = stats[1].item()
+        acc = 100. * total_correct / total_samples
         
         final_weights = last_weights.numpy() if last_weights is not None else np.zeros(len(model_names))
 
@@ -331,7 +228,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"{name.upper()} SET RESULTS (Weighted Average)")
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
-        print(f" → Total Real Samples: {total_real_samples:,}")
+        print(f" → Total Samples: {total_samples:,}")
         print(f"\nLearned Model Weights (Global):")
         for i, (w, mname) in enumerate(zip(final_weights, model_names)):
             print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
@@ -345,8 +242,7 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
                         device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
     
-    actual_module = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
-    weights_param = actual_module.weights
+    weights_param = ensemble_model.module.weights if hasattr(ensemble_model, 'module') else ensemble_model.weights
         
     optimizer = torch.optim.AdamW([weights_param], lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
@@ -357,7 +253,7 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
 
     if is_main:
         print("="*70)
-        print("Training Weighted Average Ensemble (Multi-GPU)")
+        print("Training Weighted Average Ensemble")
         print("="*70)
 
     for epoch in range(num_epochs):
@@ -366,10 +262,12 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         
         ensemble_model.train()
         
-        # جلوگیری از تغییر آمار BatchNorm مدل‌های فریز شده (که الان توسط AdaBN تنظیم شده‌اند)
+        # --- این بخش باید اضافه شود تا BatchNorm آپدیت نشود ---
+        actual_module = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
         for model in actual_module.models:
-            model.eval() 
-
+            model.eval()  # مدل‌های پایه مجدداً به حالت ارزیابی برمی‌گردند
+        # -------------------------------------------------------
+        
         train_loss = 0.0
         train_correct = 0
         train_total = 0
@@ -385,9 +283,7 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
 
             batch_size = images.size(0)
             train_loss += loss.item() * batch_size
-            
-            probs = torch.sigmoid(outputs.squeeze(1))
-            pred = (probs > 0.5).long()
+            pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
 
@@ -395,7 +291,6 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         train_loss = train_loss / train_total
         
         current_weights = F.softmax(weights_param, dim=0).detach().cpu()
-        
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         scheduler.step()
 
@@ -438,10 +333,14 @@ def cleanup_distributed():
 
 # ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
+    """
+    ساخت فایل txt دقیقاً بر اساس لیست‌های y_true و y_pred که از تست کنسول آمده‌اند.
+    """
     total = len(y_true)
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
     
+    # محاسبه ماتریس آشفتگی
     TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
     TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
     FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
@@ -519,10 +418,6 @@ def main():
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
     parser.add_argument('--seed', type=int, default=42)
-    
-    # اضافه شدن پرچم فعال‌سازی AdaBN
-    parser.add_argument('--apply_adabn', action='store_true', help="Apply AdaBN before training weights")
-    
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
@@ -531,7 +426,6 @@ def main():
     set_seed(args.seed)
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
-    is_distributed = world_size > 1
 
     if is_main:
         print("="*70)
@@ -552,44 +446,20 @@ def main():
     base_models = load_pruned_models(args.model_paths, device, is_main)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    # =================== بخش اعمال AdaBN ===================
-    if args.apply_adabn:
-        # ساختن دیتالودر بدون Data Augmentation
-        adabn_loader = create_adabn_dataloader(
-            args.data_dir, args.batch_size, num_workers=0, # معمولا عدد ورکر را اینجا 0 میگذارند تا اختلالی ایجاد نکند
-            dataset_type=args.dataset, seed=args.seed, is_main=is_main,
-            is_distributed=is_distributed
-        )
-        
-        # اعمال AdaBN روی مدل‌های پایه
-        adapt_batchnorm_for_new_dataset(
-            models=base_models, 
-            means=MEANS, 
-            stds=STDS, 
-            adabn_loader=adabn_loader, 
-            device=device, 
-            is_main=is_main,
-            is_distributed=is_distributed
-        )
-    # =========================================================
-
-    # ساخت انسامبل (مدل‌ها در اینجا آمارهای آپدیت شده AdaBN را دارند)
     ensemble = WeightedAverageEnsemble(
         base_models, MEANS, STDS,
         freeze_models=True
     ).to(device)
 
-    if is_distributed:
-        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    if world_size > 1:
+        ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=is_distributed, seed=args.seed, is_main=is_main)
+        is_distributed=(world_size > 1), seed=args.seed, is_main=is_main)
 
     if is_main:
-        print("\n" + "="*70)
-        print(f"INDIVIDUAL MODEL PERFORMANCE {'(After AdaBN)' if args.apply_adabn else ''}")
-        print("="*70)
+        print("\n" + "="*70); print("INDIVIDUAL MODEL PERFORMANCE"); print("="*70)
 
     individual_accs = []
     for i, model in enumerate(base_models):
@@ -602,32 +472,22 @@ def main():
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
 
-    # آموزش وزن‌ها (با توجه به کد شما، آمار BN در اینجا تغییری نمی‌کند)
     best_val_acc, history = train_weighted_ensemble(
         ensemble, train_loader, val_loader,
         args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
     ckpt_path = os.path.join(args.save_dir, 'best_weighted_ensemble.pt')
-    
     if is_main and os.path.exists(ckpt_path):
-        pass 
-
-    if dist.is_initialized():
-        dist.barrier()
-
-    if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        if hasattr(ensemble, 'module'):
-            ensemble.module.weights.data.copy_(ckpt['weights'])
-        else:
-            ensemble.weights.data.copy_(ckpt['weights'])
-        if is_main:
-            print("Best model weights loaded on all GPUs.\n")
+        if hasattr(ensemble, 'module'): ensemble.module.weights.data.copy_(ckpt['weights'])
+        else: ensemble.weights.data.copy_(ckpt['weights'])
+        print("Best model weights loaded.\n")
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
+    # دریافت خروجی‌ها برای JSON و Log
     ensemble_test_acc, ensemble_weights, predictions_data = evaluate_ensemble_final_ddp(
-        ensemble, test_loader, device, "Test", MODEL_NAMES, is_main)
+        ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
     if is_main:
         print("\n" + "="*70)
@@ -638,18 +498,20 @@ def main():
         print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
 
+        # استخراج لیست‌ها
         y_true, y_score, y_pred = predictions_data
         
+        # 1. ذخیره JSON
         json_path = os.path.join(args.save_dir, 'test_predictions.json')
         save_predictions_json(y_true, y_score, y_pred, json_path, args.seed, args.dataset)
 
+        # 2. ذخیره فایل txt دقیقاً مطابق با کنسول
         log_path = os.path.join(args.save_dir, 'prediction_log.txt')
         save_accuracy_log_from_results(y_true, y_pred, log_path, "Weighted Ensemble")
 
         final_results = {
             'seed': args.seed,
             'method': 'Weighted_Average',
-            'adabn_applied': args.apply_adabn, # ثبت اینکه آیا ادابان استفاده شده یا خیر
             'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
             'ensemble': {'test_accuracy': float(ensemble_test_acc), 'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)}},
             'improvement': float(ensemble_test_acc - best_single),
@@ -676,6 +538,8 @@ def main():
             args.num_grad_cam_samples, args.num_lime_samples,
             args.dataset, is_main)
 
+    cleanup_distributed()
+    
     if is_main:
         plot_roc_and_f1(
             ensemble_module,
@@ -685,8 +549,6 @@ def main():
             MODEL_NAMES,
             is_main
         )
-        
-    cleanup_distributed()
 
 if __name__ == "__main__":
     main()
