@@ -313,19 +313,19 @@ class HesitantFuzzyMembership(nn.Module):
         self.aggregation_weights = nn.Parameter(torch.ones(num_memberships) / num_memberships)
 
       def forward(self, x: torch.Tensor):
-        features = self.feature_net(x).flatten(1)
-        memberships = self.membership_generator(features)
-        memberships = memberships.view(-1, self.num_models, self.num_memberships)
-        memberships = torch.sigmoid(memberships)
+          features = self.feature_net(x).flatten(1)
+          memberships = self.membership_generator(features)
+          memberships = memberships.view(-1, self.num_models, self.num_memberships)
+          memberships = torch.sigmoid(memberships)
         
         # Softmax اول (برای ضرایب آلفا) - کاملاً درست است
-        agg_weights = F.softmax(self.aggregation_weights, dim=0)
+          agg_weights = F.softmax(self.aggregation_weights, dim=0)
         
-        final_weights = (memberships * agg_weights.view(1, 1, -1)).sum(dim=2)
+          final_weights = (memberships * agg_weights.view(1, 1, -1)).sum(dim=2)
  
-        final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
+          final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
         
-        return final_weights, memberships
+          return final_weights, memberships
 
 class FuzzyHesitantEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
