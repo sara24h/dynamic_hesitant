@@ -414,32 +414,25 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
 
-def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
-                              name: str, mean: Tuple[float, float, float],
-                              std: Tuple[float, float, float], is_main: bool) -> float:
+def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
+                                name: str, mean: Tuple[float, float, float],
+                                std: Tuple[float, float, float]) -> float:
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
+    total = 0
     
-    # تعداد واقعی نمونه‌ها (بدون padding)
-    total_real_samples = len(loader.dataset)
-    
-    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
+    for images, labels in tqdm(loader, desc=f"Evaluating {name}"):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
         out = model(images)
         if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-
-    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    
-    # محاسبه با تعداد واقعی نمونه‌ها
-    acc = 100. * correct_tensor.item() / total_real_samples
-    
-    if is_main: 
-        print(f" {name}: {acc:.2f}% (Real samples: {total_real_samples})")
+        total += labels.size(0) # شمارش دقیق تعداد نمونه‌های پردازش شده
+        
+    acc = 100. * correct / total
+    print(f" {name}: {acc:.2f}%")
     return acc
 
 @torch.no_grad()
@@ -710,20 +703,26 @@ def main():
         print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
         print("="*70)
 
-    individual_accs = []
-    for i, model in enumerate(base_models):
-        acc = evaluate_single_model_ddp(
-            model, test_loader, device,
-            f"Model {i+1} ({MODEL_NAMES[i]})",
-            MEANS[i], STDS[i], is_main)
-        individual_accs.append(acc)
+        _, _, test_loader_full = create_dataloaders(
+            args.data_dir, args.batch_size, dataset_type=args.dataset,
+            is_distributed=False, seed=args.seed, is_main=True
+        )
+    
+        individual_accs = []
+        for i, model in enumerate(base_models):
+            # استفاده از ارزیابی یکپارچه و دقیق بدون DDP
+            acc = evaluate_single_model_exact(model, test_loader_full, device, 
+                                              f"Model {i+1} ({MODEL_NAMES[i]})", 
+                                              MEANS[i], STDS[i])
+            individual_accs.append(acc)
 
-    best_single = max(individual_accs)
-    best_idx = individual_accs.index(best_single)
-
-    if is_main:
+        best_single = max(individual_accs)
+        best_idx = individual_accs.index(best_single)
         print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
         print("="*70)
+
+    if dist.is_initialized():
+        dist.barrier()
 
     best_val_acc = train_hesitant_fuzzy(
         ensemble, train_loader, val_loader,
