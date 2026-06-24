@@ -91,7 +91,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             
             # محاسبه احتمال (Score) و کلاس پیش‌بینی شده
             prob = torch.sigmoid(output.squeeze()).item()
-                all_model_weights.append(final_weights.squeeze(0).cpu().numpy())
+            all_model_weights.append(final_weights.squeeze(0).cpu().numpy())
             
             pred_int = int(prob > 0.5)
             
