@@ -275,15 +275,15 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         from collections import Counter
 
         for name, indices in [ ("Train", train_indices),("Validation", val_indices),("Test", test_indices),]:
-        counter = Counter()
+            counter = Counter()
 
-        for idx in indices:
-            _, label = full_dataset.samples[idx]
-            counter[label] += 1
+            for idx in indices:
+                _, label = full_dataset.samples[idx]
+                counter[label] += 1
 
-        print(f"\n{name}")
-        print(f" Fake: {counter[0]}")
-        print(f" Real: {counter[1]}")
+            print(f"\n{name}")
+            print(f" Fake: {counter[0]}")
+            print(f" Real: {counter[1]}")
         
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
