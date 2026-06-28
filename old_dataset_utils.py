@@ -12,8 +12,7 @@ from PIL import Image
 # ================== DATASET CLASSES ==================
 
 class CustomGenAIDataset(Dataset):
-    """دیتاست قدیمی (جهت سازگاری با نسخه‌های قبلی نگهداری شده است)"""
-    
+
     def __init__(self, root_dir, fake_classes, real_class, transform=None):
         self.root_dir = root_dir
         self.transform = transform
@@ -272,6 +271,19 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = UADFVDataset(base_dir, transform=temp_transform)
         train_indices, val_indices, test_indices = create_video_level_uadfV_split(full_dataset, seed=seed)
+
+        from collections import Counter
+
+        for name, indices in [ ("Train", train_indices),("Validation", val_indices),("Test", test_indices),]:
+        counter = Counter()
+
+        for idx in indices:
+            _, label = full_dataset.samples[idx]
+            counter[label] += 1
+
+        print(f"\n{name}")
+        print(f" Fake: {counter[0]}")
+        print(f" Real: {counter[1]}")
         
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
