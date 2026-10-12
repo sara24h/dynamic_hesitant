@@ -47,10 +47,7 @@ def setup_device():
 
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args):
-    """
-    ارزیابی نهایی یکپارچه برای اطمینان از یکسان بودن اعداد در کنسول و لاگ.
-    شامل ذخیره داده‌های McNemar و ROC (y_true, y_score, y_pred).
-    """
+  
     model.eval()
     
     base_dataset = test_loader_full.dataset
@@ -130,13 +127,26 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
     
     # محاسبه معیارهای عملکرد
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+    precision_real = TP / (TP + FP) if (TP + FP) > 0 else 0
+    recall_real    = TP / (TP + FN) if (TP + FN) > 0 else 0
+    f1_real        = 2 * precision_real * recall_real / (precision_real + recall_real) if (precision_real + recall_real) > 0 else 0
+
+# Fake class (Negative class = 0)
+    precision_fake = TN / (TN + FN) if (TN + FN) > 0 else 0
+    recall_fake    = TN / (TN + FP) if (TN + FP) > 0 else 0
+    f1_fake        = 2 * precision_fake * recall_fake / (precision_fake + recall_fake) if (precision_fake + recall_fake) > 0 else 0
+
+# Macro averages
+    macro_precision = (precision_real + precision_fake) / 2
+    macro_recall    = (recall_real + recall_fake) / 2
+    macro_f1        = (f1_real + f1_fake) / 2
+
+# Balanced Accuracy
+    balanced_acc = ((recall_real + recall_fake) / 2) * 100
 
     # ================== Confusion Matrix Plot ==================
     cm = np.array([[TN, FP],
-                   [FN, TP]])
+               [FN, TP]])
 
     plt.figure(figsize=(8, 6))
     sns.heatmap(
@@ -144,36 +154,40 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
         annot=True,
         fmt='d',
         cmap='Blues',
-        xticklabels=['Predicted Real', 'Predicted Fake'],
-        yticklabels=['Actual Real', 'Actual Fake'],
+        xticklabels=['Predicted Fake', 'Predicted Real'],
+        yticklabels=['Actual Fake', 'Actual Real'],
         cbar=True,
         annot_kws={"size": 16}
     )
-    plt.title(f'Confusion Matrix\nAccuracy: {acc:.2f}% | Precision: {precision:.4f} | Recall: {recall:.4f}',
-              fontsize=13, fontweight='bold')
+    plt.title(f'Confusion Matrix\nAccuracy: {acc:.2f}% | Balanced Acc: {balanced_acc:.2f}% | Macro-F1: {macro_f1:.4f}',
+          fontsize=13, fontweight='bold')
     plt.ylabel('True Label', fontsize=12)
     plt.xlabel('Predicted Label', fontsize=12)
     plt.tight_layout()
-
+    
     cm_path = os.path.join(save_dir, 'confusion_matrix.png')
     plt.savefig(cm_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✅ Confusion Matrix saved to: {cm_path}")
-
-    # چاپ نتایج نهایی در کنسول
+    
+    # ================== چاپ نتایج نهایی ==================
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"Specificity: {specificity:.4f}")
-    print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
-    print(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
+    print(f"Accuracy          : {acc:.2f}%")
+    print(f"Balanced Accuracy : {balanced_acc:.2f}%")
+    print(f"Macro-F1          : {macro_f1:.4f}")
+    print()
+    print(f"{'Class':<12} {'Precision':>10} {'Recall':>10} {'F1-Score':>10}")
+    print("-" * 45)
+    print(f"{'Fake (0)':<12} {precision_fake:10.4f} {recall_fake:10.4f} {f1_fake:10.4f}")
+    print(f"{'Real (1)':<12} {precision_real:10.4f} {recall_real:10.4f} {f1_real:10.4f}")
+    print("-" * 45)
+    print(f"{'Macro Avg':<12} {macro_precision:10.4f} {macro_recall:10.4f} {macro_f1:10.4f}")
+    print(f"\nCorrect Predictions  : {correct_count} ({acc:.2f}%)")
+    print(f"Incorrect Predictions: {total_samples - correct_count} ({100 - acc:.2f}%)")
     print("="*70)
 
-    # ════════════════════════════════════════════════════════════════
-    #        آمار فعال‌سازی هر مدل (درصد نمونه‌هایی که مدل فعال بوده)
-    # ════════════════════════════════════════════════════════════════
     if len(all_model_weights) > 0:
         weights_np = np.array(all_model_weights)
         
@@ -235,16 +249,26 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             json.dump(activation_stats, f, indent=2, ensure_ascii=False)
         print(f"Model activation stats saved: {activation_json_path}")
 
-    # ذخیره لاگ متنی (McNemar Format)
+
     output_str = []
 
     output_str.append("-" * 100)
     output_str.append("SUMMARY STATISTICS:")
     output_str.append("-" * 100)
-    output_str.append(f"Accuracy: {acc:.2f}%")
-    output_str.append(f"Precision: {precision:.4f}")
-    output_str.append(f"Recall: {recall:.4f}")
-    output_str.append(f"Specificity: {specificity:.4f}")
+    output_str.append(f"Overall Accuracy: {acc:.2f}%")
+    output_str.append(f"Balanced Accuracy: {balanced_acc:.2f}%")
+    output_str.append(f"Macro F1-Score: {macro_f1:.4f}")
+    
+    output_str.append("\n--- Real (1) Class Metrics ---")
+    output_str.append(f"Precision (Real): {precision_real:.4f}")
+    output_str.append(f"Recall (Real):    {recall_real:.4f}")
+    output_str.append(f"F1-Score (Real):  {f1_real:.4f}")
+    
+    output_str.append("\n--- Fake (0) Class Metrics ---")
+    output_str.append(f"Precision (Fake): {precision_fake:.4f}")
+    output_str.append(f"Recall (Fake):    {recall_fake:.4f}")
+    output_str.append(f"F1-Score (Fake):  {f1_fake:.4f}")
+    
     output_str.append(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
     output_str.append(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
     output_str.append(f"\nConfusion Matrix saved to: confusion_matrix.png")
