@@ -44,6 +44,8 @@ def setup_device():
     return device
 
 # ================== UNIFIED FINAL EVALUATION ==================
+# ================== UNIFIED FINAL EVALUATION ==================
+@torch.no_grad()
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args):
     """
     ارزیابی نهایی یکپارچه برای اطمینان از یکسان بودن اعداد در کنسول و لاگ.
@@ -51,17 +53,11 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     """
     model.eval()
     
+    # حفظ دسترسی به ریشه دیتاست فقط برای استخراج مسیر فایل
     base_dataset = test_loader_full.dataset
+    root_dataset = base_dataset
     if hasattr(base_dataset, 'dataset'):
-        base_dataset = base_dataset.dataset
-    
-    # استخراج اندیس‌های تست
-    if hasattr(test_loader_full, 'sampler') and hasattr(test_loader_full.sampler, 'indices'):
-        test_indices = test_loader_full.sampler.indices
-    elif hasattr(test_loader_full.dataset, 'indices'):
-        test_indices = test_loader_full.dataset.indices
-    else:
-        test_indices = list(range(len(base_dataset)))
+        root_dataset = base_dataset.dataset
 
     lines = []
     lines.append("="*100)
@@ -73,43 +69,31 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
 
     TP, TN, FP, FN = 0, 0, 0, 0
     
-    # لیست‌های برای ذخیره داده‌های ROC و JSON
     all_y_true = []
     all_y_score = []
     all_y_pred = []
-
-    all_model_weights = []  # لیست وزن هر مدل برای هر نمونه
+    all_model_weights = []
     
-    print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
+    print(f"\nRunning Unified Final Evaluation on {len(test_loader_full.dataset)} samples...")
     
-    with torch.no_grad():
-        for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
-            try:
-                image, label = base_dataset[global_idx]
-                path, _ = get_sample_info(base_dataset, global_idx)
-            except Exception as e:
-                continue
-
-            image = image.unsqueeze(0).to(device)
-            label_int = int(label)
-            
-            # پیش‌بینی مدل با دریافت جزئیات وزن‌ها
-            output, final_weights, _, _ = model(image, return_details=True)
-            
-            # محاسبه احتمال (Score) و کلاس پیش‌بینی شده
-            prob = torch.sigmoid(output.squeeze()).item()
-            
-            # ذخیره وزن هر مدل
-            all_model_weights.append(final_weights.squeeze(0).cpu().numpy())
-            
+    sample_idx = 0
+    for images, labels in tqdm(test_loader_full, desc="Final Eval"):
+        images = images.to(device)
+        labels = labels.to(device).long()
+        
+        outputs, final_weights, _, _ = model(images, return_details=True)
+        probs = torch.sigmoid(outputs.squeeze(1))
+        
+        for b in range(images.size(0)):
+            label_int = int(labels[b].item())
+            prob = float(probs[b].item())
             pred_int = int(prob > 0.5)
             
-            # ذخیره برای ROC و JSON
             all_y_true.append(label_int)
             all_y_score.append(prob)
             all_y_pred.append(pred_int)
+            all_model_weights.append(final_weights[b].cpu().numpy())
             
-            # محاسبه ماتریس آشفتگی
             if label_int == 1:
                 if pred_int == 1: TP += 1
                 else: FN += 1
@@ -118,21 +102,34 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
                 else: TN += 1
             
             correct_str = "Yes" if pred_int == label_int else "No"
+            
+            # استخراج مسیر فایل به صورت امن
+            try:
+                # اگر دیتاست از نوع Subset باشد
+                if hasattr(base_dataset, 'indices'):
+                    orig_idx = base_dataset.indices[sample_idx]
+                    path, _ = root_dataset.samples[orig_idx]
+                elif hasattr(root_dataset, 'samples'):
+                    path, _ = root_dataset.samples[sample_idx]
+                else:
+                    path = f"sample_{sample_idx}"
+            except:
+                path = f"sample_{sample_idx}"
+                
             filename = os.path.basename(path)
             if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
-            line = f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}"
-            lines.append(line)
+            lines.append(f"{sample_idx+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}")
+            
+            sample_idx += 1
 
     total_samples = len(all_y_true)
     correct_count = TP + TN
     acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
     
-    # محاسبه معیارهای عملکرد
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0
     specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
 
-    # چاپ نتایج نهایی مطابق فرمت خواسته شده در کنسول
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
@@ -147,9 +144,6 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
     print("="*70)
 
-    # ════════════════════════════════════════════════════════════════
-    #        آمار فعال‌سازی هر مدل (درصد نمونه‌هایی که مدل فعال بوده)
-    # ════════════════════════════════════════════════════════════════
     if len(all_model_weights) > 0:
         weights_np = np.array(all_model_weights)
         
@@ -211,9 +205,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             json.dump(activation_stats, f, indent=2, ensure_ascii=False)
         print(f"Model activation stats saved: {activation_json_path}")
 
-    # ذخیره لاگ متنی (McNemar Format)
     output_str = []
-
     output_str.append("-" * 100)
     output_str.append("SUMMARY STATISTICS:")
     output_str.append("-" * 100)
@@ -234,17 +226,12 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
         f.write("\n".join(output_str))
     print(f"✅ Prediction log saved to: {log_path}")
 
-    # ────────────────────────────────────────────────────────────────
-    #                ذخیره داده‌های ROC (JSON & TXT)
-    # ────────────────────────────────────────────────────────────────
     print("\nCollecting ROC data (y_true & y_score) ...")
     
-    # تبدیل به آرایه نامپای
     y_true_np = np.array(all_y_true)
     y_score_np = np.array(all_y_score)
     y_pred_np = np.array(all_y_pred)
 
-    # 1. ذخیره در JSON
     roc_json_path = os.path.join(save_dir, "roc_data_test.json")
     roc_data_json = {
         "metadata": {
@@ -263,7 +250,6 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
         json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
     print(f"ROC data saved (JSON): {roc_json_path}")
 
-    # 2. ذخیره در TXT
     roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
     with open(roc_txt_path, 'w', encoding='utf-8') as f:
         f.write("y_true\ty_score\ty_pred\n")
@@ -271,7 +257,6 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
     print(f"ROC data saved (TXT):  {roc_txt_path}")
 
-    # ویژوالایزیشن
     vis_dir = os.path.join(save_dir, 'visualizations')
     generate_visualizations(
         model, test_loader_full, device, vis_dir, model_names,
@@ -638,7 +623,7 @@ def main():
     # استفاده از دیتالودرهای غیرتوزیع‌شده
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=False, seed=args.seed, is_main=True)
+        is_distributed=False, seed=42, is_main=True)
 
     print("\n" + "="*70)
     print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
@@ -646,7 +631,7 @@ def main():
 
     _, _, test_loader_full = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=False, seed=args.seed, is_main=True
+        is_distributed=False, seed=42, is_main=True
     )
     
     individual_accs = []
