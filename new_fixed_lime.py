@@ -50,18 +50,10 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
   
     model.eval()
     
-    base_dataset = test_loader_full.dataset
-    if hasattr(base_dataset, 'dataset'):
-        base_dataset = base_dataset.dataset
+    test_dataset = test_loader_full.dataset          # این TransformSubset است
     
-    # استخراج اندیس‌های تست
-    if hasattr(test_loader_full, 'sampler') and hasattr(test_loader_full.sampler, 'indices'):
-        test_indices = test_loader_full.sampler.indices
-    elif hasattr(test_loader_full.dataset, 'indices'):
-        test_indices = test_loader_full.dataset.indices
-    else:
-        test_indices = list(range(len(base_dataset)))
-
+    num_samples = len(test_dataset)
+    
     lines = []
     lines.append("="*100)
     lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
@@ -72,21 +64,24 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
 
     TP, TN, FP, FN = 0, 0, 0, 0
     
-    # لیست‌های برای ذخیره داده‌های ROC و JSON
     all_y_true = []
     all_y_score = []
     all_y_pred = []
-
-    all_model_weights = []  # لیست وزن هر مدل برای هر نمونه
+    all_model_weights = []
     
-    print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
+    print(f"\nRunning Unified Final Evaluation on {num_samples} samples...")
     
     with torch.no_grad():
-        for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
+        for i in tqdm(range(num_samples), desc="Final Eval"):
             try:
-                image, label = base_dataset[global_idx]
-                path, _ = get_sample_info(base_dataset, global_idx)
+                # خواندن از TransformSubset → ترنسفورم val_test درست اعمال می‌شود
+                image, label = test_dataset[i]
+                
+                # گرفتن مسیر فایل برای لاگ
+                original_idx = test_dataset.indices[i]
+                path, _ = get_sample_info(test_dataset.dataset, original_idx)
             except Exception as e:
+                print(f"Error loading sample {i}: {e}")
                 continue
 
             image = image.unsqueeze(0).to(device)
@@ -108,17 +103,18 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             all_y_score.append(prob)
             all_y_pred.append(pred_int)
             
-            # محاسبه ماتریس آشفتگی
-            if label_int == 1:
+            # محاسبه ماتریس آشفتگی (Real=1, Fake=0)
+            if label_int == 1:          # Real
                 if pred_int == 1: TP += 1
                 else: FN += 1
-            else:
+            else:                       # Fake
                 if pred_int == 1: FP += 1
                 else: TN += 1
             
             correct_str = "Yes" if pred_int == label_int else "No"
             filename = os.path.basename(path)
-            if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
+            if len(filename) > 55:
+                filename = filename[:25] + "..." + filename[-27:]
             line = f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}"
             lines.append(line)
 
@@ -509,6 +505,13 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
 
     total_real_samples = len(train_loader.dataset)
 
+    # لیست‌ها برای ذخیره تاریخچه آموزش جهت رسم نمودار
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'val_acc': []
+    }
+
     print("="*70)
     print("Training Fuzzy Hesitant Network (Single GPU)")
     print("="*70)
@@ -554,7 +557,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             sum_cumsum_used += cumsum_used_samples
             sum_active_models += active_mask.sum(dim=0)
 
-        # محاسبه با تعداد واقعی نمونه‌ها (تک GPU - نیازی به all_reduce نیست)
+        # محاسبه با تعداد واقعی نمونه‌ها
         train_loss = train_loss / total_real_samples
         train_acc = 100. * train_correct / total_real_samples
         
@@ -565,6 +568,11 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         
         val_acc = evaluate_accuracy(ensemble_model, val_loader, device)
         scheduler.step()
+
+        # ذخیره در تاریخچه
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
 
         print(f"\n{'='*70}")
         print(f"Epoch {epoch+1}/{num_epochs}")
@@ -606,6 +614,34 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             print(f"\n✓ Best model saved → {val_acc:.2f}%")
 
         print()
+
+    # ================== رسم نمودارهای Loss و Accuracy ==================
+    plt.figure(figsize=(12, 5))
+    
+    # نمودار Loss
+    plt.subplot(1, 2, 1)
+    plt.plot(range(1, num_epochs + 1), history['train_loss'], marker='o', label='Train Loss', color='blue')
+    plt.title('Training Loss', fontsize=14)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.grid(True)
+    plt.legend()
+
+    # نمودار Accuracy
+    plt.subplot(1, 2, 2)
+    plt.plot(range(1, num_epochs + 1), history['train_acc'], marker='o', label='Train Acc', color='blue')
+    plt.plot(range(1, num_epochs + 1), history['val_acc'], marker='s', label='Val Acc', color='orange')
+    plt.title('Training & Validation Accuracy', fontsize=14)
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.grid(True)
+    plt.legend()
+
+    plt.tight_layout()
+    curves_path = os.path.join(save_dir, 'training_curves.png')
+    plt.savefig(curves_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Training curves (Loss & Acc) saved to: {curves_path}")
 
     return best_val_acc
 
