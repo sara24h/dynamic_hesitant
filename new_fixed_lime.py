@@ -478,21 +478,31 @@ def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: to
 
 
 @torch.no_grad()
-def evaluate_accuracy(model, loader, device):
-    """ارزیابی دقت روی یک GPU"""
+def evaluate_accuracy_and_loss(model, loader, device, criterion):
+
     model.eval()
     correct = 0
+    total_loss = 0.0
     total_real_samples = len(loader.dataset)
     
     for images, labels in tqdm(loader, desc="Validation"):
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
+        
+        # محاسبه خطا
+        loss = criterion(outputs.squeeze(1), labels)
+        total_loss += loss.item() * images.size(0)
+        
+        # محاسبه دقت
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
     
-    return 100. * correct / total_real_samples
+    acc = 100. * correct / total_real_samples
+    avg_loss = total_loss / total_real_samples
+    return acc, avg_loss
 
 
+# ================== TRAINING (Single GPU) ==================
 # ================== TRAINING (Single GPU) ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, model_names):
@@ -508,6 +518,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     # لیست‌ها برای ذخیره تاریخچه آموزش جهت رسم نمودار
     history = {
         'train_loss': [],
+        'val_loss': [],   # اضافه شد
         'train_acc': [],
         'val_acc': []
     }
@@ -566,11 +577,13 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         avg_model_activation = (sum_active_models / total_real_samples) * 100
         overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
         
-        val_acc = evaluate_accuracy(ensemble_model, val_loader, device)
+        # محاسبه دقت و خطای ولیدیشن
+        val_acc, val_loss = evaluate_accuracy_and_loss(ensemble_model, val_loader, device, criterion)
         scheduler.step()
 
         # ذخیره در تاریخچه
         history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
 
@@ -578,7 +591,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         print(f"Epoch {epoch+1}/{num_epochs}")
         print(f"{'='*70}")
         print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-        print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
+        print(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         print(f"\n{'Hesitancy (Variance) per Model:':^70}")
         print(f"{'-'*70}")
@@ -616,26 +629,27 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         print()
 
     # ================== رسم نمودارهای Loss و Accuracy ==================
-    plt.figure(figsize=(12, 5))
+    plt.figure(figsize=(14, 6))
     
-    # نمودار Loss
+    # نمودار Loss (دقیقا مشابه عکس ارسال شده)
     plt.subplot(1, 2, 1)
-    plt.plot(range(1, num_epochs + 1), history['train_loss'], marker='o', label='Train Loss', color='blue')
-    plt.title('Training Loss', fontsize=14)
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.grid(True)
-    plt.legend()
+    plt.plot(range(1, num_epochs + 1), history['train_loss'], label='train', color='blue', linewidth=2)
+    plt.plot(range(1, num_epochs + 1), history['val_loss'], label='validation', color='orange', linewidth=2)
+    plt.title('Loss', fontsize=16)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=12)
 
     # نمودار Accuracy
     plt.subplot(1, 2, 2)
-    plt.plot(range(1, num_epochs + 1), history['train_acc'], marker='o', label='Train Acc', color='blue')
-    plt.plot(range(1, num_epochs + 1), history['val_acc'], marker='s', label='Val Acc', color='orange')
-    plt.title('Training & Validation Accuracy', fontsize=14)
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
-    plt.grid(True)
-    plt.legend()
+    plt.plot(range(1, num_epochs + 1), history['train_acc'], label='train', color='blue', linewidth=2)
+    plt.plot(range(1, num_epochs + 1), history['val_acc'], label='validation', color='orange', linewidth=2)
+    plt.title('Accuracy', fontsize=16)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Accuracy (%)', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=12)
 
     plt.tight_layout()
     curves_path = os.path.join(save_dir, 'training_curves.png')
@@ -644,7 +658,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     print(f"✅ Training curves (Loss & Acc) saved to: {curves_path}")
 
     return best_val_acc
-
 
 # ================== MAIN FUNCTION ==================
 def main():
