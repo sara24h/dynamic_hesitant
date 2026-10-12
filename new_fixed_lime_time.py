@@ -586,10 +586,10 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         avg_model_activation = (sum_active_models / total_real_samples) * 100
         overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
         
-        # محاسبه دقت و خطای ولیدیشن
+        val_sw = Stopwatch(device).start()
         val_acc, val_loss = evaluate_accuracy_and_loss(ensemble_model, val_loader, device, criterion)
+        t_val = val_sw.stop()
         t_epoch = epoch_sw.stop()
-        t_val = t_epoch - t_train
         epoch_times.append(t_epoch); train_times.append(t_train); val_times.append(t_val)
         scheduler.step()
 
