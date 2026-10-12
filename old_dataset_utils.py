@@ -326,11 +326,10 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
         print("="*70)
 
     train_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.RandomCrop(256),
+        transforms.RandomResizedCrop(256, scale=(0.75, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(10),
-        transforms.ColorJitter(0.2, 0.2),
+        transforms.ColorJitter(0.2, 0.2, 0.1, 0.05),
         transforms.ToTensor(),
     ])
 
@@ -399,10 +398,6 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
         sampler_test = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
 
-        # نکته: برای جلوگیری از خطا در برخی سیستم‌عامل‌ها (مثل ویندوز) هنگام استفاده از چندین worker،
-        # num_workers را می‌توانید 0 بگذارید. در لینوکس می‌توانید افزایش دهید.
-        # اینجا همان مقدار ورودی تابع استفاده می‌شود.
-        
         train_loader = DataLoader(train_dataset, batch_size=batch_size,
                                  shuffle=(train_sampler is None), sampler=train_sampler,
                                  num_workers=num_workers, pin_memory=True, drop_last=True,
@@ -436,8 +431,7 @@ if __name__ == '__main__':
             is_distributed=False,
             seed=42
         )
-        
-        # تست لود کردن یک بچ
+      
         print("Testing batch retrieval...")
         images, labels = next(iter(train_loader))
         print(f"Batch shape: {images.shape}, Labels shape: {labels.shape}")
