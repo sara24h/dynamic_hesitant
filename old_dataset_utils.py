@@ -326,10 +326,11 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
         print("="*70)
 
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(256, scale=(0.75, 1.0)),
+        transforms.Resize(256),
+        transforms.RandomCrop(256),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(10),
-        transforms.ColorJitter(0.2, 0.2, 0.1, 0.05),
+        transforms.ColorJitter(0.2, 0.2),
         transforms.ToTensor(),
     ])
 
