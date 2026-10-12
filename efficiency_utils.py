@@ -263,7 +263,8 @@ def benchmark_efficiency(ensemble, test_loader, device, model_names,
 
     # ---- cache real test data on GPU --------------------------------------
     n_lat = min(latency_samples, len(dataset))
-    lat_inputs = [dataset[i][0].unsqueeze(0).to(device) for i in range(n_lat)]
+    idx = np.sort(np.random.RandomState(0).choice(len(dataset), n_lat, replace=False))
+    lat_inputs = [dataset[int(i)][0].unsqueeze(0).to(device) for i in idx]
     thr_inputs = []
     for images, _ in test_loader:
         thr_inputs.append(images.to(device))
