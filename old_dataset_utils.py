@@ -173,9 +173,7 @@ def get_sample_info(dataset, index):
 
 
 def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-    """
-    تقسیم‌بندی استاندارد دیتاست به نسبت 70-15-15
-    """
+   
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     num_samples = len(dataset)
     indices = list(range(num_samples))
@@ -183,14 +181,14 @@ def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15,
 
     # Split Train+Val vs Test
     train_val_indices, test_indices = train_test_split(
-        indices, test_size=test_ratio, random_state=seed, stratify=labels)
+        indices, test_size=test_ratio, random_state=42, stratify=labels)
     
     # Calculate adjusted ratio for Val
     val_size_adjusted = val_ratio / (train_ratio + val_ratio)
     
     # Split Train vs Val
     train_indices, val_indices = train_test_split(
-        train_val_indices, test_size=val_size_adjusted, random_state=seed, stratify=[labels[i] for i in train_val_indices])
+        train_val_indices, test_size=val_size_adjusted, random_state=42, stratify=[labels[i] for i in train_val_indices])
         
     return train_indices, val_indices, test_indices
 
@@ -208,9 +206,9 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
     all_video_ids = sorted(list(all_video_ids))
     print(f"[Split] Found {len(all_video_ids)} unique video pairs (Real+Fake).")
 
-    train_val_ids, test_ids = train_test_split(all_video_ids, test_size=test_ratio, random_state=seed)
+    train_val_ids, test_ids = train_test_split(all_video_ids, test_size=test_ratio, random_state=42)
     val_size_adjusted = val_ratio / (train_ratio + val_ratio)
-    train_ids, val_ids = train_test_split(train_val_ids, test_size=val_size_adjusted, random_state=seed)
+    train_ids, val_ids = train_test_split(train_val_ids, test_size=val_size_adjusted, random_state=42)
     
     train_indices, val_indices, test_indices = [], [], []
     
@@ -254,7 +252,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         )
         print("[Dataset Loading] Custom GenAI (Old) Dataset loaded.")
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
-            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
+            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42
         )
         
     elif dataset_type == 'custom_genai_v2':
@@ -262,7 +260,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         full_dataset = NewGenAIDataset(base_dir, transform=temp_transform)
         print("[Dataset Loading] NewGwnAI Dataset (custom_genai_v2) loaded.")
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
-            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=seed
+            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42
         )
 
     elif dataset_type == 'uadfV':
@@ -270,7 +268,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
             raise FileNotFoundError(f"UADFV dataset directory not found: {base_dir}")
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = UADFVDataset(base_dir, transform=temp_transform)
-        train_indices, val_indices, test_indices = create_video_level_uadfV_split(full_dataset, seed=seed)
+        train_indices, val_indices, test_indices = create_video_level_uadfV_split(full_dataset, seed=42)
 
         from collections import Counter
 
@@ -306,7 +304,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
         
         # استفاده از نسبت 70-15-15 برای این دیتاست‌ها
-        train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=seed)
+        train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=42)
     else:
         raise ValueError(f"Unknown dataset_type: {dataset_type}")
 
@@ -382,7 +380,7 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
             print(f"Processing {dataset_type} dataset from: {base_dir}")
             
         full_dataset, train_indices, val_indices, test_indices = prepare_dataset(
-            base_dir, dataset_type, seed=seed)
+            base_dir, dataset_type, seed=42)
         
         if is_main:
             print(f"\nDataset Stats:")
