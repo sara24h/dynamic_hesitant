@@ -13,7 +13,6 @@ import random
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from metrics_utils import plot_roc_and_f1
 from old_dataset_utils import (
     UADFVDataset, 
     create_dataloaders, 
@@ -21,7 +20,7 @@ from old_dataset_utils import (
     worker_init_fn
 )
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
-from efficiency_utils import Stopwatch, benchmark_efficiency, print_headline
+from evaluate_utils import Stopwatch, benchmark_efficiency
 
 warnings.filterwarnings("ignore")
 
@@ -95,7 +94,6 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         all_y_pred.append(pred_int)
         
         is_correct = (pred_int == label_int)
-        if is_correct: correct_count += 1
         
         # محاسبه ماتریس آشفتگی (Real=1, Fake=0)
         if label_int == 1:          # Real
@@ -238,6 +236,56 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     print(f"ROC data saved (TXT):  {roc_txt_path}")
 
     return acc, y_true_np, y_score_np
+
+
+# ================== BENCHMARK ADAPTER (سازگاری با evaluate_utils) ==================
+class _SimpleAvgBenchmarkAdapter(nn.Module):
+    """
+    benchmark_efficiency در evaluate_utils برای انسمبل HFDE نوشته شده و انتظار دارد:
+      - ensemble.models / ensemble.normalizations
+      - ensemble.hesitant_fuzzy(x)          (متد 'Router only')
+      - ensemble(x) -> (output, weights)    (آمار مسیریابی از o[1])
+    SimpleAveragingEnsemble روتر ندارد؛ این آداپتور بدون تغییر کلاس اصلی و بدون
+    تغییر evaluate_utils، رابط بالا را فراهم می‌کند: وزن‌های یکنواخت (1/M) که
+    همیشه مثبت‌اند؛ بنابراین آمار routing به‌درستی نشان می‌دهد که در این انسمبل
+    همه مدل‌ها همیشه اجرا می‌شوند.
+    """
+    def __init__(self, ensemble: 'SimpleAveragingEnsemble'):
+        super().__init__()
+        self.ensemble = ensemble
+        self.models = ensemble.models
+        self.normalizations = ensemble.normalizations
+        self.num_models = ensemble.num_models
+
+    def hesitant_fuzzy(self, x: torch.Tensor):
+        # این انسمبل روتر ندارد؛ وزن یکنواخت با هزینه‌ی تقریباً صفر
+        return torch.full((x.size(0), self.num_models),
+                          1.0 / self.num_models, device=x.device)
+
+    def forward(self, x: torch.Tensor):
+        out, _ = self.ensemble(x)
+        w = torch.full((x.size(0), self.num_models),
+                      1.0 / self.num_models, device=x.device)
+        return out, w
+
+
+def print_headline_simple_avg(results):
+    """چاپ سه عدد اصلی کارایی برای Simple Averaging (دقیقاً همان فرمت HFDE)."""
+    h = results['methods']['Simple Averaging']
+    thr = h['throughput']
+    bs = thr['batch_size']
+    fp = results['full_test_pass']
+    print("=" * 70)
+    print("SIMPLE AVERAGING EFFICIENCY SUMMARY")
+    print("=" * 70)
+    print(f"Latency (bs=1)          : {h['latency']['mean_ms']:.2f} ± {h['latency']['std_ms']:.2f} ms / image")
+    print(f"Throughput (bs={bs})".ljust(24) +
+          f": {thr['throughput_img_per_s']:.1f} ± {thr['throughput_std_img_per_s']:.1f} images/s "
+          f"(mean ± std of {thr['repeats']} runs)")
+    print(f"Computational time      : {fp['model_compute_time_s']:.2f} ± {fp['model_compute_time_std_s']:.2f} s "
+          f"(model inference on the whole test set, {fp['num_images']} images, "
+          f"mean of {fp['repeats']} passes; data loading excluded)")
+    print("=" * 70 + "\n")
 
 
 class MultiModelNormalization(nn.Module):
@@ -430,14 +478,31 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # بنچمارک Latency / Throughput (قبل از ارزیابی نهایی)
+    # ================== بنچمارک کارایی (Latency / Throughput / Computational time) ==================
+    # همان پروتکل اسکریپت HFDE با استفاده از evaluate_utils.benchmark_efficiency
+    efficiency = {}
+    bench_time = 0.0
     try:
-        efficiency = benchmark_efficiency(ensemble, test_loader, device, MODEL_NAMES,
-                                           latency_samples=len(test_loader.dataset))
-        print_headline(efficiency)
+        adapter = _SimpleAvgBenchmarkAdapter(ensemble)
+        bench_sw = Stopwatch(device).start()
+        efficiency = benchmark_efficiency(
+            adapter, test_loader, device, MODEL_NAMES,
+            latency_samples=len(test_loader.dataset))
+        bench_time = bench_sw.stop()
+
+        # برچسب‌گذاری درست برای گزارش JSON (بنچمارک برای HFDE نام‌گذاری کرده)
+        efficiency['methods']['Simple Averaging'] = efficiency['methods'].pop('HFDE (dynamic)')
+        efficiency['full_test_pass'] = efficiency.pop('full_test_pass_hfde')
+        # این انسمبل روتر ندارد؛ مدخل بی‌معنای 'Router only' حذف شود
+        efficiency['methods'].pop('Router only', None)
+        efficiency['method'] = 'Simple Averaging'
+        efficiency['benchmark_time_s'] = float(bench_time)
+
+        print_headline_simple_avg(efficiency)
     except Exception as e:
-        print(f"[WARNING] Benchmark efficiency failed: {e}")
+        print(f"[WARNING] Efficiency benchmark failed: {e}")
         efficiency = {}
+        bench_time = 0.0
 
     # زمان‌سنجی ارزیابی نهایی
     eval_sw = Stopwatch(device).start()
@@ -490,16 +555,7 @@ def main():
         args.num_grad_cam_samples, args.num_lime_samples,
         args.dataset, is_main=True
     )
-    
-    plot_roc_and_f1(
-        ensemble,
-        test_loader, 
-        device, 
-        args.save_dir, 
-        MODEL_NAMES,
-        is_main=True
-    )
-
+   
     # ================== خلاصه زمان‌ها ==================
     total_pipeline_time = pipeline_sw.stop()
 
@@ -508,12 +564,15 @@ def main():
     print("="*70)
     for i, name in enumerate(MODEL_NAMES):
         print(f"  Model {i+1} ({name}) evaluation : {individual_times[i]:.1f}s")
-    print(f"  Final ensemble evaluation     : {final_eval_time:.1f}s")
-    print(f"  Total pipeline time           : {total_pipeline_time/60:.2f} min ({total_pipeline_time:.1f}s)")
+    print(f"  Efficiency benchmark         : {bench_time:.1f}s")
+    print(f"  Final ensemble evaluation    : {final_eval_time:.1f}s")
+    print(f"  Total pipeline time          : {total_pipeline_time/60:.2f} min ({total_pipeline_time:.1f}s)")
     print("="*70)
 
     # ذخیره گزارش کارایی (Latency / Throughput / زمان‌ها)
-    efficiency['final_evaluation_time_s'] = final_eval_time
+    efficiency['individual_model_eval_times_s'] = {
+        name: float(t) for name, t in zip(MODEL_NAMES, individual_times)}
+    efficiency['final_evaluation_time_s'] = final_eval_time   # شامل ویژوالایزیشن نیست
     efficiency['total_pipeline_time_s'] = total_pipeline_time
     with open(os.path.join(args.save_dir, 'efficiency_report.json'), 'w') as f:
         json.dump(efficiency, f, indent=2)
