@@ -14,8 +14,7 @@ import time
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# فرض بر این است که این فایل‌ها در مسیر شما موجود هستند
-from metrics_utils import plot_roc_and_f1
+#from metrics_utils import plot_roc_and_f1
 from old_dataset_utils import (
     UADFVDataset, CustomGenAIDataset, NewGenAIDataset,
     create_dataloaders, get_sample_info
@@ -836,15 +835,6 @@ def main():
         'stds': STDS,
         'seed': args.seed
     }, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
-
-    plot_roc_and_f1(
-        ensemble,
-        test_loader_full, 
-        device, 
-        args.save_dir, 
-        MODEL_NAMES,
-        #True
-    )
 
     # ذخیره گزارش کارایی (Latency / Throughput / Computational time)
     efficiency['final_evaluation_time_s'] = final_eval_time   # شامل Grad-CAM/LIME است؛ زمان inference نیست
