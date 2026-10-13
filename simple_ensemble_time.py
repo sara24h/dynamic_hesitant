@@ -290,14 +290,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
 
 # ================== BENCHMARK ADAPTER ==================
 class _SimpleAvgBenchmarkAdapter(nn.Module):
-    """
-    Adapter تا SimpleAveragingEnsemble با evaluate_utils.benchmark_efficiency کار کند.
-    benchmark_efficiency انتظار دارد:
-      - ensemble.models / ensemble.normalizations
-      - ensemble.hesitant_fuzzy(x)         (روتر)
-      - ensemble(x) → (output, weights)
-    SimpleAveragingEnsemble روتر ندارد؛ وزن یکنواخت 1/M برمی‌گردانیم.
-    """
+
     def __init__(self, ensemble: 'SimpleAveragingEnsemble'):
         super().__init__()
         self.ensemble = ensemble
@@ -469,7 +462,7 @@ def main():
     set_seed(args.seed)
 
     # تک GPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
 
     # زمان‌سنجی کل پایپ‌لاین
