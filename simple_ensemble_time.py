@@ -20,7 +20,7 @@ from old_dataset_utils import (
     worker_init_fn
 )
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
-from evaluate_utils import Stopwatch, benchmark_efficiency
+from efficiency_utils import Stopwatch, benchmark_efficiency
 
 warnings.filterwarnings("ignore")
 
