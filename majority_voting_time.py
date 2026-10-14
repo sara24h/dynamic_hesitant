@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore")
 
 # =================== بخش ایمپورت دیتاست ===================
 try:
-    from dataset_utils import (
+    from old_dataset_utils import (
         UADFVDataset, 
         CustomGenAIDataset, 
         create_dataloaders, 
@@ -133,29 +133,17 @@ class MajorityVotingEnsemble(nn.Module):
         stacked_logits = torch.cat(votes_logits, dim=1) # [Batch, Num_Models]
         
         # =================== Hard Voting Logic ===================
-        # تبدیل لاجیت‌ها به رأی قطعی (0 یا 1)
         hard_votes = (stacked_logits > 0).long() 
-        
-        # محاسبه رأی نهایی (اکثریت)
         sum_votes = hard_votes.sum(dim=1, keepdim=True)
-        
-        # اگر مجموع آراء >= نصف تعداد مدل‌ها باشد، برنده کلاس 1 است
         threshold = self.num_models / 2.0
         final_decision = (sum_votes >= threshold).long().float()
         
         # =================== Soft Score for ROC ===================
-        # برای محاسبه AUC/ROC ما به یک امتیاز (Score) نیاز داریم.
-        # از میانگین احتمالات استفاده می‌کنیم.
         avg_probs = torch.sigmoid(stacked_logits).mean(dim=1, keepdim=True)
         
         if return_details:
             batch_size = x.size(0)
             weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
-            # ترتیب خروجی‌ها برای سازگاری با کدهای قبلی:
-            # 1. final_decision (خروجی اصلی)
-            # 2. weights (وزن‌ها -在这里是均匀的)
-            # 3. avg_probs (امتیاز برای ROC - جایگزین dummy_membership شده)
-            # 4. stacked_logits (لاجیت‌های تک تک مدل‌ها)
             return final_decision, weights, avg_probs, stacked_logits
             
         return final_decision, hard_votes
@@ -194,7 +182,6 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
     
-    # تعداد واقعی نمونه‌ها (بدون padding)
     total_real_samples = len(loader.dataset)
     
     if loader is None: return 0.0
@@ -211,187 +198,120 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
         correct = correct_tensor.item()
     
-    # محاسبه با تعداد واقعی نمونه‌ها
     acc = 100. * correct / total_real_samples if total_real_samples > 0 else 0.0
     if is_main: 
         print(f" {name}: {acc:.2f}% (Real samples: {total_real_samples})")
     return acc
 
 
+# ================== UNIFIED EVALUATION (Single Source of Truth) ==================
 @torch.no_grad()
-def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
+def evaluate_ensemble_unified(model, loader, device, name, model_names, save_dir, args, is_main=True):
+    """
+    ارزیابی یکپارچه ensemble:
+    - جمع‌آوری predictions (y_true, y_score, y_pred) با ترنسفورم صحیح val/test
+    - محاسبه تمام متریک‌ها (Accuracy، Balanced Acc، Macro-F1، Real/Fake metrics)
+    - ذخیره confusion_matrix.png، prediction_log.txt، roc_data_test.json/txt
+    - تولید visualizations
+    - چاپ همه چیز به صورت یک گزارش واحد (بدون دقت‌های متناقض)
+    """
     model.eval()
-    local_stats = torch.zeros(5, device=device)
-    vote_distribution = torch.zeros(len(model_names), 2, device=device)
+    total_correct = 0
+    total_samples_seen = 0
     
-    # تعداد واقعی نمونه‌ها (بدون padding)
-    total_real_samples = len(loader.dataset)
-    
-    if loader is None: return 0.0, [], []
-    if is_main: print(f"\nEvaluating {name} set (Majority Voting - Hard)...")
-    
-    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
-        images, labels = images.to(device), labels.to(device)
-        outputs, weights, _, stacked_logits = model(images, return_details=True)
-        
-        pred = outputs.squeeze(1).long()
-        
-        is_tp = ((pred == 1) & (labels.long() == 1)).sum()
-        is_tn = ((pred == 0) & (labels.long() == 0)).sum()
-        is_fp = ((pred == 1) & (labels.long() == 0)).sum()
-        is_fn = ((pred == 0) & (labels.long() == 1)).sum()
-        local_stats[0] += is_tp
-        local_stats[1] += is_tn
-        local_stats[2] += is_fp
-        local_stats[3] += is_fn
-        # حذف local_stats[4] چون دیگر نیازی نیست
-        
-        current_votes = (stacked_logits > 0).long() 
-        for i in range(len(model_names)):
-            fake_count = (current_votes[:, i] == 0).sum()
-            real_count = (current_votes[:, i] == 1).sum()
-            vote_distribution[i, 0] += fake_count
-            vote_distribution[i, 1] += real_count
-
-    if dist.is_initialized():
-        dist.all_reduce(local_stats, op=dist.ReduceOp.SUM)
-        dist.all_reduce(vote_distribution, op=dist.ReduceOp.SUM)
-
-    if is_main:
-        tp = local_stats[0].item()
-        tn = local_stats[1].item()
-        fp = local_stats[2].item()
-        fn = local_stats[3].item()
-        
-        # استفاده از تعداد واقعی نمونه‌ها
-        total = total_real_samples
-        acc = 100. * (tp + tn) / total if total > 0 else 0.0
-        
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-        vote_dist_np = vote_distribution.cpu().numpy()
-
-        print(f"\n{'='*70}")
-        print(f"{name.upper()} SET RESULTS (Majority Voting - Hard)")
-        print(f"{'='*70}")
-        print(f" → Accuracy: {acc:.3f}%")
-        print(f" → Precision: {precision:.4f}")
-        print(f" → Recall: {recall:.4f}")
-        print(f" → Specificity: {specificity:.4f}")
-        print(f" → Total Real Samples: {total:,}")
-        print(f"\nConfusion Matrix:")
-        print(f"                 Predicted Real  Predicted Fake")
-        print(f"    Actual Real      {int(tp):<15} {int(fn):<15}")
-        print(f"    Actual Fake      {int(fp):<15} {int(tn):<15}")
-        print(f"\nVote Distribution (Fake / Real):")
-        for i, mname in enumerate(model_names):
-            print(f"  {i+1:2d}. {mname:<25}: {int(vote_dist_np[i,0]):<6} / {int(vote_dist_np[i,1]):<6}")
-        print(f"{'='*70}")
-        return acc, vote_dist_np.tolist(), local_stats.cpu().tolist()
-    return 0.0, [], []
-
-# ================== VISUALIZATION & LOGGING FUNCTIONS ==================
-def get_test_indices(test_loader):
-    if hasattr(test_loader, 'sampler') and hasattr(test_loader.sampler, 'indices'): return test_loader.sampler.indices
-    elif hasattr(test_loader.dataset, 'indices'): return test_loader.dataset.indices
-    else: return list(range(len(test_loader.dataset)))
-
-# ================== UNIFIED FINAL EVALUATION (McNemar + ROC) ==================
-def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
-    if not is_main: return 0.0, None, None
-
-    eval_sw = Stopwatch(device).start()
-
-    model.eval()
-    
-    base_dataset = test_loader_full.dataset
-    if hasattr(base_dataset, 'dataset'):
-        base_dataset = base_dataset.dataset
-    
-    if hasattr(test_loader_full, 'sampler') and hasattr(test_loader_full.sampler, 'indices'):
-        test_indices = test_loader_full.sampler.indices
-    elif hasattr(test_loader_full.dataset, 'indices'):
-        test_indices = test_loader_full.dataset.indices
-    else:
-        test_indices = list(range(len(base_dataset)))
-
-    lines = []
-    lines.append("="*100)
-    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (Hard Voting Logic):")
-    lines.append("="*100)
-    header = f"{'ID':<10} {'Filename':<60} {'True':<10} {'Pred':<10} {'Correct':<10}"
-    lines.append(header)
-    lines.append("-"*100)
-
-    TP, TN, FP, FN = 0, 0, 0, 0
+    ws = dist.get_world_size() if dist.is_initialized() else 1
     
     all_y_true = []
-    all_y_score = [] # برای ROC از Soft Probability استفاده می‌کنیم
-    all_y_pred = []  # برای Accuracy از Hard Voting استفاده می‌کنیم
+    all_y_score = []
+    all_y_pred = []
+    all_paths = []
     
-    print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
-    
-    with torch.no_grad():
-        for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
-            try:
-                image, label = base_dataset[global_idx]
-                path, _ = get_sample_info(base_dataset, global_idx)
-            except Exception as e:
-                continue
+    last_weights = None
 
-            image = image.unsqueeze(0).to(device)
-            label_int = int(label)
-            
-            # خروجی‌ها: final_decision, weights, avg_probs, stacked_logits
-            decision, _, avg_probs, stacked_logits = model(image, return_details=True)
-            
-            # پیش‌بینی نهایی بر اساس Hard Voting
-            pred_int = int(decision.squeeze().item())
-            
-            # امتیاز برای ROC (میانگین احتمالات)
-            score_for_roc = avg_probs.squeeze().item()
-            
-            all_y_true.append(label_int)
-            all_y_score.append(score_for_roc)
-            all_y_pred.append(pred_int)
-            
-            if label_int == 1:
-                if pred_int == 1: TP += 1
-                else: FN += 1
-            else:
-                if pred_int == 1: FP += 1
-                else: TN += 1
-            
-            correct_str = "Yes" if pred_int == label_int else "No"
-            filename = os.path.basename(path)
-            if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
-            line = f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}"
-            lines.append(line)
+    # تعداد واقعی نمونه‌ها (بدون padding)
+    total_real_samples = len(loader.dataset)
 
-    total_samples = len(all_y_true)
+    if is_main:
+        print(f"\nEvaluating {name} set (Majority Voting - Hard)...")
+        
+    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
+        images, labels = images.to(device), labels.to(device)
+        outputs, weights, avg_probs, stacked_logits = model(images, return_details=True)
+        
+        if last_weights is None:
+            last_weights = weights.detach().cpu()
+            
+        # Hard Voting برای pred
+        pred_int = outputs.squeeze(1).long()
+        # Soft Score برای ROC
+        score_for_roc = avg_probs.squeeze(1)
+        
+        all_y_true.extend(labels.cpu().numpy().tolist())
+        all_y_score.extend(score_for_roc.cpu().numpy().tolist())
+        all_y_pred.extend(pred_int.cpu().numpy().tolist())
+        
+        total_correct += pred_int.eq(labels.long()).sum().item()
+        total_samples_seen += labels.size(0)
+
+    stats = torch.tensor([total_correct, total_samples_seen], dtype=torch.long, device=device)
+    if dist.is_initialized():
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+    if ws > 1:
+        gathered_true = [None for _ in range(ws)]
+        gathered_score = [None for _ in range(ws)]
+        gathered_pred = [None for _ in range(ws)]
+        
+        if dist.is_initialized():
+            dist.all_gather_object(gathered_true, all_y_true)
+            dist.all_gather_object(gathered_score, all_y_score)
+            dist.all_gather_object(gathered_pred, all_y_pred)
+        
+        if is_main:
+            all_y_true = [item for sublist in gathered_true for item in sublist]
+            all_y_score = [item for sublist in gathered_score for item in sublist]
+            all_y_pred = [item for sublist in gathered_pred for item in sublist]
+
+    if not is_main:
+        return 0.0, []
+
+    # ================== بعد از این خط فقط روی rank 0 اجرا می‌شود ==================
+    # کوتاه کردن به تعداد واقعی نمونه‌ها
+    all_y_true = all_y_true[:total_real_samples]
+    all_y_score = all_y_score[:total_real_samples]
+    all_y_pred = all_y_pred[:total_real_samples]
+
+    total = total_real_samples
+    TP = sum(1 for yt, yp in zip(all_y_true, all_y_pred) if yt == 1 and yp == 1)
+    TN = sum(1 for yt, yp in zip(all_y_true, all_y_pred) if yt == 0 and yp == 0)
+    FP = sum(1 for yt, yp in zip(all_y_true, all_y_pred) if yt == 0 and yp == 1)
+    FN = sum(1 for yt, yp in zip(all_y_true, all_y_pred) if yt == 1 and yp == 0)
+
     correct_count = TP + TN
-    acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
+    acc = 100.0 * correct_count / total if total > 0 else 0.0
 
-    # ================== Real (1) Class Metrics ==================
+    # Real (1) Class Metrics
     precision_real = TP / (TP + FP) if (TP + FP) > 0 else 0
     recall_real    = TP / (TP + FN) if (TP + FN) > 0 else 0
     f1_real        = 2 * precision_real * recall_real / (precision_real + recall_real) if (precision_real + recall_real) > 0 else 0
 
-    # ================== Fake (0) Class Metrics ==================
+    # Fake (0) Class Metrics
     precision_fake = TN / (TN + FN) if (TN + FN) > 0 else 0
     recall_fake    = TN / (TN + FP) if (TN + FP) > 0 else 0
     f1_fake        = 2 * precision_fake * recall_fake / (precision_fake + recall_fake) if (precision_fake + recall_fake) > 0 else 0
 
-    # ================== Macro Averages ==================
+    # Macro
     macro_precision = (precision_real + precision_fake) / 2
     macro_recall    = (recall_real + recall_fake) / 2
     macro_f1        = (f1_real + f1_fake) / 2
 
-    # ================== Balanced Accuracy ==================
+    # Balanced Accuracy
     balanced_acc = ((recall_real + recall_fake) / 2) * 100
 
+    final_weights = last_weights.numpy() if last_weights is not None else np.zeros(len(model_names))
+
     # ================== Confusion Matrix Plot ==================
+    os.makedirs(save_dir, exist_ok=True)
     cm = np.array([[TN, FP],
                    [FN, TP]])
 
@@ -416,9 +336,9 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     plt.close()
     print(f"✅ Confusion Matrix saved to: {cm_path}")
 
-    # ================== چاپ نتایج نهایی ==================
+    # ================== گزارش واحد (فقط یک بار چاپ) ==================
     print(f"\n{'='*70}")
-    print("FINAL RESULTS (HARD VOTING)")
+    print(f"{name.upper()} SET RESULTS (Majority Voting - Hard)")
     print(f"{'='*70}")
     print(f"Accuracy          : {acc:.2f}%")
     print(f"Balanced Accuracy : {balanced_acc:.2f}%")
@@ -430,37 +350,53 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"{'Real (1)':<12} {precision_real:10.4f} {recall_real:10.4f} {f1_real:10.4f}")
     print("-" * 45)
     print(f"{'Macro Avg':<12} {macro_precision:10.4f} {macro_recall:10.4f} {macro_f1:10.4f}")
+    print(f"\nConfusion Matrix:")
+    print(f"                 Predicted Real  Predicted Fake")
+    print(f"    Actual Real      {int(TP):<15} {int(FN):<15}")
+    print(f"    Actual Fake      {int(FP):<15} {int(TN):<15}")
     print(f"\nCorrect Predictions  : {correct_count} ({acc:.2f}%)")
-    print(f"Incorrect Predictions: {total_samples - correct_count} ({100 - acc:.2f}%)")
-    print("="*70)
+    print(f"Incorrect Predictions: {total - correct_count} ({100 - acc:.2f}%)")
+    print(f" → Total Real Samples: {total:,}")
+    print(f"\nLearned Model Weights (Global):")
+    for i, (w, mname) in enumerate(zip(final_weights, model_names)):
+        print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
+    print(f"{'='*70}")
 
-    output_str = []
-    output_str.append("-" * 100)
-    output_str.append("SUMMARY STATISTICS:")
-    output_str.append("-" * 100)
-    output_str.append(f"Overall Accuracy: {acc:.2f}%")
-    output_str.append(f"Balanced Accuracy: {balanced_acc:.2f}%")
-    output_str.append(f"Macro F1-Score: {macro_f1:.4f}")
-    output_str.append("\n--- Real (1) Class Metrics ---")
-    output_str.append(f"Precision (Real): {precision_real:.4f}")
-    output_str.append(f"Recall (Real):    {recall_real:.4f}")
-    output_str.append(f"F1-Score (Real):  {f1_real:.4f}")
-    output_str.append("\n--- Fake (0) Class Metrics ---")
-    output_str.append(f"Precision (Fake): {precision_fake:.4f}")
-    output_str.append(f"Recall (Fake):    {recall_fake:.4f}")
-    output_str.append(f"F1-Score (Fake):  {f1_fake:.4f}")
-    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
-    output_str.append(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
-    output_str.append(f"\nConfusion Matrix saved to: confusion_matrix.png")
-    output_str.extend(lines)
-    
+    # ================== ذخیره prediction_log.txt ==================
+    lines = []
+    lines.append("-" * 100)
+    lines.append("SUMMARY STATISTICS:")
+    lines.append("-" * 100)
+    lines.append(f"Overall Accuracy   : {acc:.2f}%")
+    lines.append(f"Balanced Accuracy  : {balanced_acc:.2f}%")
+    lines.append(f"Macro F1-Score     : {macro_f1:.4f}")
+    lines.append("\n--- Real (1) Class Metrics ---")
+    lines.append(f"Precision (Real): {precision_real:.4f}")
+    lines.append(f"Recall (Real):    {recall_real:.4f}")
+    lines.append(f"F1-Score (Real):  {f1_real:.4f}")
+    lines.append("\n--- Fake (0) Class Metrics ---")
+    lines.append(f"Precision (Fake): {precision_fake:.4f}")
+    lines.append(f"Recall (Fake):    {recall_fake:.4f}")
+    lines.append(f"F1-Score (Fake):  {f1_fake:.4f}")
+    lines.append(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
+    lines.append(f"Incorrect Predictions: {total - correct_count} ({100 - acc:.2f}%)")
+    lines.append(f"\nConfusion Matrix saved to: confusion_matrix.png")
+    lines.append("")
+    lines.append("="*100)
+    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (Hard Voting Logic):")
+    lines.append("="*100)
+    lines.append(f"{'ID':<10} {'True':<10} {'Pred':<10} {'Score':<12} {'Status':<10}")
+    lines.append("-" * 100)
+    for i, (yt, yp, ys) in enumerate(zip(all_y_true, all_y_pred, all_y_score)):
+        status = "Correct" if yt == yp else "Wrong"
+        lines.append(f"{i+1:<10} {int(yt):<10} {int(yp):<10} {ys:<12.6f} {status:<10}")
+
     log_path = os.path.join(save_dir, 'prediction_log.txt')
     with open(log_path, 'w') as f:
-        f.write("\n".join(output_str))
+        f.write("\n".join(lines))
     print(f"✅ Prediction log saved to: {log_path}")
 
-    print("\nCollecting ROC data (y_true & y_score) ...")
-    
+    # ================== ذخیره ROC data (JSON + TXT) ==================
     y_true_np = np.array(all_y_true)
     y_score_np = np.array(all_y_score)
     y_pred_np = np.array(all_y_pred)
@@ -470,9 +406,9 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
         "metadata": {
             "seed": args.seed,
             "dataset": args.dataset,
-            "num_samples": int(total_samples),
+            "num_samples": int(total),
             "positive_count": int(np.sum(y_true_np)),
-            "negative_count": int(total_samples - np.sum(y_true_np)),
+            "negative_count": int(total - np.sum(y_true_np)),
             "model": "majority_voting_ensemble_HARD"
         },
         "y_true": y_true_np.tolist(),
@@ -490,20 +426,19 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
     print(f"ROC data saved (TXT):  {roc_txt_path}")
 
+    # ================== Visualizations ==================
     try:
         from visualization_utils import generate_visualizations
         vis_dir = os.path.join(save_dir, 'visualizations')
         generate_visualizations(
-            model, test_loader_full, device, vis_dir, model_names,
+            model, loader, device, vis_dir, model_names,
             args.num_grad_cam_samples, args.num_lime_samples,
             args.dataset, is_main)
-    except:
-        pass
+    except Exception as e:
+        print(f"[WARN] Visualizations failed: {e}")
 
-    final_eval_time = eval_sw.stop()
-    print(f"\n⏱️  Final Evaluation time: {final_eval_time:.2f}s")
+    return acc, final_weights.tolist()
 
-    return acc, y_true_np, y_score_np
 
 # ================== DISTRIBUTED SETUP ==================
 def setup_distributed():
@@ -563,6 +498,7 @@ def main():
 
     ensemble = MajorityVotingEnsemble(base_models, MEANS, STDS, freeze_models=True).to(device)
     set_seed(args.seed)
+
     try:
         train_loader, val_loader, test_loader = create_dataloaders(
             args.data_dir, args.batch_size, dataset_type=args.dataset,
@@ -578,6 +514,7 @@ def main():
         cleanup_distributed()
         return
 
+    # ================== ارزیابی مدل‌های تکی ==================
     if is_main: print("\n" + "="*70); print("INDIVIDUAL MODEL PERFORMANCE"); print("="*70)
     individual_accs = []
     set_seed(args.seed)
@@ -593,26 +530,20 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
 
-    ensemble_sw = Stopwatch(device).start()
-    ensemble_test_acc, vote_dist, stats = evaluate_ensemble_final_ddp(ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
-    ensemble_eval_time = ensemble_sw.stop()
-
+    # ================== ارزیابی یکپارچه ensemble (تنها یک بار، تنها یک دقت) ==================
     if is_main:
         os.makedirs(args.save_dir, exist_ok=True)
-
         print("\n" + "="*70)
         print("FINAL ENSEMBLE EVALUATION (Unified - Hard Voting)")
         print("="*70)
 
-        _, _, test_loader_full = create_dataloaders(
-            args.data_dir, args.batch_size, dataset_type=args.dataset,
-            is_distributed=False, seed=args.seed, is_main=True
-        )
+    ensemble_sw = Stopwatch(device).start()
+    final_acc, ensemble_weights = evaluate_ensemble_unified(
+        ensemble_module, test_loader, device, "Test", MODEL_NAMES, args.save_dir, args, is_main
+    )
+    ensemble_eval_time = ensemble_sw.stop()
 
-        final_acc, y_true, y_scores = final_evaluation_unified(
-            ensemble_module, test_loader_full, device, args.save_dir, MODEL_NAMES, args, is_main
-        )
-
+    if is_main:
         print("\n" + "="*70)
         print("FINAL COMPARISON")
         print("="*70)
@@ -621,13 +552,19 @@ def main():
         print(f"Improvement: {final_acc - best_single:+.2f}%")
         print("="*70)
 
-        save_ensemble_checkpoint(os.path.join(args.save_dir, 'best_ensemble_model.pt'), ensemble, args.model_paths, MODEL_NAMES, final_acc, MEANS, STDS)
+        save_ensemble_checkpoint(
+            os.path.join(args.save_dir, 'best_ensemble_model.pt'),
+            ensemble, args.model_paths, MODEL_NAMES, final_acc, MEANS, STDS
+        )
 
         final_results = {
             'seed': args.seed,
             'method': 'Majority Voting (Hard)',
             'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
-            'ensemble': {'test_accuracy': float(final_acc), 'vote_distribution': {name: {'fake': int(d[0]), 'real': int(d[1])} for name, d in zip(MODEL_NAMES, vote_dist)}},
+            'ensemble': {
+                'test_accuracy': float(final_acc),
+                'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)}
+            },
             'improvement': float(final_acc - best_single)
         }
         with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
@@ -653,16 +590,19 @@ def main():
         print("="*70)
 
     cleanup_distributed()
-    
+
     if is_main:
-        plot_roc_and_f1(
-            ensemble_module,
-            test_loader_full, 
-            device, 
-            args.save_dir, 
-            MODEL_NAMES,
-            is_main
-        )
+        try:
+            plot_roc_and_f1(
+                ensemble_module,
+                test_loader,
+                device,
+                args.save_dir,
+                MODEL_NAMES,
+                is_main
+            )
+        except Exception as e:
+            print(f"[WARN] plot_roc_and_f1 failed: {e}")
 
 if __name__ == "__main__":
     main()
