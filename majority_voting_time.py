@@ -23,10 +23,10 @@ warnings.filterwarnings("ignore")
 # =================== بخش ایمپورت دیتاست ===================
 try:
     from old_dataset_utils import (
-        UADFVDataset, 
-        CustomGenAIDataset, 
-        create_dataloaders, 
-        get_sample_info, 
+        UADFVDataset,
+        CustomGenAIDataset,
+        create_dataloaders,
+        get_sample_info,
         worker_init_fn
     )
 except ImportError:
@@ -55,7 +55,7 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
-def save_ensemble_checkpoint(save_path: str, ensemble_model: nn.Module, model_paths: List[str], 
+def save_ensemble_checkpoint(save_path: str, ensemble_model: nn.Module, model_paths: List[str],
                              model_names: List[str], accuracy: float, means: List, stds: List):
     model_to_save = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
     checkpoint = {
@@ -103,7 +103,7 @@ class MultiModelNormalization(nn.Module):
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
-# ================== MAJORITY VOTING ENSEMBLE CLASS (FIXED) ==================
+# ================== MAJORITY VOTING ENSEMBLE CLASS ==================
 class MajorityVotingEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
                  stds: List[Tuple[float]], freeze_models: bool = True):
@@ -130,22 +130,22 @@ class MajorityVotingEnsemble(nn.Module):
                     out = out[0]
             votes_logits.append(out)
 
-        stacked_logits = torch.cat(votes_logits, dim=1) # [Batch, Num_Models]
-        
+        stacked_logits = torch.cat(votes_logits, dim=1)  # [Batch, Num_Models]
+
         # =================== Hard Voting Logic ===================
-        hard_votes = (stacked_logits > 0).long() 
+        hard_votes = (stacked_logits > 0).long()
         sum_votes = hard_votes.sum(dim=1, keepdim=True)
         threshold = self.num_models / 2.0
         final_decision = (sum_votes >= threshold).long().float()
-        
+
         # =================== Soft Score for ROC ===================
         avg_probs = torch.sigmoid(stacked_logits).mean(dim=1, keepdim=True)
-        
+
         if return_details:
             batch_size = x.size(0)
             weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             return final_decision, weights, avg_probs, stacked_logits
-            
+
         return final_decision, hard_votes
 
 # ================== MODEL LOADING ==================
@@ -181,9 +181,9 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    
+
     total_real_samples = len(loader.dataset)
-    
+
     if loader is None: return 0.0
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device).float()
@@ -192,14 +192,14 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
         if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-    
+
     if dist.is_initialized():
         correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
         correct = correct_tensor.item()
-    
+
     acc = 100. * correct / total_real_samples if total_real_samples > 0 else 0.0
-    if is_main: 
+    if is_main:
         print(f" {name}: {acc:.2f}% (Real samples: {total_real_samples})")
     return acc
 
@@ -218,14 +218,14 @@ def evaluate_ensemble_unified(model, loader, device, name, model_names, save_dir
     model.eval()
     total_correct = 0
     total_samples_seen = 0
-    
+
     ws = dist.get_world_size() if dist.is_initialized() else 1
-    
+
     all_y_true = []
     all_y_score = []
     all_y_pred = []
     all_paths = []
-    
+
     last_weights = None
 
     # تعداد واقعی نمونه‌ها (بدون padding)
@@ -233,23 +233,23 @@ def evaluate_ensemble_unified(model, loader, device, name, model_names, save_dir
 
     if is_main:
         print(f"\nEvaluating {name} set (Majority Voting - Hard)...")
-        
+
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
         outputs, weights, avg_probs, stacked_logits = model(images, return_details=True)
-        
+
         if last_weights is None:
             last_weights = weights.detach().cpu()
-            
+
         # Hard Voting برای pred
         pred_int = outputs.squeeze(1).long()
         # Soft Score برای ROC
         score_for_roc = avg_probs.squeeze(1)
-        
+
         all_y_true.extend(labels.cpu().numpy().tolist())
         all_y_score.extend(score_for_roc.cpu().numpy().tolist())
         all_y_pred.extend(pred_int.cpu().numpy().tolist())
-        
+
         total_correct += pred_int.eq(labels.long()).sum().item()
         total_samples_seen += labels.size(0)
 
@@ -261,12 +261,12 @@ def evaluate_ensemble_unified(model, loader, device, name, model_names, save_dir
         gathered_true = [None for _ in range(ws)]
         gathered_score = [None for _ in range(ws)]
         gathered_pred = [None for _ in range(ws)]
-        
+
         if dist.is_initialized():
             dist.all_gather_object(gathered_true, all_y_true)
             dist.all_gather_object(gathered_score, all_y_score)
             dist.all_gather_object(gathered_pred, all_y_pred)
-        
+
         if is_main:
             all_y_true = [item for sublist in gathered_true for item in sublist]
             all_y_score = [item for sublist in gathered_score for item in sublist]
@@ -308,7 +308,17 @@ def evaluate_ensemble_unified(model, loader, device, name, model_names, save_dir
     # Balanced Accuracy
     balanced_acc = ((recall_real + recall_fake) / 2) * 100
 
-    final_weights = last_weights.numpy() if last_weights is not None else np.zeros(len(model_names))
+    # ============================================================
+    # ✅ FIX: final_weights باید یک بردار 1D به طول num_models باشه
+    # قبلاً last_weights shape=[batch, num_models] بود و
+    # zip(final_weights, model_names) روی ردیف‌ها می‌چرخید
+    # و w یک ndarray می‌شد → خطای فرمت‌استرینگ.
+    # ============================================================
+    if last_weights is not None:
+        # میانگین روی dimension 0 (batch) → shape [num_models]
+        final_weights = last_weights.mean(dim=0).numpy()
+    else:
+        final_weights = np.zeros(len(model_names))
 
     # ================== Confusion Matrix Plot ==================
     os.makedirs(save_dir, exist_ok=True)
@@ -359,7 +369,7 @@ def evaluate_ensemble_unified(model, loader, device, name, model_names, save_dir
     print(f" → Total Real Samples: {total:,}")
     print(f"\nLearned Model Weights (Global):")
     for i, (w, mname) in enumerate(zip(final_weights, model_names)):
-        print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
+        print(f" {i+1:2d}. {mname:<25}: {float(w):6.4f} ({float(w)*100:5.2f}%)")
     print(f"{'='*70}")
 
     # ================== ذخیره prediction_log.txt ==================
@@ -530,7 +540,7 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
 
-    # ================== ارزیابی یکپارچه ensemble (تنها یک بار، تنها یک دقت) ==================
+    # ================== ارزیابی یکپارچه ensemble ==================
     if is_main:
         os.makedirs(args.save_dir, exist_ok=True)
         print("\n" + "="*70)
