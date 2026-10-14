@@ -338,8 +338,10 @@ def evaluate_ensemble_unified(model, loader, device, name, model_names,
     # Balanced Accuracy
     balanced_acc = ((recall_real + recall_fake) / 2) * 100
 
-    final_weights = last_weights.numpy() if last_weights is not None \
-        else np.zeros(len(model_names))
+    if last_weights is not None:
+        final_weights = last_weights.mean(dim=0).numpy()  
+    else:
+        final_weights = np.zeros(len(model_names))
 
     # ================== Confusion Matrix Plot ==================
     os.makedirs(save_dir, exist_ok=True)
