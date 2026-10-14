@@ -543,7 +543,7 @@ def setup_distributed():
             print(f"Distributed: rank {rank}/{world_size}, local_rank {local_rank}")
         return device, local_rank, rank, world_size
     else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         return device, 0, 0, 1
 
 
