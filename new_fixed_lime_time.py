@@ -47,11 +47,11 @@ def setup_device():
     return device
 
 # ================== UNIFIED FINAL EVALUATION ==================
-def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args):
+def final_evaluation_unified(model, test_loader, device, save_dir, model_names, args):
   
     model.eval()
     
-    test_dataset = test_loader_full.dataset          # این TransformSubset است
+    test_dataset = test_loader.dataset          # این TransformSubset است
     
     num_samples = len(test_dataset)
     
@@ -316,7 +316,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     # ویژوالایزیشن
     vis_dir = os.path.join(save_dir, 'visualizations')
     generate_visualizations(
-        model, test_loader_full, device, vis_dir, model_names,
+        model, test_loader, device, vis_dir, model_names,
         args.num_grad_cam_samples, args.num_lime_samples,
         args.dataset, is_main=True)
 
@@ -757,14 +757,11 @@ def main():
     print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
     print("="*70)
 
-    _, _, test_loader_full = create_dataloaders(
-        args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=False, seed=args.seed, is_main=True
-    )
+    
     
     individual_accs = []
     for i, model in enumerate(base_models):
-        acc = evaluate_single_model_exact(model, test_loader_full, device, 
+        acc = evaluate_single_model_exact(model, test_loader, device, 
                                           f"Model {i+1} ({MODEL_NAMES[i]})", 
                                           MEANS[i], STDS[i])
         individual_accs.append(acc)
@@ -790,22 +787,16 @@ def main():
     print("FINAL ENSEMBLE EVALUATION")
     print("="*70)
 
-    # ساخت دیتالودر تست غیرتوزیع‌شده
-    _, _, test_loader_full = create_dataloaders(
-        args.data_dir, args.batch_size, dataset_type=args.dataset,
-        is_distributed=False, seed=args.seed, is_main=True
-    )
-
     # بنچمارک Latency / Throughput (قبل از ارزیابی نهایی)
-    efficiency = benchmark_efficiency(ensemble, test_loader_full, device, MODEL_NAMES,
-                                  latency_samples=len(test_loader_full.dataset))
+    efficiency = benchmark_efficiency(ensemble, test_loader, device, MODEL_NAMES,
+                                  latency_samples=len(test_loader.dataset))
     efficiency['training_time'] = train_timing
     print_headline(efficiency)
 
     # ارزیابی یکپارچه نهایی
     eval_sw = Stopwatch(device).start()
     final_acc, y_true, y_scores = final_evaluation_unified(
-        ensemble, test_loader_full, device, args.save_dir, MODEL_NAMES, args
+        ensemble, test_loader, device, args.save_dir, MODEL_NAMES, args
     )
     final_eval_time = eval_sw.stop()
 
