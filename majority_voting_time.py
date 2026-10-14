@@ -169,6 +169,57 @@ class MajorityVotingEnsemble(nn.Module):
         return final_decision, hard_votes
 
 
+# ================== BENCHMARK ADAPTER ==================
+class _MajorityVotingBenchmarkAdapter(nn.Module):
+    """
+    آداپتور برای benchmark_efficiency که API آن با hesitant_fuzzy سازگار است.
+    """
+
+    def __init__(self, ensemble: 'MajorityVotingEnsemble'):
+        super().__init__()
+        self.ensemble = ensemble
+        self.models = ensemble.models
+        self.normalizations = ensemble.normalizations
+        self.num_models = ensemble.num_models
+
+    def eval(self):
+        self.ensemble.eval()
+        return self
+
+    def hesitant_fuzzy(self, x: torch.Tensor):
+        # وزن یکنواخت برای همه مدل‌ها (چون بنچمارک این فرمت را انتظار دارد)
+        return torch.full((x.size(0), self.num_models),
+                          1.0 / self.num_models, device=x.device)
+
+    def forward(self, x: torch.Tensor):
+        out, _ = self.ensemble(x)
+        w = torch.full((x.size(0), self.num_models),
+                       1.0 / self.num_models, device=x.device)
+        return out, w
+
+
+def print_headline_majority_voting(results):
+    """چاپ خلاصه‌ی سه عدد اصلی کارایی برای Majority Voting."""
+    h = results['methods'].get('Majority Voting', {})
+    if not h:
+        return
+    thr = h['throughput']
+    bs = thr['batch_size']
+    fp = results.get('full_test_pass', {})
+    print("=" * 70)
+    print("MAJORITY VOTING EFFICIENCY SUMMARY")
+    print("=" * 70)
+    print(f"Latency (bs=1)          : {h['latency']['mean_ms']:.2f} ± {h['latency']['std_ms']:.2f} ms / image")
+    print(f"Throughput (bs={bs})".ljust(24) +
+          f": {thr['throughput_img_per_s']:.1f} ± {thr['throughput_std_img_per_s']:.1f} images/s "
+          f"(mean ± std of {thr['repeats']} runs)")
+    if fp:
+        print(f"Computational time      : {fp['model_compute_time_s']:.2f} ± {fp['model_compute_time_std_s']:.2f} s "
+              f"(model inference on the whole test set, {fp['num_images']} images, "
+              f"mean of {fp['repeats']} passes; data loading excluded)")
+    print("=" * 70 + "\n")
+
+
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     try:
@@ -241,13 +292,6 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device,
 @torch.no_grad()
 def evaluate_ensemble_unified(model, loader, device, name, model_names,
                               save_dir, args, is_main=True):
-    """
-    ارزیابی یکپارچه ensemble (Hard Voting):
-    - جمع‌آوری predictions (y_true, y_score, y_pred)
-    - محاسبه تمام متریک‌ها (Accuracy، Balanced Acc، Macro-F1، Real/Fake metrics)
-    - چاپ متریک‌های Real/Fake با فرمت مشابه کد Fuzzy
-    - ذخیره confusion_matrix.png، prediction_log.txt، roc_data_test.json/txt
-    """
     model.eval()
     total_correct = 0
     total_samples_seen = 0
@@ -339,7 +383,7 @@ def evaluate_ensemble_unified(model, loader, device, name, model_names,
     balanced_acc = ((recall_real + recall_fake) / 2) * 100
 
     if last_weights is not None:
-        final_weights = last_weights.mean(dim=0).numpy()  
+        final_weights = last_weights.mean(dim=0).numpy()
     else:
         final_weights = np.zeros(len(model_names))
 
@@ -367,7 +411,7 @@ def evaluate_ensemble_unified(model, loader, device, name, model_names,
     plt.close()
     print(f"✅ Confusion Matrix saved to: {cm_path}")
 
-    # ================== گزارش واحد (فرمت مشابه Fuzzy) ==================
+    # ================== گزارش واحد ==================
     print(f"\n{'='*70}")
     print(f"{name.upper()} SET RESULTS (Majority Voting - Hard)")
     print(f"{'='*70}")
@@ -376,7 +420,6 @@ def evaluate_ensemble_unified(model, loader, device, name, model_names,
     print(f"Macro-F1          : {macro_f1:.4f}")
     print()
 
-    # ---- Real / Fake metrics (فرمت درخواستی) ----
     print("--- Real (1) Class Metrics ---")
     print(f"Precision (Real): {precision_real:.4f}")
     print(f"Recall (Real):    {recall_real:.4f}")
@@ -581,15 +624,20 @@ def main():
         print("=" * 70)
 
     individual_accs = []
+    individual_times = []
     set_seed(args.seed)
-    individual_sw = Stopwatch(device).start()
+
     for i, model in enumerate(base_models):
+        sw = Stopwatch(device).start()
         acc = evaluate_single_model_ddp(
             model, test_loader, device,
             f"Model {i+1} ({MODEL_NAMES[i]})",
             MEANS[i], STDS[i], is_main)
+        t = sw.stop()
         individual_accs.append(acc)
-    individual_eval_time = individual_sw.stop()
+        individual_times.append(t)
+        if is_main:
+            print(f" ⏱ Evaluation time: {t:.1f}s\n")
 
     best_single = max(individual_accs) if individual_accs else 0.0
     best_idx = individual_accs.index(best_single) if individual_accs else 0
@@ -599,9 +647,39 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
 
+    # ================== EFFICIENCY BENCHMARK ==================
+    os.makedirs(args.save_dir, exist_ok=True)
+    efficiency = {}
+    bench_time = 0.0
+    if is_main:
+        try:
+            adapter = _MajorityVotingBenchmarkAdapter(ensemble_module).to(device)
+            bench_sw = Stopwatch(device).start()
+            efficiency = benchmark_efficiency(
+                adapter, test_loader, device, MODEL_NAMES,
+                latency_samples=min(300, len(test_loader.dataset)),
+                verbose=True,
+            )
+            bench_time = bench_sw.stop()
+
+            # تغییر برچسب‌ها از HFDE به Majority Voting
+            if 'HFDE (dynamic)' in efficiency.get('methods', {}):
+                efficiency['methods']['Majority Voting'] = efficiency['methods'].pop('HFDE (dynamic)')
+            efficiency.get('methods', {}).pop('Router only', None)
+            if 'full_test_pass_hfde' in efficiency:
+                efficiency['full_test_pass'] = efficiency.pop('full_test_pass_hfde')
+
+            efficiency['method'] = 'Majority Voting'
+            efficiency['benchmark_time_s'] = float(bench_time)
+
+            print_headline_majority_voting(efficiency)
+        except Exception as e:
+            print(f"[WARNING] Efficiency benchmark failed: {e}")
+            efficiency = {}
+            bench_time = 0.0
+
     # ================== ارزیابی یکپارچه ensemble ==================
     if is_main:
-        os.makedirs(args.save_dir, exist_ok=True)
         print("\n" + "=" * 70)
         print("FINAL ENSEMBLE EVALUATION (Unified - Hard Voting)")
         print("=" * 70)
@@ -612,21 +690,10 @@ def main():
         MODEL_NAMES, args.save_dir, args, is_main
     )
     ensemble_eval_time = ensemble_sw.stop()
-
-    # ================== Benchmark Efficiency ==================
-    # بنچمارک Latency/Throughput (روی rank 0 و زمانی که دیتالودر در دسترس است)
-    efficiency = {}
     if is_main:
-        try:
-            efficiency = benchmark_efficiency(
-                ensemble_module, test_loader, device, MODEL_NAMES,
-                latency_samples=len(test_loader.dataset)
-            )
-            print_headline(efficiency)
-        except Exception as e:
-            print(f"[WARN] benchmark_efficiency failed: {e}")
-            efficiency = {}
+        print(f"\n⏱ Final ensemble evaluation time: {ensemble_eval_time:.1f}s")
 
+    # ================== FINAL COMPARISON ==================
     if is_main:
         print("\n" + "=" * 70)
         print("FINAL COMPARISON")
@@ -641,9 +708,23 @@ def main():
             ensemble, args.model_paths, MODEL_NAMES, final_acc, MEANS, STDS
         )
 
+        # ================== TIME SUMMARY ==================
+        total_pipeline_time = pipeline_sw.stop()
+
+        print("\n" + "=" * 70)
+        print("TIME SUMMARY")
+        print("=" * 70)
+        for i, name in enumerate(MODEL_NAMES):
+            print(f"  Model {i+1} ({name}) evaluation : {individual_times[i]:.1f}s")
+        print(f"  Efficiency benchmark          : {bench_time:.1f}s")
+        print(f"  Final ensemble evaluation     : {ensemble_eval_time:.1f}s")
+        print(f"  Total pipeline time           : {total_pipeline_time/60:.2f} min ({total_pipeline_time:.1f}s)")
+        print("=" * 70)
+
         final_results = {
             'seed': args.seed,
             'method': 'Majority Voting (Hard)',
+            'dataset': args.dataset,
             'best_single_model': {
                 'name': MODEL_NAMES[best_idx],
                 'accuracy': float(best_single)
@@ -653,32 +734,32 @@ def main():
                 'model_weights': {name: float(w)
                                   for name, w in zip(MODEL_NAMES, ensemble_weights)}
             },
-            'improvement': float(final_acc - best_single)
+            'improvement': float(final_acc - best_single),
+            'timing': {
+                'individual_model_eval_times_s': {
+                    name: float(t) for name, t in zip(MODEL_NAMES, individual_times)
+                },
+                'benchmark_time_s': float(bench_time),
+                'ensemble_eval_time_s': float(ensemble_eval_time),
+                'total_pipeline_time_s': float(total_pipeline_time),
+            }
         }
         with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
             json.dump(final_results, f, indent=4)
 
         # ================== Efficiency Report ==================
-        total_pipeline_time = pipeline_sw.stop()
+        if efficiency:
+            efficiency['individual_model_eval_times_s'] = {
+                name: float(t) for name, t in zip(MODEL_NAMES, individual_times)
+            }
+            efficiency['individual_models_eval_time_s'] = float(sum(individual_times))
+            efficiency['ensemble_eval_time_s'] = float(ensemble_eval_time)
+            efficiency['total_pipeline_time_s'] = float(total_pipeline_time)
 
-        # پر کردن بخش‌های زمان‌سنجی مطابق فرمت کد Fuzzy
-        efficiency['individual_models_eval_time_s'] = float(individual_eval_time)
-        efficiency['ensemble_eval_time_s'] = float(ensemble_eval_time)
-        efficiency['total_pipeline_time_s'] = float(total_pipeline_time)
-
-        with open(os.path.join(args.save_dir, 'efficiency_report.json'), 'w') as f:
-            json.dump(efficiency, f, indent=2)
-        print(f"Efficiency report saved: "
-              f"{os.path.join(args.save_dir, 'efficiency_report.json')}")
-
-        # ================== چاپ خلاصه زمان‌ها ==================
-        print("\n" + "=" * 70)
-        print("⏱️  TIMING SUMMARY")
-        print("=" * 70)
-        print(f"  Individual Models Eval : {individual_eval_time:.2f} s")
-        print(f"  Ensemble Eval          : {ensemble_eval_time:.2f} s")
-        print(f"  Total Pipeline         : {total_pipeline_time:.2f} s")
-        print("=" * 70)
+            with open(os.path.join(args.save_dir, 'efficiency_report.json'), 'w') as f:
+                json.dump(efficiency, f, indent=2)
+            print(f"Efficiency report saved: "
+                  f"{os.path.join(args.save_dir, 'efficiency_report.json')}")
 
     cleanup_distributed()
 
