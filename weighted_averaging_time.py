@@ -19,13 +19,17 @@ from metrics_utils import plot_roc_and_f1
 warnings.filterwarnings("ignore")
 
 from old_dataset_utils import (
-    UADFVDataset, 
-    create_dataloaders, 
-    get_sample_info, 
+    UADFVDataset,
+    create_dataloaders,
+    get_sample_info,
     worker_init_fn
 )
 
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
+
+# ================== NEW IMPORT: EFFICIENCY BENCHMARK ==================
+from efficiency_utils import Stopwatch, benchmark_efficiency
+
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -57,7 +61,7 @@ class WeightedAverageEnsemble(nn.Module):
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
-        
+
         initial_weights = torch.ones(self.num_models) / self.num_models
         self.weights = nn.Parameter(initial_weights)
 
@@ -70,7 +74,7 @@ class WeightedAverageEnsemble(nn.Module):
     def forward(self, x: torch.Tensor, return_details: bool = False):
         norm_weights = F.softmax(self.weights, dim=0)
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-        
+
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
             with torch.no_grad():
@@ -80,10 +84,68 @@ class WeightedAverageEnsemble(nn.Module):
             outputs[:, i] = out
 
         final_output = (outputs * norm_weights.view(1, -1, 1)).sum(dim=1)
-        
+
         if return_details:
             return final_output, norm_weights, None, outputs
         return final_output, norm_weights
+
+
+# ================== BENCHMARK ADAPTER (NEW) ==================
+class _WeightedAvgBenchmarkAdapter(nn.Module):
+    """
+    Adapter so that `benchmark_efficiency` (written for the HFDE ensemble)
+    can be reused with the Weighted Average ensemble:
+
+      * exposes `.models`, `.normalizations`, `.num_models` for the warm-up
+        routine,
+      * exposes `.hesitant_fuzzy(x)` -> dummy (N, num_models) weight matrix
+        built from the learned softmax weights (constant per batch),
+      * `forward(x)` returns `(final_output, weights)` so `measure_latency`,
+        `measure_throughput` and `measure_full_pass` work without changes.
+    """
+
+    def __init__(self, ensemble: 'WeightedAverageEnsemble'):
+        super().__init__()
+        self.ensemble = ensemble
+        self.models = ensemble.models
+        self.normalizations = ensemble.normalizations
+        self.num_models = ensemble.num_models
+
+    def eval(self):
+        self.ensemble.eval()
+        return self
+
+    @torch.no_grad()
+    def hesitant_fuzzy(self, x: torch.Tensor):
+        # Learned global weights (softmax) broadcast to (N, num_models).
+        w = F.softmax(self.ensemble.weights, dim=0)
+        return w.unsqueeze(0).expand(x.size(0), -1).contiguous()
+
+    def forward(self, x: torch.Tensor):
+        out, w, _, _ = self.ensemble(x, return_details=True)
+        return out, w
+
+
+def print_headline_weighted_avg(results):
+    """Print ONLY the three headline numbers for the Weighted Average ensemble."""
+    h = results['methods'].get('Weighted Average', {})
+    if not h:
+        return
+    thr = h['throughput']
+    bs = thr['batch_size']
+    fp = results.get('full_test_pass', {})
+    print("=" * 70)
+    print("WEIGHTED AVERAGE EFFICIENCY SUMMARY")
+    print("=" * 70)
+    print(f"Latency (bs=1)          : {h['latency']['mean_ms']:.2f} ± {h['latency']['std_ms']:.2f} ms / image")
+    print(f"Throughput (bs={bs})".ljust(24) +
+          f": {thr['throughput_img_per_s']:.1f} ± {thr['throughput_std_img_per_s']:.1f} images/s "
+          f"(mean ± std of {thr['repeats']} runs)")
+    if fp:
+        print(f"Computational time      : {fp['model_compute_time_s']:.2f} ± {fp['model_compute_time_std_s']:.2f} s "
+              f"(model inference on the whole test set, {fp['num_images']} images, "
+              f"mean of {fp['repeats']} passes; data loading excluded)")
+    print("=" * 70 + "\n")
 
 
 # ================== MODEL LOADING ==================
@@ -110,7 +172,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bo
             models.append(model)
         except Exception as e:
             if is_main: print(f" [ERROR] Failed to load {path}: {e}")
-    
+
     if len(models) == 0: raise ValueError("No models loaded!")
     if is_main: print(f"All {len(models)} models loaded!\n")
     return models
@@ -139,7 +201,7 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
-    
+
     acc = 100. * correct_tensor.item() / total_tensor.item() if total_tensor.item() > 0 else 0.0
     if is_main: print(f" {name}: {acc:.2f}%")
     return acc
@@ -171,32 +233,32 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     model.eval()
     total_correct = 0
     total_samples = 0
-    
+
     ws = dist.get_world_size() if dist.is_initialized() else 1
-    
+
     all_y_true = []
     all_y_score = []
     all_y_pred = []
-    
+
     last_weights = None
 
     if is_main:
         print(f"\nEvaluating {name} set (Weighted Average)...")
-        
+
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
         outputs, weights, _, _ = model(images, return_details=True)
-        
+
         if last_weights is None:
             last_weights = weights.detach().cpu()
-            
+
         probs = torch.sigmoid(outputs.squeeze(1))
         pred_int = (probs > 0.5).long()
-        
+
         all_y_true.extend(labels.cpu().numpy().tolist())
         all_y_score.extend(probs.cpu().numpy().tolist())
         all_y_pred.extend(pred_int.cpu().numpy().tolist())
-        
+
         total_correct += pred_int.eq(labels.long()).sum().item()
         total_samples += labels.size(0)
 
@@ -208,12 +270,12 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         gathered_true = [None for _ in range(ws)]
         gathered_score = [None for _ in range(ws)]
         gathered_pred = [None for _ in range(ws)]
-        
+
         if dist.is_initialized():
             dist.all_gather_object(gathered_true, all_y_true)
             dist.all_gather_object(gathered_score, all_y_score)
             dist.all_gather_object(gathered_pred, all_y_pred)
-        
+
         if is_main:
             all_y_true = [item for sublist in gathered_true for item in sublist]
             all_y_score = [item for sublist in gathered_score for item in sublist]
@@ -223,7 +285,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         total_correct = stats[0].item()
         total_samples = stats[1].item()
         acc = 100. * total_correct / total_samples
-        
+
         final_weights = last_weights.numpy() if last_weights is not None else np.zeros(len(model_names))
 
         print(f"\n{'='*70}")
@@ -236,16 +298,16 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
             print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
         print(f"{'='*70}")
         return acc, final_weights.tolist(), (all_y_true, all_y_score, all_y_pred)
-    
+
     return 0.0, [0.0]*len(model_names), ([], [], [])
 
 
 def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
-    
+
     weights_param = ensemble_model.module.weights if hasattr(ensemble_model, 'module') else ensemble_model.weights
-        
+
     optimizer = torch.optim.AdamW([weights_param], lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
@@ -261,15 +323,15 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
     for epoch in range(num_epochs):
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
-        
+
         ensemble_model.train()
-        
-        # --- این بخش باید اضافه شود تا BatchNorm آپدیت نشود ---
+
+        # --- این بخش باید باشد تا BatchNorm مدل‌های پایه آپدیت نشود ---
         actual_module = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
         for model in actual_module.models:
-            model.eval()  # مدل‌های پایه مجدداً به حالت ارزیابی برمی‌گردند
-        # -------------------------------------------------------
-        
+            model.eval()
+        # -------------------------------------------------------------
+
         train_loss = 0.0
         train_correct = 0
         train_total = 0
@@ -277,7 +339,7 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
         for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main):
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
-            
+
             outputs, _, _, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
@@ -291,7 +353,7 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
 
         train_acc = 100. * train_correct / train_total
         train_loss = train_loss / train_total
-        
+
         current_weights = F.softmax(weights_param, dim=0).detach().cpu()
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         scheduler.step()
@@ -334,28 +396,27 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-# ================== NEW HELPER: REAL/FAKE METRICS ==================
+# ================== REAL/FAKE METRICS ==================
 def compute_real_fake_metrics(y_true, y_pred):
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
-    
-    # Real = 1, Fake = 0
+
     real_precision, real_recall, real_f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=[1], average=None, zero_division=0
     )
     real_precision, real_recall, real_f1 = real_precision[0], real_recall[0], real_f1[0]
-    
+
     fake_precision, fake_recall, fake_f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=[0], average=None, zero_division=0
     )
     fake_precision, fake_recall, fake_f1 = fake_precision[0], fake_recall[0], fake_f1[0]
-    
+
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])  # Fake=0, Real=1
-    TN, FP, FN, TP = cm.ravel()   # از دید کلاس Real (مثبت=1)
-    
+    TN, FP, FN, TP = cm.ravel()
+
     real_specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
     fake_specificity = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-    
+
     metrics = {
         'real': {
             'precision': float(real_precision),
@@ -398,105 +459,12 @@ def print_real_fake_metrics(metrics, title="REAL/FAKE METRICS"):
     print(f"{'='*70}")
 
 
-# ================== NEW HELPER: LATENCY / THROUGHPUT / COMPUTE TIME ==================
-@torch.no_grad()
-def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
-    
-    model.eval()
-    
-    # ---- Pre-cache کل داده تست روی CPU برای حذف زمان data loading ----
-    cached_images = []
-    for images, _ in loader:
-        cached_images.append(images)
-    cached_images = torch.cat(cached_images, dim=0)  # (N, C, H, W) on CPU
-    N = cached_images.size(0)
-    
-    bs_lat = 1
-    bs_tp = 16
-    
-    # ---- Warmup ----
-    warmup_img = cached_images[:bs_tp].to(device)
-    for _ in range(3):
-        _ = model(warmup_img)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    
-    # ============ Latency (bs=1) ============
-    lat_runs = []
-    for _ in range(num_runs):
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for i in range(N):
-            img = cached_images[i:i+bs_lat].to(device)
-            _ = model(img)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        lat_runs.append((t1 - t0) / N * 1000.0)  # ms per image
-    lat_mean = float(np.mean(lat_runs))
-    lat_std = float(np.std(lat_runs))
-    
-    # ============ Throughput (bs=16) ============
-    tp_runs = []
-    for _ in range(num_runs):
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for i in range(0, N, bs_tp):
-            img = cached_images[i:i+bs_tp].to(device)
-            _ = model(img)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        tp_runs.append(N / (t1 - t0))  # images/sec
-    tp_mean = float(np.mean(tp_runs))
-    tp_std = float(np.std(tp_runs))
-    
-    # ============ Computational Time (whole test set, no data loading) ============
-    ct_runs = []
-    for _ in range(num_runs):
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for i in range(0, N, bs_tp):
-            img = cached_images[i:i+bs_tp].to(device)
-            _ = model(img)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        ct_runs.append(t1 - t0)  # seconds
-    ct_mean = float(np.mean(ct_runs))
-    ct_std = float(np.std(ct_runs))
-    
-    results = {
-        'num_test_images': int(N),
-        'num_runs': int(num_runs),
-        'latency_bs1_ms_per_image': {'mean': lat_mean, 'std': lat_std},
-        'throughput_bs16_images_per_sec': {'mean': tp_mean, 'std': tp_std},
-        'computational_time_sec': {'mean': ct_mean, 'std': ct_std}
-    }
-    
-    if is_main:
-        print("="*70)
-        print(f"Latency (bs=1)          : {lat_mean:.2f} ± {lat_std:.2f} ms / image")
-        print(f"Throughput (bs=16)      : {tp_mean:.1f} ± {tp_std:.1f} images/s (mean ± std of {num_runs} runs)")
-        print(f"Computational time      : {ct_mean:.2f} ± {ct_std:.2f} s (model inference on the whole test set, {N} images, mean of {num_runs} passes; data loading excluded)")
-        print("="*70)
-    
-    return results
-
-
-# ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
+# ================== SAVE LOG / JSON HELPERS ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
-    """
-    ساخت فایل txt دقیقاً بر اساس لیست‌های y_true و y_pred که از تست کنسول آمده‌اند.
-    """
     total = len(y_true)
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
-    
-    # محاسبه ماتریس آشفتگی
+
     TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
     TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
     FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
@@ -511,12 +479,12 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     lines.append(f"Total Samples: {total}")
     lines.append(f"Correct Predictions: {correct}")
     lines.append(f"Incorrect Predictions: {total - correct}")
-    
+
     lines.append("\nConfusion Matrix:")
     lines.append(f"                 Predicted Fake  Predicted Real")
     lines.append(f"    Actual Fake   {TN:<15} {FP:<15}")
     lines.append(f"    Actual Real   {FN:<15} {TP:<15}")
-    
+
     lines.append("\nClassification Metrics:")
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0
@@ -525,7 +493,6 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     lines.append(f"Recall: {recall:.4f}")
     lines.append(f"Specificity: {specificity:.4f}")
 
-    # ===== NEW: Real/Fake Metrics =====
     rf = compute_real_fake_metrics(y_true, y_pred)
     lines.append("\n" + "="*70)
     lines.append("REAL/FAKE METRICS")
@@ -538,13 +505,12 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
                      f"{m['f1']:<12.4f} {m['specificity']:<12.4f}")
     lines.append("-"*70)
     lines.append(f"Macro F1: {rf['macro_f1']:.4f}")
-    # ==================================
-    
+
     lines.append("-" * 70)
     lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test):")
     lines.append(f"{'ID':<10} {'True':<10} {'Pred':<10} {'Status':<10}")
     lines.append("-" * 70)
-    
+
     for i, (yt, yp) in enumerate(zip(y_true, y_pred)):
         status = "Correct" if yt == yp else "Wrong"
         lines.append(f"{i+1:<10} {yt:<10} {yp:<10} {status:<10}")
@@ -553,10 +519,11 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
         f.write("\n".join(lines))
     print(f"✅ Accuracy log (Console-Accurate) saved to: {save_path}")
 
+
 def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name):
     pos_count = sum(y_true)
     neg_count = len(y_true) - pos_count
-    
+
     output_data = {
         "metadata": {
             "seed": seed,
@@ -573,6 +540,7 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
     with open(save_path, 'w') as f:
         json.dump(output_data, f, indent=4)
     print(f"✅ Predictions JSON saved to: {save_path}")
+
 
 # ================== MAIN FUNCTION ==================
 def main():
@@ -598,6 +566,9 @@ def main():
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
 
+    # ============ PIPELINE STOPWATCH (NEW) ============
+    pipeline_sw = Stopwatch(device).start()
+
     if is_main:
         print("="*70)
         print(f"WEIGHTED AVERAGE ENSEMBLE TRAINING")
@@ -606,11 +577,11 @@ def main():
 
     MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-    
+
     if len(args.model_paths) > len(MEANS):
         MEANS = MEANS * (len(args.model_paths) // len(MEANS) + 1)
         STDS = STDS * (len(args.model_paths) // len(STDS) + 1)
-        
+
     MEANS = MEANS[:len(args.model_paths)]
     STDS = STDS[:len(args.model_paths)]
 
@@ -633,11 +604,17 @@ def main():
         print("\n" + "="*70); print("INDIVIDUAL MODEL PERFORMANCE"); print("="*70)
 
     individual_accs = []
+    individual_times = []
     for i, model in enumerate(base_models):
+        sw = Stopwatch(device).start()
         acc = evaluate_single_model_ddp(
             model, test_loader, device,
             f"Model {i+1} ({MODEL_NAMES[i]})",
             MEANS[i], STDS[i], is_main)
+        t = sw.stop()
+        individual_times.append(t)
+        if is_main:
+            print(f" ⏱ Evaluation time: {t:.1f}s\n")
         individual_accs.append(acc)
 
     best_single = max(individual_accs)
@@ -655,12 +632,47 @@ def main():
         print("Best model weights loaded.\n")
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
-    
-    # دریافت خروجی‌ها برای JSON و Log
+
+    # ============ EFFICIENCY BENCHMARK (REPLACED measure_latency_throughput) ============
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    efficiency = {}
+    bench_time = 0.0
+    if is_main:
+        try:
+            adapter = _WeightedAvgBenchmarkAdapter(ensemble_module).to(device)
+            bench_sw = Stopwatch(device).start()
+            efficiency = benchmark_efficiency(
+                adapter, test_loader, device, MODEL_NAMES,
+                latency_samples=min(300, len(test_loader.dataset)),
+                verbose=True,
+            )
+            bench_time = bench_sw.stop()
+
+            # Rename HFDE labels to Weighted Average labels
+            if 'HFDE (dynamic)' in efficiency.get('methods', {}):
+                efficiency['methods']['Weighted Average'] = efficiency['methods'].pop('HFDE (dynamic)')
+            efficiency.get('methods', {}).pop('Router only', None)
+            if 'full_test_pass_hfde' in efficiency:
+                efficiency['full_test_pass'] = efficiency.pop('full_test_pass_hfde')
+
+            efficiency['method'] = 'Weighted Average'
+            efficiency['benchmark_time_s'] = float(bench_time)
+
+            print_headline_weighted_avg(efficiency)
+        except Exception as e:
+            print(f"[WARNING] Efficiency benchmark failed: {e}")
+            efficiency = {}
+            bench_time = 0.0
+
+    # ============ FINAL EVALUATION ============
+    eval_sw = Stopwatch(device).start()
     ensemble_test_acc, ensemble_weights, predictions_data = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
+    final_eval_time = eval_sw.stop()
 
     if is_main:
+        print(f"\n⏱ Final evaluation time: {final_eval_time:.1f}s")
         print("\n" + "="*70)
         print("FINAL COMPARISON")
         print("="*70)
@@ -669,43 +681,59 @@ def main():
         print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
         print("="*70)
 
-        # استخراج لیست‌ها
         y_true, y_score, y_pred = predictions_data
 
-        # ============ REAL/FAKE METRICS ============
+        # REAL/FAKE METRICS
         rf_metrics = compute_real_fake_metrics(y_true, y_pred)
         print_real_fake_metrics(rf_metrics, title="WEIGHTED ENSEMBLE — REAL/FAKE METRICS")
 
-        # ============ LATENCY / THROUGHPUT ============
-        perf_metrics = measure_latency_throughput(
-            ensemble_module, test_loader, device, is_main=is_main
-        )
-        
-        # 1. ذخیره JSON
+        # Save JSON + log
         json_path = os.path.join(args.save_dir, 'test_predictions.json')
         save_predictions_json(y_true, y_score, y_pred, json_path, args.seed, args.dataset)
 
-        # 2. ذخیره فایل txt دقیقاً مطابق با کنسول
         log_path = os.path.join(args.save_dir, 'prediction_log.txt')
         save_accuracy_log_from_results(y_true, y_pred, log_path, "Weighted Ensemble")
 
+        # ============ TIME SUMMARY ============
+        total_pipeline_time = pipeline_sw.stop()
+
+        print("\n" + "="*70)
+        print("TIME SUMMARY")
+        print("="*70)
+        for i, name in enumerate(MODEL_NAMES):
+            print(f"  Model {i+1} ({name}) evaluation : {individual_times[i]:.1f}s")
+        print(f"  Efficiency benchmark          : {bench_time:.1f}s")
+        print(f"  Final ensemble evaluation     : {final_eval_time:.1f}s")
+        print(f"  Total pipeline time           : {total_pipeline_time/60:.2f} min ({total_pipeline_time:.1f}s)")
+        print("="*70)
+
+        # ============ SAVE FINAL RESULTS ============
         final_results = {
             'seed': args.seed,
             'method': 'Weighted_Average',
             'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
-            'ensemble': {'test_accuracy': float(ensemble_test_acc), 'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)}},
+            'ensemble': {
+                'test_accuracy': float(ensemble_test_acc),
+                'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)}
+            },
             'improvement': float(ensemble_test_acc - best_single),
             'training_history': history,
-            # ===== NEW =====
             'real_fake_metrics': rf_metrics,
-            'performance_metrics': perf_metrics
-            # ===============
+            'performance_metrics': efficiency,
+            'timing': {
+                'individual_model_eval_times_s': {
+                    name: float(t) for name, t in zip(MODEL_NAMES, individual_times)
+                },
+                'benchmark_time_s': float(bench_time),
+                'final_evaluation_time_s': float(final_eval_time),
+                'total_pipeline_time_s': float(total_pipeline_time),
+            }
         }
 
         results_path = os.path.join(args.save_dir, 'final_results.json')
         with open(results_path, 'w') as f:
             json.dump(final_results, f, indent=4)
-        
+
         final_model_path = os.path.join(args.save_dir, 'final_ensemble_model.pt')
         torch.save({
             'ensemble_state_dict': ensemble_module.state_dict(),
@@ -716,6 +744,19 @@ def main():
             'seed': args.seed
         }, final_model_path)
 
+        # Save efficiency report separately
+        if efficiency:
+            efficiency['individual_model_eval_times_s'] = {
+                name: float(t) for name, t in zip(MODEL_NAMES, individual_times)
+            }
+            efficiency['final_evaluation_time_s'] = float(final_eval_time)
+            efficiency['total_pipeline_time_s'] = float(total_pipeline_time)
+            eff_path = os.path.join(args.save_dir, 'efficiency_report.json')
+            with open(eff_path, 'w') as f:
+                json.dump(efficiency, f, indent=2)
+            print(f"Efficiency report saved: {eff_path}")
+
+        # ============ VISUALIZATIONS ============
         vis_dir = os.path.join(args.save_dir, 'visualizations')
         generate_visualizations(
             ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
@@ -723,16 +764,17 @@ def main():
             args.dataset, is_main)
 
     cleanup_distributed()
-    
+
     if is_main:
         plot_roc_and_f1(
             ensemble_module,
-            test_loader, 
-            device, 
-            args.save_dir, 
+            test_loader,
+            device,
+            args.save_dir,
             MODEL_NAMES,
             is_main
         )
+
 
 if __name__ == "__main__":
     main()
