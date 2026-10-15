@@ -10,10 +10,8 @@ import warnings
 import argparse
 import json
 import random
-import time
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
-from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
 from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
@@ -404,151 +402,6 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
     print(f"✅ Predictions JSON saved to: {save_path}")
 
 
-# ================== NEW HELPER: REAL/FAKE METRICS ==================
-def compute_real_fake_metrics(y_true, y_pred):
-    """
-    محاسبه متریک‌های جداگانه برای کلاس Real (0) و Fake (1)
-    """
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-    
-    # برچسب‌ها: فرض می‌کنیم 0 = Real, 1 = Fake
-    # Real metrics (کلاس 0 به عنوان مثبت)
-    real_precision, real_recall, real_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=[0], average=None, zero_division=0
-    )
-    real_precision = real_precision[0]
-    real_recall = real_recall[0]
-    real_f1 = real_f1[0]
-    
-    # Fake metrics (کلاس 1 به عنوان مثبت)
-    fake_precision, fake_recall, fake_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=[1], average=None, zero_division=0
-    )
-    fake_precision = fake_precision[0]
-    fake_recall = fake_recall[0]
-    fake_f1 = fake_f1[0]
-    
-    # Confusion matrix
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    TN, FP, FN, TP = cm.ravel()  # Real=0, Fake=1
-    
-    # Specificity برای هر کلاس
-    real_specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0  # = Recall کلاس Fake
-    fake_specificity = TP / (TP + FN) if (TP + FN) > 0 else 0.0  # = Recall کلاس Real
-    
-    metrics = {
-        'real': {
-            'precision': float(real_precision),
-            'recall': float(real_recall),
-            'f1': float(real_f1),
-            'specificity': float(real_specificity),
-            'support': int(np.sum(y_true == 0))
-        },
-        'fake': {
-            'precision': float(fake_precision),
-            'recall': float(fake_recall),
-            'f1': float(fake_f1),
-            'specificity': float(fake_specificity),
-            'support': int(np.sum(y_true == 1))
-        },
-        'macro_f1': float((real_f1 + fake_f1) / 2),
-        'confusion_matrix': {
-            'TN': int(TN), 'FP': int(FP), 'FN': int(FN), 'TP': int(TP)
-        }
-    }
-    return metrics
-
-
-def print_real_fake_metrics(metrics, title="REAL/FAKE METRICS"):
-    print(f"\n{'='*70}")
-    print(title)
-    print(f"{'='*70}")
-    print(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'F1':<12} {'Specificity':<12} {'Support':<10}")
-    print(f"{'-'*70}")
-    for cls in ['real', 'fake']:
-        m = metrics[cls]
-        print(f"{cls.upper():<10} {m['precision']:<12.4f} {m['recall']:<12.4f} "
-              f"{m['f1']:<12.4f} {m['specificity']:<12.4f} {m['support']:<10}")
-    print(f"{'-'*70}")
-    print(f"Macro F1: {metrics['macro_f1']:.4f}")
-    print(f"Confusion Matrix: TN={metrics['confusion_matrix']['TN']}, "
-          f"FP={metrics['confusion_matrix']['FP']}, "
-          f"FN={metrics['confusion_matrix']['FN']}, "
-          f"TP={metrics['confusion_matrix']['TP']}")
-    print(f"{'='*70}")
-
-
-# ================== NEW HELPER: LATENCY / THROUGHPUT / COMPUTE TIME ==================
-@torch.no_grad()
-def measure_latency_throughput(model, loader, device, is_main=True, warmup_batches=5):
-    """
-    اندازه‌گیری Latency (ms/sample)، Throughput (samples/sec) و Compute Time (sec)
-    """
-    model.eval()
-    
-    # مرحله warmup
-    warmup_count = 0
-    for images, _ in loader:
-        images = images.to(device)
-        _ = model(images)
-        warmup_count += 1
-        if warmup_count >= warmup_batches:
-            break
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    
-    total_samples = 0
-    total_time = 0.0
-    per_batch_times = []
-    
-    for images, _ in loader:
-        images = images.to(device)
-        batch_size = images.size(0)
-        
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        start = time.perf_counter()
-        
-        _ = model(images)
-        
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        end = time.perf_counter()
-        
-        elapsed = end - start
-        total_time += elapsed
-        total_samples += batch_size
-        per_batch_times.append(elapsed)
-    
-    latency_ms_per_sample = (total_time / total_samples) * 1000.0 if total_samples > 0 else 0.0
-    throughput = total_samples / total_time if total_time > 0 else 0.0
-    avg_batch_time_ms = (np.mean(per_batch_times) * 1000.0) if per_batch_times else 0.0
-    
-    results = {
-        'total_samples': int(total_samples),
-        'total_compute_time_sec': float(total_time),
-        'latency_ms_per_sample': float(latency_ms_per_sample),
-        'throughput_samples_per_sec': float(throughput),
-        'avg_batch_time_ms': float(avg_batch_time_ms),
-        'num_batches': len(per_batch_times)
-    }
-    
-    if is_main:
-        print(f"\n{'='*70}")
-        print("LATENCY / THROUGHPUT / COMPUTE TIME")
-        print(f"{'='*70}")
-        print(f"Total Samples          : {results['total_samples']:,}")
-        print(f"Total Compute Time     : {results['total_compute_time_sec']:.4f} sec")
-        print(f"Latency (per sample)   : {results['latency_ms_per_sample']:.4f} ms")
-        print(f"Throughput             : {results['throughput_samples_per_sec']:.2f} samples/sec")
-        print(f"Avg Batch Time         : {results['avg_batch_time_ms']:.4f} ms")
-        print(f"Number of Batches      : {results['num_batches']}")
-        print(f"{'='*70}")
-    
-    return results
-
-
 # ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
 
@@ -583,21 +436,6 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     lines.append(f"Precision: {precision:.4f}")
     lines.append(f"Recall: {recall:.4f}")
     lines.append(f"Specificity: {specificity:.4f}")
-
-    # ===== NEW: Real/Fake Metrics =====
-    rf = compute_real_fake_metrics(y_true, y_pred)
-    lines.append("\n" + "="*70)
-    lines.append("REAL/FAKE METRICS")
-    lines.append("="*70)
-    lines.append(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'F1':<12} {'Specificity':<12}")
-    lines.append("-"*70)
-    for cls in ['real', 'fake']:
-        m = rf[cls]
-        lines.append(f"{cls.upper():<10} {m['precision']:<12.4f} {m['recall']:<12.4f} "
-                     f"{m['f1']:<12.4f} {m['specificity']:<12.4f}")
-    lines.append("-"*70)
-    lines.append(f"Macro F1: {rf['macro_f1']:.4f}")
-    # ==================================
     
     lines.append("-" * 70)
     lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test):")
@@ -735,15 +573,6 @@ def main():
             print("="*70)
 
             y_true, y_score, y_pred = predictions_data
-
-            # ============ REAL/FAKE METRICS ============
-            rf_metrics = compute_real_fake_metrics(y_true, y_pred)
-            print_real_fake_metrics(rf_metrics, title="STACKING ENSEMBLE — REAL/FAKE METRICS")
-            
-            # ============ LATENCY / THROUGHPUT ============
-            perf_metrics = measure_latency_throughput(
-                ensemble_module, test_loader, device, is_main=is_main
-            )
             
             json_path = os.path.join(current_save_dir, 'test_predictions.json')
             save_predictions_json(y_true, y_score, y_pred, json_path, current_seed, args.dataset)
@@ -764,11 +593,7 @@ def main():
                     'learned_bias': float(learned_bias)
                 },
                 'improvement': float(ensemble_test_acc - best_single),
-                'training_history': history,
-                # ===== NEW =====
-                'real_fake_metrics': rf_metrics,
-                'performance_metrics': perf_metrics
-                # ===============
+                'training_history': history
             }
 
             results_path = os.path.join(current_save_dir, 'final_results_stacking_lr.json')
