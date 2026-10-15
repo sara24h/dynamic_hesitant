@@ -14,6 +14,9 @@ import time
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+import matplotlib
+matplotlib.use('Agg')  
+import matplotlib.pyplot as plt
 
 from metrics_utils import plot_roc_and_f1
 from old_dataset_utils import (
@@ -563,20 +566,32 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
     acc = 100. * correct_tensor.item() / real_total
     if is_main: print(f" {name}: {acc:.2f}%")
     return acc
+
 @torch.no_grad()
-def evaluate_accuracy_ddp(model, loader, device):
+def evaluate_accuracy_and_loss_ddp(model, loader, device, criterion):
+    """محاسبه دقت و loss ولیدیشن در حالت DDP (هر دو all_reduce می‌شوند)."""
     model.eval()
     correct = 0
+    total_loss = 0.0
+
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
+        loss = criterion(outputs.squeeze(1), labels)
+        total_loss += loss.item() * images.size(0)
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-    
-    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+
     real_total = len(loader.dataset)
+    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
+    loss_tensor = torch.tensor(total_loss, dtype=torch.float, device=device)
+
     dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    return 100. * correct_tensor.item() / real_total
+    dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+
+    acc = 100. * correct_tensor.item() / real_total
+    avg_loss = loss_tensor.item() / real_total
+    return acc, avg_loss
 # ================== TRAINING ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, is_main, model_names):
@@ -586,6 +601,15 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
     best_val_acc = 0.0
+       
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_acc': [],
+        'val_acc': []
+    }
+
+                            
     if is_main:
         print("="*70)
         print("Training Fuzzy Hesitant Network")
@@ -638,14 +662,22 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         avg_model_activation = (sum_active_models / train_total) * 100
         overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
         
-        val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
+        val_acc, val_loss = evaluate_accuracy_and_loss_ddp(ensemble_model, val_loader, device, criterion)
+        
         scheduler.step()
+        
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
+        
         if is_main:
             print(f"\n{'='*70}")
             print(f"Epoch {epoch+1}/{num_epochs}")
             print(f"{'='*70}")
             print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-            print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
+            print(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
+            
             
             print(f"\n{'Hesitancy (Variance) per Model:':^70}")
             print(f"{'-'*70}")
@@ -678,8 +710,39 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             save_path = os.path.join(save_dir, 'best_hesitant_fuzzy.pt')
             torch.save({'hesitant_state_dict': hesitant_net.state_dict()}, save_path)
             print(f"\n✓ Best model saved → {val_acc:.2f}%")
-        if is_main:
-            print()
+            # ================== رسم نمودار Loss و Accuracy (فقط روی rank 0) ==================
+    if is_main:
+        plt.figure(figsize=(14, 6))
+
+        # --- Loss ---
+        plt.subplot(1, 2, 1)
+        plt.plot(range(1, num_epochs + 1), history['train_loss'],
+                 label='train', color='blue', linewidth=2)
+        plt.plot(range(1, num_epochs + 1), history['val_loss'],
+                 label='validation', color='orange', linewidth=2)
+        plt.title('Loss', fontsize=16)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Loss', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend(fontsize=12)
+
+        # --- Accuracy ---
+        plt.subplot(1, 2, 2)
+        plt.plot(range(1, num_epochs + 1), history['train_acc'],
+                 label='train', color='blue', linewidth=2)
+        plt.plot(range(1, num_epochs + 1), history['val_acc'],
+                 label='validation', color='orange', linewidth=2)
+        plt.title('Accuracy', fontsize=16)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Accuracy (%)', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend(fontsize=12)
+
+        plt.tight_layout()
+        curves_path = os.path.join(save_dir, 'training_curves.png')
+        plt.savefig(curves_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✅ Training curves (Loss & Acc) saved to: {curves_path}")
     return best_val_acc
 # ================== DISTRIBUTED SETUP ==================
 def setup_distributed():
