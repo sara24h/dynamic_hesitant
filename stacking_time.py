@@ -406,36 +406,33 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
 
 # ================== NEW HELPER: REAL/FAKE METRICS ==================
 def compute_real_fake_metrics(y_true, y_pred):
-    """
-    محاسبه متریک‌های جداگانه برای کلاس Real (0) و Fake (1)
-    """
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     
-    # برچسب‌ها: فرض می‌کنیم 0 = Real, 1 = Fake
-    # Real metrics (کلاس 0 به عنوان مثبت)
+    # Real = 1, Fake = 0
     real_precision, real_recall, real_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=[0], average=None, zero_division=0
+        y_true, y_pred, labels=[1], average=None, zero_division=0
     )
     real_precision = real_precision[0]
     real_recall = real_recall[0]
     real_f1 = real_f1[0]
     
-    # Fake metrics (کلاس 1 به عنوان مثبت)
     fake_precision, fake_recall, fake_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=[1], average=None, zero_division=0
+        y_true, y_pred, labels=[0], average=None, zero_division=0
     )
     fake_precision = fake_precision[0]
     fake_recall = fake_recall[0]
     fake_f1 = fake_f1[0]
     
-    # Confusion matrix
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    TN, FP, FN, TP = cm.ravel()  # Real=0, Fake=1
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])  # Fake=0, Real=1
+    # cm:
+    # [[TN_fake, FP_fake],   → Actual Fake
+    #  [FN_real, TP_real]]   → Actual Real
+    TN, FP, FN, TP = cm.ravel()   # از دید کلاس Real (مثبت = 1)
     
-    # Specificity برای هر کلاس
-    real_specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0  # = Recall کلاس Fake
-    fake_specificity = TP / (TP + FN) if (TP + FN) > 0 else 0.0  # = Recall کلاس Real
+    # Specificity
+    real_specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0   # Specificity of Real = Recall of Fake
+    fake_specificity = TP / (TP + FN) if (TP + FN) > 0 else 0.0   # Specificity of Fake = Recall of Real
     
     metrics = {
         'real': {
@@ -443,14 +440,14 @@ def compute_real_fake_metrics(y_true, y_pred):
             'recall': float(real_recall),
             'f1': float(real_f1),
             'specificity': float(real_specificity),
-            'support': int(np.sum(y_true == 0))
+            'support': int(np.sum(y_true == 1))
         },
         'fake': {
             'precision': float(fake_precision),
             'recall': float(fake_recall),
             'f1': float(fake_f1),
             'specificity': float(fake_specificity),
-            'support': int(np.sum(y_true == 1))
+            'support': int(np.sum(y_true == 0))
         },
         'macro_f1': float((real_f1 + fake_f1) / 2),
         'confusion_matrix': {
@@ -576,10 +573,10 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
     
-    TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
-    TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
-    FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
-    FN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 0)
+    TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)  # Real correctly predicted
+    TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)  # Fake correctly predicted
+    FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)  # Fake predicted as Real
+    FN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 0)  # Real predicted as Fake
 
     lines = []
     lines.append("="*70)
@@ -592,9 +589,9 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     lines.append(f"Incorrect Predictions: {total - correct}")
     
     lines.append("\nConfusion Matrix:")
-    lines.append(f"                 Predicted Real  Predicted Fake")
-    lines.append(f"    Actual Real   {TP:<15} {FN:<15}")
-    lines.append(f"    Actual Fake   {FP:<15} {TN:<15}")
+    lines.append(f"                 Predicted Fake  Predicted Real")
+    lines.append(f"    Actual Fake   {TN:<15} {FP:<15}")
+    lines.append(f"    Actual Real   {FN:<15} {TP:<15}")
     
     lines.append("\nClassification Metrics:")
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
