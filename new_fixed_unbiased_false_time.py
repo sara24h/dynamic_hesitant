@@ -21,6 +21,11 @@ from old_dataset_utils import (
     create_dataloaders, get_sample_info
 )
 from visualization_utils import generate_visualizations
+
+# ================== NEW IMPORT: EFFICIENCY BENCHMARK ==================
+from efficiency_utils import Stopwatch, benchmark_efficiency
+# ======================================================================
+
 warnings.filterwarnings("ignore")
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -92,6 +97,7 @@ def print_real_fake_metrics(metrics, title="REAL/FAKE METRICS"):
           f"TP={metrics['confusion_matrix']['TP']}")
     print(f"{'='*70}")
 # ================== LATENCY / THROUGHPUT / COMPUTE TIME ==================
+# NOTE: تابع قدیمی حفظ شده ولی دیگر استفاده نمی‌شود (طبق درخواست دست‌نخورده).
 @torch.no_grad()
 def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
     model.eval()
@@ -280,9 +286,11 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     # ============ REAL/FAKE METRICS ============
     rf_metrics = compute_real_fake_metrics(all_y_true, all_y_pred)
     print_real_fake_metrics(rf_metrics, title="FUZZY HESITANT ENSEMBLE — REAL/FAKE METRICS")
-    # ============ LATENCY / THROUGHPUT ============
-    perf_metrics = measure_latency_throughput(
-        model, test_loader_full, device, is_main=is_main
+    # ============ LATENCY / THROUGHPUT (REPLACED) ============
+    perf_metrics = benchmark_efficiency(
+        model, test_loader_full, device, model_names,
+        latency_samples=min(300, len(test_loader_full.dataset)),
+        verbose=is_main,
     )
     # ════════════════════════════════════════════════════════════════
     #        آمار فعال‌سازی هر مدل (درصد نمونه‌هایی که مدل فعال بوده)
