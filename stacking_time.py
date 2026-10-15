@@ -480,71 +480,91 @@ def print_real_fake_metrics(metrics, title="REAL/FAKE METRICS"):
 
 
 # ================== NEW HELPER: LATENCY / THROUGHPUT / COMPUTE TIME ==================
+
 @torch.no_grad()
-def measure_latency_throughput(model, loader, device, is_main=True, warmup_batches=5):
-    """
-    اندازه‌گیری Latency (ms/sample)، Throughput (samples/sec) و Compute Time (sec)
-    """
+def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
+  
     model.eval()
     
-    # مرحله warmup
-    warmup_count = 0
+    # ---- Pre-cache کل داده تست روی CPU برای حذف زمان data loading ----
+    cached_images = []
     for images, _ in loader:
-        images = images.to(device)
-        _ = model(images)
-        warmup_count += 1
-        if warmup_count >= warmup_batches:
-            break
+        cached_images.append(images)
+    cached_images = torch.cat(cached_images, dim=0)  # (N, C, H, W) on CPU
+    N = cached_images.size(0)
+    
+    bs_lat = 1
+    bs_tp = 16
+    
+    # ---- Warmup ----
+    warmup_img = cached_images[:bs_tp].to(device)
+    for _ in range(3):
+        _ = model(warmup_img)
     if device.type == 'cuda':
         torch.cuda.synchronize()
     
-    total_samples = 0
-    total_time = 0.0
-    per_batch_times = []
-    
-    for images, _ in loader:
-        images = images.to(device)
-        batch_size = images.size(0)
-        
+    # ============ Latency (bs=1) ============
+    lat_runs = []
+    for _ in range(num_runs):
         if device.type == 'cuda':
             torch.cuda.synchronize()
-        start = time.perf_counter()
-        
-        _ = model(images)
-        
+        t0 = time.perf_counter()
+        for i in range(N):
+            img = cached_images[i:i+bs_lat].to(device)
+            _ = model(img)
         if device.type == 'cuda':
             torch.cuda.synchronize()
-        end = time.perf_counter()
-        
-        elapsed = end - start
-        total_time += elapsed
-        total_samples += batch_size
-        per_batch_times.append(elapsed)
+        t1 = time.perf_counter()
+        lat_runs.append((t1 - t0) / N * 1000.0)  # ms per image
+    lat_mean = float(np.mean(lat_runs))
+    lat_std = float(np.std(lat_runs))
     
-    latency_ms_per_sample = (total_time / total_samples) * 1000.0 if total_samples > 0 else 0.0
-    throughput = total_samples / total_time if total_time > 0 else 0.0
-    avg_batch_time_ms = (np.mean(per_batch_times) * 1000.0) if per_batch_times else 0.0
+    # ============ Throughput (bs=16) ============
+    tp_runs = []
+    for _ in range(num_runs):
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for i in range(0, N, bs_tp):
+            img = cached_images[i:i+bs_tp].to(device)
+            _ = model(img)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        tp_runs.append(N / (t1 - t0))  # images/sec
+    tp_mean = float(np.mean(tp_runs))
+    tp_std = float(np.std(tp_runs))
+    
+    # ============ Computational Time (whole test set, no data loading) ============
+    ct_runs = []
+    for _ in range(num_runs):
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for i in range(0, N, bs_tp):
+            img = cached_images[i:i+bs_tp].to(device)
+            _ = model(img)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        ct_runs.append(t1 - t0)  # seconds
+    ct_mean = float(np.mean(ct_runs))
+    ct_std = float(np.std(ct_runs))
     
     results = {
-        'total_samples': int(total_samples),
-        'total_compute_time_sec': float(total_time),
-        'latency_ms_per_sample': float(latency_ms_per_sample),
-        'throughput_samples_per_sec': float(throughput),
-        'avg_batch_time_ms': float(avg_batch_time_ms),
-        'num_batches': len(per_batch_times)
+        'num_test_images': int(N),
+        'num_runs': int(num_runs),
+        'latency_bs1_ms_per_image': {'mean': lat_mean, 'std': lat_std},
+        'throughput_bs16_images_per_sec': {'mean': tp_mean, 'std': tp_std},
+        'computational_time_sec': {'mean': ct_mean, 'std': ct_std}
     }
     
     if is_main:
-        print(f"\n{'='*70}")
-        print("LATENCY / THROUGHPUT / COMPUTE TIME")
-        print(f"{'='*70}")
-        print(f"Total Samples          : {results['total_samples']:,}")
-        print(f"Total Compute Time     : {results['total_compute_time_sec']:.4f} sec")
-        print(f"Latency (per sample)   : {results['latency_ms_per_sample']:.4f} ms")
-        print(f"Throughput             : {results['throughput_samples_per_sec']:.2f} samples/sec")
-        print(f"Avg Batch Time         : {results['avg_batch_time_ms']:.4f} ms")
-        print(f"Number of Batches      : {results['num_batches']}")
-        print(f"{'='*70}")
+        print("="*70)
+        print(f"Latency (bs=1)          : {lat_mean:.2f} ± {lat_std:.2f} ms / image")
+        print(f"Throughput (bs=16)      : {tp_mean:.1f} ± {tp_std:.1f} images/s (mean ± std of {num_runs} runs)")
+        print(f"Computational time      : {ct_mean:.2f} ± {ct_std:.2f} s (model inference on the whole test set, {N} images, mean of {num_runs} passes; data loading excluded)")
+        print("="*70)
     
     return results
 
