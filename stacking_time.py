@@ -28,6 +28,9 @@ from old_dataset_utils import (
 
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
 
+# ================== NEW IMPORT: EFFICIENCY BENCHMARK ==================
+from efficiency_utils import Stopwatch, benchmark_efficiency
+# ======================================================================
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -99,6 +102,32 @@ class StackingEnsemble(nn.Module):
             dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
             return final_output, dummy_weights
 
+
+# ================== BENCHMARK ADAPTER (NEW) ==================
+class _StackingBenchmarkAdapter(nn.Module):
+
+    def __init__(self, ensemble: 'StackingEnsemble'):
+        super().__init__()
+        self.ensemble = ensemble
+        self.models = ensemble.models
+        self.normalizations = ensemble.normalizations
+        self.num_models = ensemble.num_models
+
+    def eval(self):
+        self.ensemble.eval()
+        return self
+
+    @torch.no_grad()
+    def hesitant_fuzzy(self, x: torch.Tensor):
+        # Stacking has no router → uniform dummy weights.
+        return torch.full((x.size(0), self.num_models),
+                          1.0 / self.num_models, device=x.device)
+
+    def forward(self, x: torch.Tensor):
+        out, w = self.ensemble(x)
+        return out, w
+
+
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
     try:
@@ -160,7 +189,6 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     
-    # ---> اصلاح باگ: فقط در صورت فعال بودن DDP آل ردوس کن <---
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
@@ -185,7 +213,6 @@ def evaluate_accuracy_ddp(model, loader, device):
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     
-    # ---> اصلاح باگ: فقط در صورت فعال بودن DDP آل ردوس کن <---
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
@@ -221,7 +248,6 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
 
     correct_tensor = torch.tensor(total_correct, dtype=torch.long, device=device)
     
-    # ---> اصلاح باگ: فقط در صورت فعال بودن DDP آل ردوس کن <---
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
 
@@ -370,7 +396,6 @@ def setup_distributed():
             print(f"Distributed: rank {rank}/{world_size}, local_rank {local_rank}")
         return device, local_rank, rank, world_size
     else:
-        # ---> اصلاح: برای یک GPU هم به طور صریح cuda:0 بده تا تداخلی پیش نیاید <---
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         return device, 0, 0, 1
 
@@ -401,7 +426,7 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
     with open(save_path, 'w') as f:
         json.dump(output_data, f, indent=4)
     
-    print(f"✅ Predictions JSON saved to: {save_path}")
+    print(f" Predictions JSON saved to: {save_path}")
 
 
 # ================== NEW HELPER: REAL/FAKE METRICS ==================
@@ -409,7 +434,6 @@ def compute_real_fake_metrics(y_true, y_pred):
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     
-    # Real = 1, Fake = 0
     real_precision, real_recall, real_f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=[1], average=None, zero_division=0
     )
@@ -425,14 +449,10 @@ def compute_real_fake_metrics(y_true, y_pred):
     fake_f1 = fake_f1[0]
     
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])  # Fake=0, Real=1
-    # cm:
-    # [[TN_fake, FP_fake],   → Actual Fake
-    #  [FN_real, TP_real]]   → Actual Real
-    TN, FP, FN, TP = cm.ravel()   # از دید کلاس Real (مثبت = 1)
+    TN, FP, FN, TP = cm.ravel()
     
-    # Specificity
-    real_specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0   # Specificity of Real = Recall of Fake
-    fake_specificity = TP / (TP + FN) if (TP + FN) > 0 else 0.0   # Specificity of Fake = Recall of Real
+    real_specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+    fake_specificity = TP / (TP + FN) if (TP + FN) > 0 else 0.0
     
     metrics = {
         'real': {
@@ -476,31 +496,28 @@ def print_real_fake_metrics(metrics, title="REAL/FAKE METRICS"):
     print(f"{'='*70}")
 
 
-# ================== NEW HELPER: LATENCY / THROUGHPUT / COMPUTE TIME ==================
-
+# ================== LATENCY / THROUGHPUT / COMPUTE TIME ==================
+# NOTE: تابع قدیمی حفظ شده ولی دیگر استفاده نمی‌شود (طبق درخواست دست‌نخورده).
 @torch.no_grad()
 def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
   
     model.eval()
     
-    # ---- Pre-cache کل داده تست روی CPU برای حذف زمان data loading ----
     cached_images = []
     for images, _ in loader:
         cached_images.append(images)
-    cached_images = torch.cat(cached_images, dim=0)  # (N, C, H, W) on CPU
+    cached_images = torch.cat(cached_images, dim=0)
     N = cached_images.size(0)
     
     bs_lat = 1
     bs_tp = 16
     
-    # ---- Warmup ----
     warmup_img = cached_images[:bs_tp].to(device)
     for _ in range(3):
         _ = model(warmup_img)
     if device.type == 'cuda':
         torch.cuda.synchronize()
     
-    # ============ Latency (bs=1) ============
     lat_runs = []
     for _ in range(num_runs):
         if device.type == 'cuda':
@@ -512,11 +529,10 @@ def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
         if device.type == 'cuda':
             torch.cuda.synchronize()
         t1 = time.perf_counter()
-        lat_runs.append((t1 - t0) / N * 1000.0)  # ms per image
+        lat_runs.append((t1 - t0) / N * 1000.0)
     lat_mean = float(np.mean(lat_runs))
     lat_std = float(np.std(lat_runs))
     
-    # ============ Throughput (bs=16) ============
     tp_runs = []
     for _ in range(num_runs):
         if device.type == 'cuda':
@@ -528,11 +544,10 @@ def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
         if device.type == 'cuda':
             torch.cuda.synchronize()
         t1 = time.perf_counter()
-        tp_runs.append(N / (t1 - t0))  # images/sec
+        tp_runs.append(N / (t1 - t0))
     tp_mean = float(np.mean(tp_runs))
     tp_std = float(np.std(tp_runs))
     
-    # ============ Computational Time (whole test set, no data loading) ============
     ct_runs = []
     for _ in range(num_runs):
         if device.type == 'cuda':
@@ -544,7 +559,7 @@ def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
         if device.type == 'cuda':
             torch.cuda.synchronize()
         t1 = time.perf_counter()
-        ct_runs.append(t1 - t0)  # seconds
+        ct_runs.append(t1 - t0)
     ct_mean = float(np.mean(ct_runs))
     ct_std = float(np.std(ct_runs))
     
@@ -573,10 +588,10 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
     acc = 100.0 * correct / total if total > 0 else 0.0
     
-    TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)  # Real correctly predicted
-    TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)  # Fake correctly predicted
-    FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)  # Fake predicted as Real
-    FN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 0)  # Real predicted as Fake
+    TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
+    TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
+    FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
+    FN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 0)
 
     lines = []
     lines.append("="*70)
@@ -601,7 +616,6 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     lines.append(f"Recall: {recall:.4f}")
     lines.append(f"Specificity: {specificity:.4f}")
 
-    # ===== NEW: Real/Fake Metrics =====
     rf = compute_real_fake_metrics(y_true, y_pred)
     lines.append("\n" + "="*70)
     lines.append("REAL/FAKE METRICS")
@@ -614,7 +628,6 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
                      f"{m['f1']:<12.4f} {m['specificity']:<12.4f}")
     lines.append("-"*70)
     lines.append(f"Macro F1: {rf['macro_f1']:.4f}")
-    # ==================================
     
     lines.append("-" * 70)
     lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test):")
@@ -628,7 +641,7 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     with open(save_path, 'w') as f:
         f.write("\n".join(lines))
     
-    print(f"✅ Accuracy log (Console-Accurate) saved to: {save_path}")
+    print(f" Accuracy log (Console-Accurate) saved to: {save_path}")
 
 
 # ================== MAIN FUNCTION ==================
@@ -757,9 +770,12 @@ def main():
             rf_metrics = compute_real_fake_metrics(y_true, y_pred)
             print_real_fake_metrics(rf_metrics, title="STACKING ENSEMBLE — REAL/FAKE METRICS")
             
-            # ============ LATENCY / THROUGHPUT ============
-            perf_metrics = measure_latency_throughput(
-                ensemble_module, test_loader, device, is_main=is_main
+            # ============ LATENCY / THROUGHPUT (REPLACED) ============
+            adapter = _StackingBenchmarkAdapter(ensemble_module).to(device)
+            perf_metrics = benchmark_efficiency(
+                adapter, test_loader, device, MODEL_NAMES,
+                latency_samples=min(300, len(test_loader.dataset)),
+                verbose=is_main,
             )
             
             json_path = os.path.join(current_save_dir, 'test_predictions.json')
