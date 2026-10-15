@@ -326,7 +326,7 @@ def setup_distributed():
         device = torch.device(f'cuda:{local_rank}')
         return device, local_rank, rank, world_size
     else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         return device, 0, 0, 1
 
 def cleanup_distributed():
@@ -336,33 +336,23 @@ def cleanup_distributed():
 
 # ================== NEW HELPER: REAL/FAKE METRICS ==================
 def compute_real_fake_metrics(y_true, y_pred):
-    """
-    محاسبه متریک‌های جداگانه برای کلاس Real (0) و Fake (1)
-    """
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     
-    # Real metrics (کلاس 0 به عنوان مثبت)
+    # Real = 1, Fake = 0
     real_precision, real_recall, real_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=[0], average=None, zero_division=0
-    )
-    real_precision = real_precision[0]
-    real_recall = real_recall[0]
-    real_f1 = real_f1[0]
-    
-    # Fake metrics (کلاس 1 به عنوان مثبت)
-    fake_precision, fake_recall, fake_f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=[1], average=None, zero_division=0
     )
-    fake_precision = fake_precision[0]
-    fake_recall = fake_recall[0]
-    fake_f1 = fake_f1[0]
+    real_precision, real_recall, real_f1 = real_precision[0], real_recall[0], real_f1[0]
     
-    # Confusion matrix
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    TN, FP, FN, TP = cm.ravel()  # Real=0, Fake=1
+    fake_precision, fake_recall, fake_f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=[0], average=None, zero_division=0
+    )
+    fake_precision, fake_recall, fake_f1 = fake_precision[0], fake_recall[0], fake_f1[0]
     
-    # Specificity برای هر کلاس
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])  # Fake=0, Real=1
+    TN, FP, FN, TP = cm.ravel()   # از دید کلاس Real (مثبت=1)
+    
     real_specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
     fake_specificity = TP / (TP + FN) if (TP + FN) > 0 else 0.0
     
@@ -372,14 +362,14 @@ def compute_real_fake_metrics(y_true, y_pred):
             'recall': float(real_recall),
             'f1': float(real_f1),
             'specificity': float(real_specificity),
-            'support': int(np.sum(y_true == 0))
+            'support': int(np.sum(y_true == 1))
         },
         'fake': {
             'precision': float(fake_precision),
             'recall': float(fake_recall),
             'f1': float(fake_f1),
             'specificity': float(fake_specificity),
-            'support': int(np.sum(y_true == 1))
+            'support': int(np.sum(y_true == 0))
         },
         'macro_f1': float((real_f1 + fake_f1) / 2),
         'confusion_matrix': {
@@ -411,12 +401,7 @@ def print_real_fake_metrics(metrics, title="REAL/FAKE METRICS"):
 # ================== NEW HELPER: LATENCY / THROUGHPUT / COMPUTE TIME ==================
 @torch.no_grad()
 def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
-    """
-    اندازه‌گیری دقیق Latency / Throughput / Computational Time
-    - Latency: batch_size=1, mean±std of num_runs runs
-    - Throughput: batch_size=16, mean±std of num_runs runs
-    - Computational Time: کل تست‌ست، num_runs پاس، بدون احتساب data loading
-    """
+    
     model.eval()
     
     # ---- Pre-cache کل داده تست روی CPU برای حذف زمان data loading ----
@@ -528,9 +513,9 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     lines.append(f"Incorrect Predictions: {total - correct}")
     
     lines.append("\nConfusion Matrix:")
-    lines.append(f"                 Predicted Real  Predicted Fake")
-    lines.append(f"    Actual Real   {TP:<15} {FN:<15}")
-    lines.append(f"    Actual Fake   {FP:<15} {TN:<15}")
+    lines.append(f"                 Predicted Fake  Predicted Real")
+    lines.append(f"    Actual Fake   {TN:<15} {FP:<15}")
+    lines.append(f"    Actual Real   {FN:<15} {TP:<15}")
     
     lines.append("\nClassification Metrics:")
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
