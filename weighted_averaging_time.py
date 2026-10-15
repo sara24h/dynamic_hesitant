@@ -10,12 +10,11 @@ import warnings
 import argparse
 import json
 import random
-import matplotlib.pyplot as plt
-import seaborn as sns
+import time
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
 from metrics_utils import plot_roc_and_f1
-from efficiency_utils import Stopwatch, summarize_training_times, benchmark_efficiency, print_headline
 
 warnings.filterwarnings("ignore")
 
@@ -227,81 +226,15 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         
         final_weights = last_weights.numpy() if last_weights is not None else np.zeros(len(model_names))
 
-        # ================== Confusion Matrix + All Real/Fake Metrics ==================
-        TP = sum(1 for yt, yp in zip(all_y_true, all_y_pred) if yt == 1 and yp == 1)
-        TN = sum(1 for yt, yp in zip(all_y_true, all_y_pred) if yt == 0 and yp == 0)
-        FP = sum(1 for yt, yp in zip(all_y_true, all_y_pred) if yt == 0 and yp == 1)
-        FN = sum(1 for yt, yp in zip(all_y_true, all_y_pred) if yt == 1 and yp == 0)
-
-        # Real (1) Class Metrics
-        precision_real = TP / (TP + FP) if (TP + FP) > 0 else 0
-        recall_real    = TP / (TP + FN) if (TP + FN) > 0 else 0
-        f1_real        = 2 * precision_real * recall_real / (precision_real + recall_real) if (precision_real + recall_real) > 0 else 0
-
-        # Fake (0) Class Metrics
-        precision_fake = TN / (TN + FN) if (TN + FN) > 0 else 0
-        recall_fake    = TN / (TN + FP) if (TN + FP) > 0 else 0
-        f1_fake        = 2 * precision_fake * recall_fake / (precision_fake + recall_fake) if (precision_fake + recall_fake) > 0 else 0
-
-        # Macro Averages
-        macro_precision = (precision_real + precision_fake) / 2
-        macro_recall    = (recall_real + recall_fake) / 2
-        macro_f1        = (f1_real + f1_fake) / 2
-
-        # Balanced Accuracy
-        balanced_acc = ((recall_real + recall_fake) / 2) * 100
-
         print(f"\n{'='*70}")
         print(f"{name.upper()} SET RESULTS (Weighted Average)")
         print(f"{'='*70}")
-        print(f"Accuracy          : {acc:.2f}%")
-        print(f"Balanced Accuracy : {balanced_acc:.2f}%")
-        print(f"Macro-F1          : {macro_f1:.4f}")
-        print()
-        print(f"{'Class':<12} {'Precision':>10} {'Recall':>10} {'F1-Score':>10}")
-        print("-" * 45)
-        print(f"{'Fake (0)':<12} {precision_fake:10.4f} {recall_fake:10.4f} {f1_fake:10.4f}")
-        print(f"{'Real (1)':<12} {precision_real:10.4f} {recall_real:10.4f} {f1_real:10.4f}")
-        print("-" * 45)
-        print(f"{'Macro Avg':<12} {macro_precision:10.4f} {macro_recall:10.4f} {macro_f1:10.4f}")
+        print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Samples: {total_samples:,}")
-        print(f"\nConfusion Matrix:")
-        print(f"                 Predicted Real  Predicted Fake")
-        print(f"    Actual Real      {int(TP):<15} {int(FN):<15}")
-        print(f"    Actual Fake      {int(FP):<15} {int(TN):<15}")
         print(f"\nLearned Model Weights (Global):")
         for i, (w, mname) in enumerate(zip(final_weights, model_names)):
             print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
         print(f"{'='*70}")
-
-        # ================== Confusion Matrix Plot ==================
-        cm = np.array([[TN, FP],
-                       [FN, TP]])
-
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(
-            cm,
-            annot=True,
-            fmt='d',
-            cmap='Blues',
-            xticklabels=['Predicted Fake', 'Predicted Real'],
-            yticklabels=['Actual Fake', 'Actual Real'],
-            cbar=True,
-            annot_kws={"size": 16}
-        )
-        plt.title(f'Confusion Matrix\nAccuracy: {acc:.2f}% | Balanced Acc: {balanced_acc:.2f}% | Macro-F1: {macro_f1:.4f}',
-                  fontsize=13, fontweight='bold')
-        plt.ylabel('True Label', fontsize=12)
-        plt.xlabel('Predicted Label', fontsize=12)
-        plt.tight_layout()
-        try:
-            save_dir_for_cm = os.path.join(args_save_dir_global, 'confusion_matrix.png') if 'args_save_dir_global' in globals() else 'confusion_matrix.png'
-            plt.savefig(save_dir_for_cm, dpi=300, bbox_inches='tight')
-            print(f"✅ Confusion Matrix saved to: {save_dir_for_cm}")
-        except Exception:
-            pass
-        plt.close()
-
         return acc, final_weights.tolist(), (all_y_true, all_y_score, all_y_pred)
     
     return 0.0, [0.0]*len(model_names), ([], [], [])
@@ -320,17 +253,12 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
     best_val_acc = 0.0
     history = {'train_loss': [], 'train_acc': [], 'val_acc': [], 'model_weights': []}
 
-    # ================== Timing ==================
-    epoch_times, train_times, val_times = [], [], []
-    total_sw = Stopwatch(device).start()
-
     if is_main:
         print("="*70)
         print("Training Weighted Average Ensemble")
         print("="*70)
 
     for epoch in range(num_epochs):
-        epoch_sw = Stopwatch(device).start()
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
         
@@ -363,30 +291,15 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
 
         train_acc = 100. * train_correct / train_total
         train_loss = train_loss / train_total
-
-        t_train = epoch_sw.stop()
         
         current_weights = F.softmax(weights_param, dim=0).detach().cpu()
-        
-        val_sw = Stopwatch(device).start()
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
-        t_val = val_sw.stop()
-        t_epoch = epoch_sw.stop()
-        epoch_times.append(t_epoch); train_times.append(t_train); val_times.append(t_val)
         scheduler.step()
 
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
         history['model_weights'].append(current_weights.numpy().tolist())
-
-        if is_main:
-            print(f"\n{'='*70}")
-            print(f"Epoch {epoch+1}/{num_epochs}")
-            print(f"{'='*70}")
-            print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-            print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
-            print(f"Time: epoch {t_epoch:.1f}s (train {t_train:.1f}s | val {t_val:.1f}s)")
 
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -399,19 +312,7 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
             }, save_path)
             print(f"\n✓ Best model saved → {val_acc:.2f}%")
 
-    total_time = total_sw.stop()
-
-    if is_main:
-        timing = summarize_training_times(epoch_times, train_times, val_times, total_time)
-        print(f"\nTotal training time: {total_time/60:.2f} min "
-              f"(mean epoch: {timing['mean_epoch_time_s']:.1f}s)")
-
-    return best_val_acc, history, {
-        'epoch_times': epoch_times,
-        'train_times': train_times,
-        'val_times': val_times,
-        'total_time_s': total_time
-    }
+    return best_val_acc, history
 
 
 # ================== DISTRIBUTED SETUP ==================
@@ -432,6 +333,175 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
+
+# ================== NEW HELPER: REAL/FAKE METRICS ==================
+def compute_real_fake_metrics(y_true, y_pred):
+    """
+    محاسبه متریک‌های جداگانه برای کلاس Real (0) و Fake (1)
+    """
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    
+    # Real metrics (کلاس 0 به عنوان مثبت)
+    real_precision, real_recall, real_f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=[0], average=None, zero_division=0
+    )
+    real_precision = real_precision[0]
+    real_recall = real_recall[0]
+    real_f1 = real_f1[0]
+    
+    # Fake metrics (کلاس 1 به عنوان مثبت)
+    fake_precision, fake_recall, fake_f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=[1], average=None, zero_division=0
+    )
+    fake_precision = fake_precision[0]
+    fake_recall = fake_recall[0]
+    fake_f1 = fake_f1[0]
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    TN, FP, FN, TP = cm.ravel()  # Real=0, Fake=1
+    
+    # Specificity برای هر کلاس
+    real_specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+    fake_specificity = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+    
+    metrics = {
+        'real': {
+            'precision': float(real_precision),
+            'recall': float(real_recall),
+            'f1': float(real_f1),
+            'specificity': float(real_specificity),
+            'support': int(np.sum(y_true == 0))
+        },
+        'fake': {
+            'precision': float(fake_precision),
+            'recall': float(fake_recall),
+            'f1': float(fake_f1),
+            'specificity': float(fake_specificity),
+            'support': int(np.sum(y_true == 1))
+        },
+        'macro_f1': float((real_f1 + fake_f1) / 2),
+        'confusion_matrix': {
+            'TN': int(TN), 'FP': int(FP), 'FN': int(FN), 'TP': int(TP)
+        }
+    }
+    return metrics
+
+
+def print_real_fake_metrics(metrics, title="REAL/FAKE METRICS"):
+    print(f"\n{'='*70}")
+    print(title)
+    print(f"{'='*70}")
+    print(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'F1':<12} {'Specificity':<12} {'Support':<10}")
+    print(f"{'-'*70}")
+    for cls in ['real', 'fake']:
+        m = metrics[cls]
+        print(f"{cls.upper():<10} {m['precision']:<12.4f} {m['recall']:<12.4f} "
+              f"{m['f1']:<12.4f} {m['specificity']:<12.4f} {m['support']:<10}")
+    print(f"{'-'*70}")
+    print(f"Macro F1: {metrics['macro_f1']:.4f}")
+    print(f"Confusion Matrix: TN={metrics['confusion_matrix']['TN']}, "
+          f"FP={metrics['confusion_matrix']['FP']}, "
+          f"FN={metrics['confusion_matrix']['FN']}, "
+          f"TP={metrics['confusion_matrix']['TP']}")
+    print(f"{'='*70}")
+
+
+# ================== NEW HELPER: LATENCY / THROUGHPUT / COMPUTE TIME ==================
+@torch.no_grad()
+def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
+    """
+    اندازه‌گیری دقیق Latency / Throughput / Computational Time
+    - Latency: batch_size=1, mean±std of num_runs runs
+    - Throughput: batch_size=16, mean±std of num_runs runs
+    - Computational Time: کل تست‌ست، num_runs پاس، بدون احتساب data loading
+    """
+    model.eval()
+    
+    # ---- Pre-cache کل داده تست روی CPU برای حذف زمان data loading ----
+    cached_images = []
+    for images, _ in loader:
+        cached_images.append(images)
+    cached_images = torch.cat(cached_images, dim=0)  # (N, C, H, W) on CPU
+    N = cached_images.size(0)
+    
+    bs_lat = 1
+    bs_tp = 16
+    
+    # ---- Warmup ----
+    warmup_img = cached_images[:bs_tp].to(device)
+    for _ in range(3):
+        _ = model(warmup_img)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    
+    # ============ Latency (bs=1) ============
+    lat_runs = []
+    for _ in range(num_runs):
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for i in range(N):
+            img = cached_images[i:i+bs_lat].to(device)
+            _ = model(img)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        lat_runs.append((t1 - t0) / N * 1000.0)  # ms per image
+    lat_mean = float(np.mean(lat_runs))
+    lat_std = float(np.std(lat_runs))
+    
+    # ============ Throughput (bs=16) ============
+    tp_runs = []
+    for _ in range(num_runs):
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for i in range(0, N, bs_tp):
+            img = cached_images[i:i+bs_tp].to(device)
+            _ = model(img)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        tp_runs.append(N / (t1 - t0))  # images/sec
+    tp_mean = float(np.mean(tp_runs))
+    tp_std = float(np.std(tp_runs))
+    
+    # ============ Computational Time (whole test set, no data loading) ============
+    ct_runs = []
+    for _ in range(num_runs):
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for i in range(0, N, bs_tp):
+            img = cached_images[i:i+bs_tp].to(device)
+            _ = model(img)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        ct_runs.append(t1 - t0)  # seconds
+    ct_mean = float(np.mean(ct_runs))
+    ct_std = float(np.std(ct_runs))
+    
+    results = {
+        'num_test_images': int(N),
+        'num_runs': int(num_runs),
+        'latency_bs1_ms_per_image': {'mean': lat_mean, 'std': lat_std},
+        'throughput_bs16_images_per_sec': {'mean': tp_mean, 'std': tp_std},
+        'computational_time_sec': {'mean': ct_mean, 'std': ct_std}
+    }
+    
+    if is_main:
+        print("="*70)
+        print(f"Latency (bs=1)          : {lat_mean:.2f} ± {lat_std:.2f} ms / image")
+        print(f"Throughput (bs=16)      : {tp_mean:.1f} ± {tp_std:.1f} images/s (mean ± std of {num_runs} runs)")
+        print(f"Computational time      : {ct_mean:.2f} ± {ct_std:.2f} s (model inference on the whole test set, {N} images, mean of {num_runs} passes; data loading excluded)")
+        print("="*70)
+    
+    return results
+
+
 # ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     """
@@ -447,44 +517,15 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
     FN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 0)
 
-    # Real (1) Metrics
-    precision_real = TP / (TP + FP) if (TP + FP) > 0 else 0
-    recall_real    = TP / (TP + FN) if (TP + FN) > 0 else 0
-    f1_real        = 2 * precision_real * recall_real / (precision_real + recall_real) if (precision_real + recall_real) > 0 else 0
-
-    # Fake (0) Metrics
-    precision_fake = TN / (TN + FN) if (TN + FN) > 0 else 0
-    recall_fake    = TN / (TN + FP) if (TN + FP) > 0 else 0
-    f1_fake        = 2 * precision_fake * recall_fake / (precision_fake + recall_fake) if (precision_fake + recall_fake) > 0 else 0
-
-    # Macro
-    macro_precision = (precision_real + precision_fake) / 2
-    macro_recall    = (recall_real + recall_fake) / 2
-    macro_f1        = (f1_real + f1_fake) / 2
-
-    balanced_acc = ((recall_real + recall_fake) / 2) * 100
-
     lines = []
     lines.append("="*70)
     lines.append(f"SUMMARY STATISTICS (Exact Console Match)")
     lines.append(f"Model: {model_name}")
     lines.append("="*70)
-    lines.append(f"Accuracy          : {acc:.3f}%")
-    lines.append(f"Balanced Accuracy : {balanced_acc:.2f}%")
-    lines.append(f"Macro-F1          : {macro_f1:.4f}")
-    lines.append(f"Total Samples     : {total}")
+    lines.append(f"Accuracy: {acc:.3f}%")
+    lines.append(f"Total Samples: {total}")
     lines.append(f"Correct Predictions: {correct}")
     lines.append(f"Incorrect Predictions: {total - correct}")
-
-    lines.append("\n--- Real (1) Class Metrics ---")
-    lines.append(f"Precision (Real): {precision_real:.4f}")
-    lines.append(f"Recall (Real):    {recall_real:.4f}")
-    lines.append(f"F1-Score (Real):  {f1_real:.4f}")
-
-    lines.append("\n--- Fake (0) Class Metrics ---")
-    lines.append(f"Precision (Fake): {precision_fake:.4f}")
-    lines.append(f"Recall (Fake):    {recall_fake:.4f}")
-    lines.append(f"F1-Score (Fake):  {f1_fake:.4f}")
     
     lines.append("\nConfusion Matrix:")
     lines.append(f"                 Predicted Real  Predicted Fake")
@@ -492,9 +533,27 @@ def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
     lines.append(f"    Actual Fake   {FP:<15} {TN:<15}")
     
     lines.append("\nClassification Metrics:")
-    lines.append(f"Precision: {precision_real:.4f}")
-    lines.append(f"Recall: {recall_real:.4f}")
-    lines.append(f"Specificity: {recall_fake:.4f}")
+    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+    lines.append(f"Precision: {precision:.4f}")
+    lines.append(f"Recall: {recall:.4f}")
+    lines.append(f"Specificity: {specificity:.4f}")
+
+    # ===== NEW: Real/Fake Metrics =====
+    rf = compute_real_fake_metrics(y_true, y_pred)
+    lines.append("\n" + "="*70)
+    lines.append("REAL/FAKE METRICS")
+    lines.append("="*70)
+    lines.append(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'F1':<12} {'Specificity':<12}")
+    lines.append("-"*70)
+    for cls in ['real', 'fake']:
+        m = rf[cls]
+        lines.append(f"{cls.upper():<10} {m['precision']:<12.4f} {m['recall']:<12.4f} "
+                     f"{m['f1']:<12.4f} {m['specificity']:<12.4f}")
+    lines.append("-"*70)
+    lines.append(f"Macro F1: {rf['macro_f1']:.4f}")
+    # ==================================
     
     lines.append("-" * 70)
     lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test):")
@@ -532,7 +591,6 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
 
 # ================== MAIN FUNCTION ==================
 def main():
-    global args_save_dir_global
     parser = argparse.ArgumentParser(description="Weighted Average Ensemble Training")
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.01)
@@ -548,16 +606,12 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
-    args_save_dir_global = args.save_dir
-
     if len(args.model_names) != len(args.model_paths):
         raise ValueError("Number of model_names must match model_paths")
 
     set_seed(args.seed)
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
-
-    pipeline_sw = Stopwatch(device).start()
 
     if is_main:
         print("="*70)
@@ -594,19 +648,17 @@ def main():
         print("\n" + "="*70); print("INDIVIDUAL MODEL PERFORMANCE"); print("="*70)
 
     individual_accs = []
-    individual_sw = Stopwatch(device).start()
     for i, model in enumerate(base_models):
         acc = evaluate_single_model_ddp(
             model, test_loader, device,
             f"Model {i+1} ({MODEL_NAMES[i]})",
             MEANS[i], STDS[i], is_main)
         individual_accs.append(acc)
-    individual_eval_time = individual_sw.stop()
 
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
 
-    best_val_acc, history, train_timing = train_weighted_ensemble(
+    best_val_acc, history = train_weighted_ensemble(
         ensemble, train_loader, val_loader,
         args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
@@ -619,11 +671,9 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    # ================== Benchmark Efficiency (Latency/Throughput) ==================
-    ensemble_sw = Stopwatch(device).start()
+    # دریافت خروجی‌ها برای JSON و Log
     ensemble_test_acc, ensemble_weights, predictions_data = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
-    ensemble_eval_time = ensemble_sw.stop()
 
     if is_main:
         print("\n" + "="*70)
@@ -636,6 +686,15 @@ def main():
 
         # استخراج لیست‌ها
         y_true, y_score, y_pred = predictions_data
+
+        # ============ REAL/FAKE METRICS ============
+        rf_metrics = compute_real_fake_metrics(y_true, y_pred)
+        print_real_fake_metrics(rf_metrics, title="WEIGHTED ENSEMBLE — REAL/FAKE METRICS")
+
+        # ============ LATENCY / THROUGHPUT ============
+        perf_metrics = measure_latency_throughput(
+            ensemble_module, test_loader, device, is_main=is_main
+        )
         
         # 1. ذخیره JSON
         json_path = os.path.join(args.save_dir, 'test_predictions.json')
@@ -651,7 +710,11 @@ def main():
             'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
             'ensemble': {'test_accuracy': float(ensemble_test_acc), 'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)}},
             'improvement': float(ensemble_test_acc - best_single),
-            'training_history': history
+            'training_history': history,
+            # ===== NEW =====
+            'real_fake_metrics': rf_metrics,
+            'performance_metrics': perf_metrics
+            # ===============
         }
 
         results_path = os.path.join(args.save_dir, 'final_results.json')
@@ -673,28 +736,6 @@ def main():
             ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
             args.num_grad_cam_samples, args.num_lime_samples,
             args.dataset, is_main)
-
-        # ================== Efficiency Report ==================
-        total_pipeline_time = pipeline_sw.stop()
-        efficiency = {
-            'individual_models_eval_time_s': float(individual_eval_time),
-            'ensemble_eval_time_s': float(ensemble_eval_time),
-            'training_time': train_timing,
-            'total_pipeline_time_s': float(total_pipeline_time)
-        }
-        efficiency_path = os.path.join(args.save_dir, 'efficiency_report.json')
-        with open(efficiency_path, 'w') as f:
-            json.dump(efficiency, f, indent=2)
-        print(f"Efficiency report saved: {efficiency_path}")
-
-        print("\n" + "="*70)
-        print("⏱️  TIMING SUMMARY")
-        print("="*70)
-        print(f"  Individual Models Eval : {individual_eval_time:.2f} s")
-        print(f"  Training Total         : {train_timing['total_time_s']:.2f} s")
-        print(f"  Ensemble Eval          : {ensemble_eval_time:.2f} s")
-        print(f"  Total Pipeline         : {total_pipeline_time:.2f} s")
-        print("="*70)
 
     cleanup_distributed()
     
