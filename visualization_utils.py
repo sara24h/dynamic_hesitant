@@ -76,7 +76,7 @@ def generate_lime_explanation(model, image_tensor, device, target_size=(256, 256
         return np.hstack([1 - probs, probs])
 
     explanation = explainer.explain_instance(
-        img_np, predict_fn, top_labels=1, hide_color=0, num_samples=1000)
+        img_np, predict_fn, top_labels=1, hide_color=0, num_samples=100)
     temp, mask = explanation.get_image_and_mask(
         explanation.top_labels[0], positive_only=True, num_features=10, hide_rest=True)
     lime_img = mark_boundaries(temp / 255.0, mask)
