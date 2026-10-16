@@ -17,7 +17,7 @@ class CustomGenAIDataset(Dataset):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
-      
+
         self.label_map = {'fake': 0, 'real': 1}
 
         print(f"[Old CustomDataset] Loading Fake images from: {fake_classes}")
@@ -55,14 +55,13 @@ class CustomGenAIDataset(Dataset):
 
 
 class NewGenAIDataset(Dataset):
-    
-   
+
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
         self.samples = []
         self.label_map = {'fake': 0, 'real': 1}
-        
+
         print(f"[NewGenAIDataset] Scanning recursively in: {root_dir}")
 
         if not os.path.exists(root_dir):
@@ -73,25 +72,23 @@ class NewGenAIDataset(Dataset):
         for dirpath, dirnames, filenames in os.walk(self.root_dir):
             # نام پوشه جاری را بررسی می‌کنیم
             current_folder_name = os.path.basename(dirpath)
-            
+
             # اگر به پوشه real یا fake رسیدیم، عکس‌ها را لود کن
             if current_folder_name in ['real', 'fake']:
                 label = self.label_map[current_folder_name]
-                
+
                 # فیلتر کردن فایل‌های تصویری
                 valid_files = [f for f in filenames if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                
+
                 if valid_files:
-                    # نمایش مسیر نسبی پیدا شده برای اطلاع کاربر
                     relative_path = os.path.relpath(dirpath, self.root_dir)
-                    # print(f"  - Found {len(valid_files)} images in: {relative_path}/") # Optional print
-                    
+
                     for img_file in valid_files:
                         img_path = os.path.join(dirpath, img_file)
                         self.samples.append((img_path, label))
 
         print(f"[NewGenAIDataset] Total loaded images: {len(self.samples)}")
-        
+
         if len(self.samples) == 0:
             print("[Error] No images found! Please check the root directory path and ensure folders are named 'real' or 'fake'.")
 
@@ -136,6 +133,83 @@ class UADFVDataset(Dataset):
         return image, label
 
 
+# ================== NEW: ArtiFace DATASET ==================
+
+class ArtiFaceDataset(Dataset):
+    """
+    دیتاست ArtiFace با ساختار:
+    root_dir/
+        Fake/
+            ProjectedGAN/
+            Stable_Diffusion/
+            StarGAN/
+            Taming_Transformer/
+        Real/
+            CIPS/
+            FFHQ/
+    """
+
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.samples = []
+        self.label_map = {'Fake': 0, 'Real': 1}
+
+        print(f"[ArtiFaceDataset] Scanning: {root_dir}")
+
+        if not os.path.exists(root_dir):
+            print(f"[Error] Root directory does not exist: {root_dir}")
+            return
+
+        # ---------- Fake ----------
+        fake_root = os.path.join(root_dir, 'Fake')
+        if os.path.exists(fake_root):
+            for subdir in sorted(os.listdir(fake_root)):
+                subdir_path = os.path.join(fake_root, subdir)
+                if os.path.isdir(subdir_path):
+                    valid_files = [
+                        f for f in os.listdir(subdir_path)
+                        if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+                    ]
+                    for img_file in valid_files:
+                        img_path = os.path.join(subdir_path, img_file)
+                        self.samples.append((img_path, self.label_map['Fake']))
+                    print(f"  - Fake/{subdir}: {len(valid_files)} images")
+        else:
+            print(f"[Warning] Path not found: {fake_root}")
+
+        # ---------- Real ----------
+        real_root = os.path.join(root_dir, 'Real')
+        if os.path.exists(real_root):
+            for subdir in sorted(os.listdir(real_root)):
+                subdir_path = os.path.join(real_root, subdir)
+                if os.path.isdir(subdir_path):
+                    valid_files = [
+                        f for f in os.listdir(subdir_path)
+                        if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+                    ]
+                    for img_file in valid_files:
+                        img_path = os.path.join(subdir_path, img_file)
+                        self.samples.append((img_path, self.label_map['Real']))
+                    print(f"  - Real/{subdir}: {len(valid_files)} images")
+        else:
+            print(f"[Warning] Path not found: {real_root}")
+
+        print(f"[ArtiFaceDataset] Total loaded images: {len(self.samples)}")
+        if len(self.samples) == 0:
+            print("[Error] No images found! Please check the root directory structure.")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
 class TransformSubset(Subset):
     """Subset with custom transform that bypasses dataset's transform if necessary."""
     def __init__(self, dataset, indices, transform):
@@ -145,7 +219,7 @@ class TransformSubset(Subset):
     def __getitem__(self, idx):
         # Use the index mapping to get the original data from the underlying dataset
         original_idx = self.indices[idx]
-        
+
         # Try to get raw data (path, label) to avoid double transform if dataset already has one
         if hasattr(self.dataset, 'samples'):
             img_path, label = self.dataset.samples[original_idx]
@@ -173,7 +247,7 @@ def get_sample_info(dataset, index):
 
 
 def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42):
-   
+
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
     num_samples = len(dataset)
     indices = list(range(num_samples))
@@ -182,14 +256,14 @@ def create_standard_reproducible_split(dataset, train_ratio=0.7, val_ratio=0.15,
     # Split Train+Val vs Test
     train_val_indices, test_indices = train_test_split(
         indices, test_size=test_ratio, random_state=42, stratify=labels)
-    
+
     # Calculate adjusted ratio for Val
     val_size_adjusted = val_ratio / (train_ratio + val_ratio)
-    
+
     # Split Train vs Val
     train_indices, val_indices = train_test_split(
         train_val_indices, test_size=val_size_adjusted, random_state=42, stratify=[labels[i] for i in train_val_indices])
-        
+
     return train_indices, val_indices, test_indices
 
 
@@ -209,33 +283,33 @@ def create_video_level_uadfV_split(dataset, train_ratio=0.7, val_ratio=0.15, tes
     train_val_ids, test_ids = train_test_split(all_video_ids, test_size=test_ratio, random_state=42)
     val_size_adjusted = val_ratio / (train_ratio + val_ratio)
     train_ids, val_ids = train_test_split(train_val_ids, test_size=val_size_adjusted, random_state=42)
-    
+
     train_indices, val_indices, test_indices = [], [], []
-    
+
     for idx, (img_path, label) in enumerate(dataset.samples):
         dir_name = os.path.basename(os.path.dirname(img_path))
         if '_fake' in dir_name:
             vid_id = dir_name.replace('_fake', '')
         else:
             vid_id = dir_name
-            
+
         if vid_id in test_ids: test_indices.append(idx)
         elif vid_id in val_ids: val_indices.append(idx)
         elif vid_id in train_ids: train_indices.append(idx)
-            
+
     return train_indices, val_indices, test_indices
 
 
 def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
-   
+
     # دیکشنری دیتاست‌ها: نام دیتاست -> لیست نام پوشه‌ها [fake_folder_name, real_folder_name]
     dataset_paths = {
         'real_fake': ['training_fake', 'training_real'],
         'hard_fake_real': ['fake', 'real'],
         'deepflux': ['Fake', 'Real'],
-        'real_fake_dataset': ['face_fake', 'face_real'], 
+        'real_fake_dataset': ['face_fake', 'face_real'],
         # اضافه شده: دیتاست جدید با پوشه‌های training_fake و training_real
-        'deepfake_lab': ['training_fake', 'training_real'], 
+        'deepfake_lab': ['training_fake', 'training_real'],
         # اضافه شده: دیتاست Deep-vs-Real با پوشه‌های Deepfake و Real
         '20k': ['Deepfake', 'Real'],
     }
@@ -247,16 +321,16 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         real_folder = 'Real'
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = CustomGenAIDataset(
-            base_dir, 
-            fake_classes=fake_folders, 
-            real_class=real_folder, 
+            base_dir,
+            fake_classes=fake_folders,
+            real_class=real_folder,
             transform=temp_transform
         )
         print("[Dataset Loading] Custom GenAI (Old) Dataset loaded.")
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
             full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42
         )
-        
+
     elif dataset_type == 'custom_genai_v2':
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = NewGenAIDataset(base_dir, transform=temp_transform)
@@ -264,6 +338,16 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         train_indices, val_indices, test_indices = create_standard_reproducible_split(
             full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42
         )
+
+    # ================== NEW: ArtiFace branch ==================
+    elif dataset_type == 'artiface':
+        temp_transform = transforms.Compose([transforms.ToTensor()])
+        full_dataset = ArtiFaceDataset(base_dir, transform=temp_transform)
+        print("[Dataset Loading] ArtiFace Dataset loaded.")
+        train_indices, val_indices, test_indices = create_standard_reproducible_split(
+            full_dataset, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, seed=42
+        )
+    # ===========================================================
 
     elif dataset_type == 'uadfV':
         if not os.path.exists(base_dir):
@@ -274,7 +358,7 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
 
         from collections import Counter
 
-        for name, indices in [ ("Train", train_indices),("Validation", val_indices),("Test", test_indices),]:
+        for name, indices in [("Train", train_indices), ("Validation", val_indices), ("Test", test_indices), ]:
             counter = Counter()
 
             for idx in indices:
@@ -284,27 +368,24 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
             print(f"\n{name}")
             print(f" Fake: {counter[0]}")
             print(f" Real: {counter[1]}")
-        
+
     elif dataset_type in dataset_paths:
         folders = dataset_paths[dataset_type]
-        
+
         # بررسی وجود فولدرها
-        # چک کردن مستقیم در base_dir
         dataset_dir = base_dir
         if not all(os.path.exists(os.path.join(dataset_dir, f)) for f in folders):
-            # اگر پیدا نشد، یک لایه پایین‌تر را هم چک می‌کنیم (ساختار رایج دیتاست‌ها)
-            # معمولا پوشه اصلی نام دیتاست است
+            # اگر پیدا نشد، یک لایه پایین‌تر را هم چک می‌کنیم
             possible_sub_dir = os.path.join(base_dir, dataset_type)
             if all(os.path.exists(os.path.join(possible_sub_dir, f)) for f in folders):
                 dataset_dir = possible_sub_dir
             else:
-                # تلاش دیگر: نام پوشه بر اساس کلید ممکن است کمی متفاوت باشد (مثلا real_and_fake_face)
-                # اینجا فقط یک چک ساده می‌کنیم
-                raise FileNotFoundError(f"Could not find dataset folders {folders} in {base_dir} or {possible_sub_dir}")
-        
+                raise FileNotFoundError(
+                    f"Could not find dataset folders {folders} in {base_dir} or {possible_sub_dir}")
+
         temp_transform = transforms.Compose([transforms.ToTensor()])
         full_dataset = datasets.ImageFolder(dataset_dir, transform=temp_transform)
-        
+
         # استفاده از نسبت 70-15-15 برای این دیتاست‌ها
         train_indices, val_indices, test_indices = create_standard_reproducible_split(full_dataset, seed=42)
     else:
@@ -323,9 +404,9 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
                        dataset_type: str = 'wild', is_distributed: bool = False,
                        seed: int = 42, is_main: bool = True):
     if is_main:
-        print("="*70)
+        print("=" * 70)
         print(f"Creating DataLoaders (Dataset: {dataset_type})")
-        print("="*70)
+        print("=" * 70)
 
     train_transform = transforms.Compose([
         transforms.Resize(256),
@@ -365,31 +446,31 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
         test_sampler = DistributedSampler(datasets_dict['test'], shuffle=False) if is_distributed else None
 
         train_loader = DataLoader(datasets_dict['train'], batch_size=batch_size,
-                                 shuffle=(train_sampler is None), sampler=train_sampler,
-                                 num_workers=num_workers, pin_memory=True, drop_last=True,
-                                 worker_init_fn=worker_init_fn)
+                                  shuffle=(train_sampler is None), sampler=train_sampler,
+                                  num_workers=num_workers, pin_memory=True, drop_last=True,
+                                  worker_init_fn=worker_init_fn)
         val_loader = DataLoader(datasets_dict['valid'], batch_size=batch_size,
-                               shuffle=False, sampler=val_sampler,
-                               num_workers=num_workers, pin_memory=True, drop_last=False,
-                               worker_init_fn=worker_init_fn)
-        test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size,
-                                shuffle=False, sampler=test_sampler,
+                                shuffle=False, sampler=val_sampler,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(datasets_dict['test'], batch_size=batch_size,
+                                 shuffle=False, sampler=test_sampler,
+                                 num_workers=num_workers, pin_memory=True, drop_last=False,
+                                 worker_init_fn=worker_init_fn)
     else:
-        # این بخش برای دیتاست شما (real_and_fake_face) اجرا می‌شود
+        # این بخش برای دیتاست‌های سفارشی (real_and_fake_face, artiface, ...) اجرا می‌شود
         if is_main:
             print(f"Processing {dataset_type} dataset from: {base_dir}")
-            
+
         full_dataset, train_indices, val_indices, test_indices = prepare_dataset(
             base_dir, dataset_type, seed=42)
-        
+
         if is_main:
             print(f"\nDataset Stats:")
             print(f" Total: {len(full_dataset):,} images")
-            print(f" Train: {len(train_indices):,} ({len(train_indices)/len(full_dataset)*100:.1f}%)")
-            print(f" Valid: {len(val_indices):,} ({len(val_indices)/len(full_dataset)*100:.1f}%)")
-            print(f" Test: {len(test_indices):,} ({len(test_indices)/len(full_dataset)*100:.1f}%)")
+            print(f" Train: {len(train_indices):,} ({len(train_indices) / len(full_dataset) * 100:.1f}%)")
+            print(f" Valid: {len(val_indices):,} ({len(val_indices) / len(full_dataset) * 100:.1f}%)")
+            print(f" Test: {len(test_indices):,} ({len(test_indices) / len(full_dataset) * 100:.1f}%)")
             if hasattr(full_dataset, 'class_to_idx'):
                 print(f" Class → Index: {full_dataset.class_to_idx}\n")
 
@@ -402,45 +483,46 @@ def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
         sampler_test = DistributedSampler(test_dataset, shuffle=False) if is_distributed else None
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                                 shuffle=(train_sampler is None), sampler=train_sampler,
-                                 num_workers=num_workers, pin_memory=True, drop_last=True,
-                                 worker_init_fn=worker_init_fn)
+                                  shuffle=(train_sampler is None), sampler=train_sampler,
+                                  num_workers=num_workers, pin_memory=True, drop_last=True,
+                                  worker_init_fn=worker_init_fn)
         val_loader = DataLoader(val_dataset, batch_size=batch_size,
-                               shuffle=False, sampler=val_sampler,
-                               num_workers=num_workers, pin_memory=True, drop_last=False,
-                               worker_init_fn=worker_init_fn)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size,
-                                shuffle=False, sampler=sampler_test,
+                                shuffle=False, sampler=val_sampler,
                                 num_workers=num_workers, pin_memory=True, drop_last=False,
                                 worker_init_fn=worker_init_fn)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size,
+                                 shuffle=False, sampler=sampler_test,
+                                 num_workers=num_workers, pin_memory=True, drop_last=False,
+                                 worker_init_fn=worker_init_fn)
 
     if is_main:
         print(f"DataLoaders ready! Batch size: {batch_size}")
         print(f" Batches → Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {len(test_loader)}")
-        print("="*70 + "\n")
+        print("=" * 70 + "\n")
     return train_loader, val_loader, test_loader
-                           
+
+
 if __name__ == '__main__':
- 
-    path_to_dataset = 'path/to/your/real_and_fake_face'  
-    
+
+    # برای اجرای ArtiFace این مسیر را به ریشه پوشه ArtiFace تغییر دهید
+    path_to_dataset = 'path/to/your/ArtiFace'
+
     try:
-        # استفاده از دیتاست جدید اضافه شده
         train_loader, val_loader, test_loader = create_dataloaders(
             base_dir=path_to_dataset,
             batch_size=32,
-            num_workers=0, # در ویندوز بهتر است 0 باشد، در لینوکس می‌توانید 2 یا 4 بگذارید
-            dataset_type='real_and_fake_face',  # <--- نام جدید دیتاست
+            num_workers=0,          # در ویندوز بهتر است 0 باشد، در لینوکس 2 یا 4
+            dataset_type='artiface',  # <--- نام دیتاست جدید
             is_distributed=False,
             seed=42
         )
-      
+
         print("Testing batch retrieval...")
         images, labels = next(iter(train_loader))
         print(f"Batch shape: {images.shape}, Labels shape: {labels.shape}")
         print(f"Unique labels in batch: {torch.unique(labels)}")
         print("Code executed successfully.")
-        
+
     except FileNotFoundError as e:
         print(f"Error: {e}")
     except Exception as e:
