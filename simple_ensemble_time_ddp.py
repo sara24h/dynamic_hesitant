@@ -596,6 +596,21 @@ def main():
         print("FINAL ENSEMBLE EVALUATION (Simple Averaging)")
         print("=" * 70)
 
+        # ============ FINAL ENSEMBLE EVALUATION ============
+    if is_main:
+        print("\n" + "=" * 70)
+        print("FINAL ENSEMBLE EVALUATION (Simple Averaging)")
+        print("=" * 70)
+
+    # ✅ منتظر بمان تا rank 0 بنچمارک را تمام کند
+    if dist.is_initialized():
+        dist.barrier()
+
+    ensemble_sw = Stopwatch(device).start()
+    final_acc, ensemble_weights = evaluate_ensemble_unified(
+        ensemble_module, test_loader, device, "Test",
+        MODEL_NAMES, args.save_dir, args, is_main
+    )
     ensemble_sw = Stopwatch(device).start()
     final_acc, ensemble_weights = evaluate_ensemble_unified(
         ensemble_module, test_loader, device, "Test",
