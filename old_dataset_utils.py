@@ -236,6 +236,8 @@ def prepare_dataset(base_dir: str, dataset_type: str, seed: int = 42):
         'real_fake_dataset': ['face_fake', 'face_real'], 
         # اضافه شده: دیتاست جدید با پوشه‌های training_fake و training_real
         'deepfake_lab': ['training_fake', 'training_real'], 
+        # اضافه شده: دیتاست Deep-vs-Real با پوشه‌های Deepfake و Real
+        '20k': ['Deepfake', 'Real'],
     }
 
     print(f"\n[Dataset Loading] Processing: {dataset_type}")
