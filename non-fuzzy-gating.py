@@ -6,13 +6,17 @@ import os
 from tqdm import tqdm
 import numpy as np
 from typing import List, Tuple
-import json
-import argparse
-import random
 import warnings
-warnings.filterwarnings("ignore")
+import argparse
+import json
+import random
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-from old_dataset_utils import create_dataloaders
+from old_dataset_utils import create_dataloaders, get_sample_info
+from efficiency_utils import Stopwatch
+
+warnings.filterwarnings("ignore")
 
 # ================== UTILITY ==================
 def set_seed(seed: int = 42):
@@ -24,105 +28,15 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
-
-# ================== METRIC HELPERS ==================
-def _safe_div(a, b):
-    return float(a) / float(b) if b > 0 else 0.0
-
-
-def _class_metrics(tp, fp, fn, tn):
-   
-    p = _safe_div(tp, tp + fp)
-    r = _safe_div(tp, tp + fn)
-    s = _safe_div(tn, tn + fp)
-    f = _safe_div(2 * p * r, p + r)
-    return {
-        "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
-        "support": int(tp + fn),
-        "precision": p, "recall": r, "specificity": s, "f1": f,
-    }
-
-
-def compute_all_metrics(y_true, y_score, threshold=0.5):
-   
-    y_true  = np.asarray(y_true,  dtype=np.int64)
-    y_score = np.asarray(y_score, dtype=np.float32)
-    y_pred  = (y_score > threshold).astype(np.int64)
-
-    TP = int(((y_true == 1) & (y_pred == 1)).sum())
-    TN = int(((y_true == 0) & (y_pred == 0)).sum())
-    FP = int(((y_true == 0) & (y_pred == 1)).sum())
-    FN = int(((y_true == 1) & (y_pred == 0)).sum())
-    total = TP + TN + FP + FN
-
-    real_m = _class_metrics(TP, FP, FN, TN)          # positive = real
-    fake_m = _class_metrics(TN, FN, FP, TP)          # positive = fake
-
-    macro_p  = (real_m["precision"] + fake_m["precision"]) / 2
-    macro_r  = (real_m["recall"]    + fake_m["recall"])    / 2
-    macro_f1 = (real_m["f1"]        + fake_m["f1"])        / 2
-
-    s_r, s_f = real_m["support"], fake_m["support"]
-    weighted_p  = _safe_div(real_m["precision"] * s_r + fake_m["precision"] * s_f, total)
-    weighted_r  = _safe_div(real_m["recall"]    * s_r + fake_m["recall"]    * s_f, total)
-    weighted_f1 = _safe_div(real_m["f1"]        * s_r + fake_m["f1"]        * s_f, total)
-
-    balanced_acc = (real_m["recall"] + fake_m["recall"]) / 2
-    accuracy     = _safe_div(TP + TN, total)
-
-    roc_auc = None
-    fpr, tpr = None, None
-    try:
-        from sklearn.metrics import roc_auc_score, roc_curve
-        roc_auc = float(roc_auc_score(y_true, y_score))
-        fpr, tpr, _ = roc_curve(y_true, y_score)
-    except ImportError:
-        pass
-
-    return {
-        "confusion": {"TP": TP, "TN": TN, "FP": FP, "FN": FN},
-        "num_samples": total,
-        "num_per_class": {"fake": s_f, "real": s_r},
-        "accuracy": float(accuracy),
-        "balanced_accuracy": float(balanced_acc),
-        "class_0_fake": fake_m,
-        "class_1_real": real_m,
-        "macro_precision": float(macro_p),
-        "macro_recall":    float(macro_r),
-        "macro_f1":        float(macro_f1),
-        "weighted_precision": float(weighted_p),
-        "weighted_recall":    float(weighted_r),
-        "weighted_f1":        float(weighted_f1),
-        "roc_auc": roc_auc,
-        "threshold": float(threshold),
-        "roc_curve": {"fpr": fpr, "tpr": tpr},
-    }
-
-def _print_metric_table(m, title):
-    fr, rl = m["class_0_fake"], m["class_1_real"]
-    cm = m["confusion"]
-    print(f"\n{'='*76}\n{title}\n{'='*76}")
-    print(f"Samples: {m['num_samples']}  (fake={m['num_per_class']['fake']}, real={m['num_per_class']['real']})")
-    print('-'*76)
-    print(f"{'Metric':<20}{'Fake (0)':>15}{'Real (1)':>15}{'Macro Avg':>15}")
-    print('-'*76)
-    print(f"{'Precision':<20}{fr['precision']:>15.4f}{rl['precision']:>15.4f}{m['macro_precision']:>15.4f}")
-    print(f"{'Recall (TPR)':<20}{fr['recall']:>15.4f}{rl['recall']:>15.4f}{m['macro_recall']:>15.4f}")
-    print(f"{'Specificity (TNR)':<20}{fr['specificity']:>15.4f}{rl['specificity']:>15.4f}{'-':>15}")
-    print(f"{'F1-Score':<20}{fr['f1']:>15.4f}{rl['f1']:>15.4f}{m['macro_f1']:>15.4f}")
-    print(f"{'Support':<20}{fr['support']:>15d}{rl['support']:>15d}{m['num_samples']:>15d}")
-    print('-'*76)
-    print(f"{'Accuracy':<20}: {m['accuracy']*100:.2f}%")
-    print(f"{'Balanced Accuracy':<20}: {m['balanced_accuracy']*100:.2f}%")
-    print(f"{'Weighted Precision':<20}: {m['weighted_precision']:.4f}")
-    print(f"{'Weighted Recall':<20}: {m['weighted_recall']:.4f}")
-    print(f"{'Weighted F1':<20}: {m['weighted_f1']:.4f}")
-    if m["roc_auc"] is not None:
-        print(f"{'ROC-AUC':<20}: {m['roc_auc']:.4f}")
-    print('='*76)
-    print(f"Confusion: TP={cm['TP']} TN={cm['TN']} FP={cm['FP']} FN={cm['FN']}")
-    print('='*76)
-
+def setup_device():
+    if torch.cuda.is_available():
+        device = torch.device('cuda:0')
+        torch.cuda.set_device(0)
+        print(f"Using single GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device('cpu')
+        print("WARNING: CUDA not available, using CPU")
+    return device
 
 # ================== MODEL CLASSES ==================
 class MultiModelNormalization(nn.Module):
@@ -136,12 +50,17 @@ class MultiModelNormalization(nn.Module):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
-class NonFuzzyGatingNetwork(nn.Module):
-    
+class NonFuzzyGating(nn.Module):
+    """
+    Non-fuzzy version of HesitantFuzzyMembership.
+    Same feature extractor, same parameter count roughly,
+    but directly predicts model weights (no membership values, no aggregation weights α).
+    """
     def __init__(self, num_models: int = 3, dropout: float = 0.3):
         super().__init__()
         self.num_models = num_models
 
+        # دقیقاً همان feature_net موجود در HFDE
         self.feature_net = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
@@ -152,6 +71,7 @@ class NonFuzzyGatingNetwork(nn.Module):
             nn.AdaptiveAvgPool2d(1)
         )
 
+        # Gating head: مستقیم N وزن تولید می‌کند
         self.gating_head = nn.Sequential(
             nn.Linear(128, 128),
             nn.ReLU(inplace=True),
@@ -167,6 +87,7 @@ class NonFuzzyGatingNetwork(nn.Module):
 
 
 class NonFuzzyEnsemble(nn.Module):
+
     def __init__(
         self,
         models: List[nn.Module],
@@ -180,7 +101,7 @@ class NonFuzzyEnsemble(nn.Module):
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
-        self.gating = NonFuzzyGatingNetwork(num_models=self.num_models)
+        self.gating = NonFuzzyGating(num_models=self.num_models)
         self.cum_weight_threshold = cum_weight_threshold
         self.hesitancy_threshold = hesitancy_threshold
 
@@ -197,11 +118,12 @@ class NonFuzzyEnsemble(nn.Module):
         return self
 
     def _compute_mask_vectorized(self, weights: torch.Tensor, uncertainty: torch.Tensor):
+        """همان منطق dual selection موجود در HFDE"""
         sorted_weights, sorted_indices = torch.sort(weights, dim=1, descending=True)
         cum_weights = torch.cumsum(sorted_weights, dim=1)
 
         mask = (cum_weights <= self.cum_weight_threshold).float()
-        mask[:, 0] = 1.0
+        mask[:, 0] = 1.0   # همیشه حداقل یک مدل
 
         high_unc_mask = (uncertainty > self.hesitancy_threshold).unsqueeze(1)
         mask = torch.where(high_unc_mask, torch.ones_like(mask), mask)
@@ -213,8 +135,10 @@ class NonFuzzyEnsemble(nn.Module):
     def forward(self, x: torch.Tensor, return_details: bool = False):
         weights = self.gating(x)   # [B, N]
 
+        # Uncertainty جایگزین: entropy وزن‌ها (چون membership نداریم)
         entropy = -torch.sum(weights * torch.log(weights + 1e-8), dim=1)
-        uncertainty = entropy / 1.0986   # ~ max entropy for 3 models
+        # نرمال‌سازی تقریبی به [0,1] (max entropy برای 3 کلاس ≈ ln(3) ≈ 1.0986)
+        uncertainty = entropy / 1.0986
 
         mask = self._compute_mask_vectorized(weights, uncertainty)
         weights = weights * mask
@@ -265,6 +189,131 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
     return models
 
 
+# ================== EVALUATION (sample-by-sample مثل کد اصلی) ==================
+@torch.no_grad()
+def final_evaluation_non_fuzzy(model, test_loader, device, save_dir, model_names, args):
+    model.eval()
+    test_dataset = test_loader.dataset
+    num_samples = len(test_dataset)
+
+    all_y_true, all_y_score, all_y_pred = [], [], []
+    all_model_weights = []
+    TP = TN = FP = FN = 0
+
+    print(f"\nRunning Non-Fuzzy Final Evaluation on {num_samples} samples...")
+
+    for i in tqdm(range(num_samples), desc="Non-Fuzzy Eval"):
+        try:
+            image, label = test_dataset[i]
+            original_idx = test_dataset.indices[i]
+            path, _ = get_sample_info(test_dataset.dataset, original_idx)
+        except Exception as e:
+            print(f"Error loading sample {i}: {e}")
+            continue
+
+        image = image.unsqueeze(0).to(device)
+        label_int = int(label)
+
+        output, weights, _, _ = model(image, return_details=True)
+        prob = torch.sigmoid(output.squeeze()).item()
+        pred_int = int(prob > 0.5)
+
+        all_y_true.append(label_int)
+        all_y_score.append(prob)
+        all_y_pred.append(pred_int)
+        all_model_weights.append(weights.squeeze(0).cpu().numpy())
+
+        if label_int == 1:
+            if pred_int == 1: TP += 1
+            else: FN += 1
+        else:
+            if pred_int == 1: FP += 1
+            else: TN += 1
+
+    total_samples = len(all_y_true)
+    acc = 100.0 * (TP + TN) / total_samples if total_samples > 0 else 0.0
+
+    precision_real = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+    recall_real    = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+    f1_real        = 2 * precision_real * recall_real / (precision_real + recall_real) if (precision_real + recall_real) > 0 else 0.0
+
+    precision_fake = TN / (TN + FN) if (TN + FN) > 0 else 0.0
+    recall_fake    = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+    f1_fake        = 2 * precision_fake * recall_fake / (precision_fake + recall_fake) if (precision_fake + recall_fake) > 0 else 0.0
+
+    macro_precision = (precision_real + precision_fake) / 2
+    macro_recall    = (recall_real + recall_fake) / 2
+    macro_f1        = (f1_real + f1_fake) / 2
+    balanced_acc    = ((recall_real + recall_fake) / 2) * 100
+
+    # Confusion matrix
+    cm = np.array([[TN, FP], [FN, TP]])
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Predicted Fake', 'Predicted Real'],
+                yticklabels=['Actual Fake', 'Actual Real'])
+    plt.title(f'Non-Fuzzy Gating\nAcc: {acc:.2f}% | Balanced: {balanced_acc:.2f}% | Macro-F1: {macro_f1:.4f}')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'confusion_matrix_non_fuzzy.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"\n{'='*70}")
+    print("NON-FUZZY GATING RESULTS")
+    print(f"{'='*70}")
+    print(f"Accuracy          : {acc:.2f}%")
+    print(f"Balanced Accuracy : {balanced_acc:.2f}%")
+    print(f"Macro-F1          : {macro_f1:.4f}")
+    print(f"{'Class':<12} {'Precision':>10} {'Recall':>10} {'F1-Score':>10}")
+    print("-" * 45)
+    print(f"{'Fake (0)':<12} {precision_fake:10.4f} {recall_fake:10.4f} {f1_fake:10.4f}")
+    print(f"{'Real (1)':<12} {precision_real:10.4f} {recall_real:10.4f} {f1_real:10.4f}")
+    print("-" * 45)
+    print(f"{'Macro Avg':<12} {macro_precision:10.4f} {macro_recall:10.4f} {macro_f1:10.4f}")
+    print("="*70)
+
+    # Activation statistics
+    if len(all_model_weights) > 0:
+        weights_np = np.array(all_model_weights)
+        active_mask = (weights_np > 1e-4).astype(float)
+        activation_rates = active_mask.mean(axis=0) * 100
+        avg_weights = weights_np.mean(axis=0)
+
+        print(f"\nMODEL ACTIVATION STATISTICS")
+        print(f"  {'Model':<30} {'Active %':>10} {'Avg Weight':>12}")
+        print(f"  {'-'*55}")
+        for i, name in enumerate(model_names):
+            print(f"  {i+1}. {name:<27}: {activation_rates[i]:6.2f}%  | {avg_weights[i]:.6f}")
+        print(f"  Mean active models per sample: {active_mask.sum(axis=1).mean():.2f}")
+        print("="*70)
+
+    # Save results
+    results = {
+        "method": "Non_Fuzzy_Gating",
+        "accuracy": float(acc),
+        "balanced_accuracy": float(balanced_acc),
+        "macro_f1": float(macro_f1),
+        "precision_real": float(precision_real),
+        "recall_real": float(recall_real),
+        "f1_real": float(f1_real),
+        "precision_fake": float(precision_fake),
+        "recall_fake": float(recall_fake),
+        "f1_fake": float(f1_fake),
+        "TP": TP, "TN": TN, "FP": FP, "FN": FN,
+        "num_samples": total_samples,
+        "average_weights": avg_weights.tolist() if len(all_model_weights) > 0 else [],
+        "activation_rates_pct": activation_rates.tolist() if len(all_model_weights) > 0 else []
+    }
+    with open(os.path.join(save_dir, "non_fuzzy_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+    np.savez(os.path.join(save_dir, "roc_data_non_fuzzy.npz"),
+             y_true=np.array(all_y_true),
+             y_score=np.array(all_y_score),
+             y_pred=np.array(all_y_pred))
+
+    return acc
+
+
 # ================== TRAINING ==================
 def train_non_fuzzy(ensemble, train_loader, val_loader, num_epochs, lr, device, save_dir, model_names):
     os.makedirs(save_dir, exist_ok=True)
@@ -287,12 +336,10 @@ def train_non_fuzzy(ensemble, train_loader, val_loader, num_epochs, lr, device, 
         train_loss = 0.0
         train_correct = 0
 
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
-        for images, labels in pbar:
+        for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}'):
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
-
-            outputs, weights = ensemble(images)
+            outputs, _ = ensemble(images)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
             optimizer.step()
@@ -304,6 +351,7 @@ def train_non_fuzzy(ensemble, train_loader, val_loader, num_epochs, lr, device, 
         train_loss /= total_samples
         train_acc = 100. * train_correct / total_samples
 
+        # Validation
         ensemble.eval()
         val_correct = 0
         val_total = len(val_loader.dataset)
@@ -316,7 +364,6 @@ def train_non_fuzzy(ensemble, train_loader, val_loader, num_epochs, lr, device, 
         val_acc = 100. * val_correct / val_total
 
         scheduler.step()
-
         print(f"Epoch {epoch+1:3d} | Train Loss: {train_loss:.4f} | "
               f"Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
 
@@ -329,126 +376,24 @@ def train_non_fuzzy(ensemble, train_loader, val_loader, num_epochs, lr, device, 
     return best_val_acc
 
 
-# ================== EVALUATION (UPDATED METRICS) ==================
-@torch.no_grad()
-def evaluate_non_fuzzy(ensemble, test_loader, device, save_dir, model_names):
-    os.makedirs(save_dir, exist_ok=True)
-    ensemble.eval()
-
-    all_y_true, all_y_score = [], []
-    all_weights = []
-
-    print(f"\nEvaluating Non-Fuzzy Gating on {len(test_loader.dataset)} samples...")
-
-    for images, labels in tqdm(test_loader, desc="Non-Fuzzy Eval"):
-        images = images.to(device)
-        labels = labels.to(device).long()
-
-        logits, weights = ensemble(images)
-        probs = torch.sigmoid(logits)
-
-        all_y_true.extend(labels.cpu().numpy().tolist())
-        all_y_score.extend(probs.cpu().numpy().tolist())
-        all_weights.append(weights.cpu().numpy())
-
-    # ============ همه متریک‌ها ============
-    metrics = compute_all_metrics(all_y_true, all_y_score, threshold=0.5)
-
-    weights_np = np.concatenate(all_weights, axis=0)
-    avg_weights = weights_np.mean(axis=0)
-    active_rates = (weights_np > 1e-4).mean(axis=0) * 100
-
-    # ============ چاپ جدول ============
-    _print_metric_table(metrics, "NON-FUZZY GATING NETWORK — FINAL RESULTS")
-    print(f"\nAvg ensemble weights : {[round(w, 4) for w in avg_weights]}")
-    print(f"Activation rates (%) : {[round(a, 1) for a in active_rates]}")
-    print("="*76)
-
-    # ============ ساخت نتایج JSON ============
-    fr, rl = metrics["class_0_fake"], metrics["class_1_real"]
-    results = {
-        "method": "Non_Fuzzy_Gating",
-        "model_names": model_names,
-
-        # overall
-        "accuracy": metrics["accuracy"] * 100.0,
-        "balanced_accuracy": metrics["balanced_accuracy"] * 100.0,
-
-        # macro
-        "macro_precision": metrics["macro_precision"],
-        "macro_recall":    metrics["macro_recall"],
-        "macro_f1":        metrics["macro_f1"],
-
-        # weighted
-        "weighted_precision": metrics["weighted_precision"],
-        "weighted_recall":    metrics["weighted_recall"],
-        "weighted_f1":        metrics["weighted_f1"],
-
-        # per-class — fake (0)
-        "precision_fake": fr["precision"],
-        "recall_fake":    fr["recall"],
-        "specificity_fake": fr["specificity"],
-        "f1_fake":        fr["f1"],
-        "support_fake":   fr["support"],
-
-        # per-class — real (1)
-        "precision_real": rl["precision"],
-        "recall_real":    rl["recall"],
-        "specificity_real": rl["specificity"],
-        "f1_real":        rl["f1"],
-        "support_real":   rl["support"],
-
-        # raw confusion
-        "TP": metrics["confusion"]["TP"], "TN": metrics["confusion"]["TN"],
-        "FP": metrics["confusion"]["FP"], "FN": metrics["confusion"]["FN"],
-        "num_samples": metrics["num_samples"],
-
-        # AUC + threshold
-        "roc_auc": metrics["roc_auc"],
-        "decision_threshold": 0.5,
-
-        # gating behaviour
-        "average_weights": avg_weights.tolist(),
-        "activation_rates_pct": active_rates.tolist(),
-    }
-
-    with open(os.path.join(save_dir, "non_fuzzy_results.json"), "w") as f:
-        json.dump(results, f, indent=2)
-
-    # ============ ذخیره داده ROC ============
-    save_dict = {
-        "y_true":  np.array(all_y_true,  dtype=np.int64),
-        "y_score": np.array(all_y_score, dtype=np.float32),
-        "y_pred":  (np.array(all_y_score) > 0.5).astype(np.int64),
-    }
-    if metrics["roc_curve"]["fpr"] is not None:
-        save_dict["fpr"] = np.array(metrics["roc_curve"]["fpr"])
-        save_dict["tpr"] = np.array(metrics["roc_curve"]["tpr"])
-    np.savez(os.path.join(save_dir, "roc_data_non_fuzzy.npz"), **save_dict)
-
-    print(f"\nنتایج ذخیره شد در: {save_dir}")
-    return results
-
 # ================== MAIN ==================
 def main():
-    parser = argparse.ArgumentParser(description="Non-Fuzzy Gating Network Baseline")
-    parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--dataset', type=str, required=True)
-    parser.add_argument('--model_paths', type=str, nargs='+', required=True)
-    parser.add_argument('--model_names', type=str, nargs='+', required=True)
-    parser.add_argument('--save_dir', type=str, default='./ablation_non_fuzzy')
+    parser = argparse.ArgumentParser(description="Non-Fuzzy Gating Network Baseline (Reviewer 2)")
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--lr', type=float, default=0.002)
     parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--dataset', type=str, required=True)
+    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--model_paths', type=str, nargs='+', required=True)
+    parser.add_argument('--model_names', type=str, nargs='+', required=True)
+    parser.add_argument('--save_dir', type=str, default='./ablation_non_fuzzy')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--cum_weight_threshold', type=float, default=0.8)
+    parser.add_argument('--cum_weight_threshold', type=float, default=0.80)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.0001)
 
     args = parser.parse_args()
     set_seed(args.seed)
-
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    device = setup_device()
 
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
@@ -482,15 +427,20 @@ def main():
         args.epochs, args.lr, device, args.save_dir, MODEL_NAMES
     )
 
+    # Load best
     ckpt_path = os.path.join(args.save_dir, 'best_non_fuzzy.pt')
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device)
         ensemble.gating.load_state_dict(ckpt['gating_state_dict'])
         print("Best non-fuzzy model loaded.\n")
 
-    results = evaluate_non_fuzzy(
-        ensemble, test_loader, device, args.save_dir, MODEL_NAMES
+    # Final evaluation (sample-by-sample مثل کد اصلی)
+    final_acc = final_evaluation_non_fuzzy(
+        ensemble, test_loader, device, args.save_dir, MODEL_NAMES, args
     )
+
+    print(f"\nFinal Non-Fuzzy Accuracy: {final_acc:.2f}%")
+
 
 if __name__ == "__main__":
     main()
