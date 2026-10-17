@@ -95,25 +95,20 @@ def evaluate_model2_only(
 
 # ------------------ نحوه استفاده ------------------
 if __name__ == "__main__":
-    # فرض: base_models از قبل لود شده‌اند و Model 2 ایندکس 1 است
-    # MEANS و STDS هم از قبل تعریف شده‌اند
-    
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    
-    # لود دیتاست تست
+
     _, _, test_loader = create_dataloaders(
-        data_dir="PATH_TO_DATA",
+        base_dir="/kaggle/input/your-dataset-folder",
         batch_size=32,
-        dataset_type="YOUR_DATASET",   # مثلاً 'hard_fake_real' یا 'wild'
+        dataset_type="hard_fake_real",
         is_distributed=False,
         seed=42
     )
-    
-    # Model 2 (ایندکس 1)
+
     model2 = base_models[1]
     mean2  = MEANS[1]
     std2   = STDS[1]
-    
+
     results_m2 = evaluate_model2_only(
         model2=model2,
         test_loader=test_loader,
