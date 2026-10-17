@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -13,6 +12,7 @@ warnings.filterwarnings("ignore")
 
 from old_dataset_utils import create_dataloaders
 from efficiency_utils import Stopwatch
+
 
 # ---------- کلاس‌های مورد نیاز از کد اصلی ----------
 class MultiModelNormalization(nn.Module):
@@ -54,7 +54,6 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
 
 # ---------- Fixed Ensemble ----------
 class FixedWeightEnsemble(nn.Module):
-    
     def __init__(
         self,
         models: List[nn.Module],
@@ -67,13 +66,11 @@ class FixedWeightEnsemble(nn.Module):
         self.models = nn.ModuleList(models)
         self.num_models = len(models)
         self.normalizations = MultiModelNormalization(means, stds)
-        
-        # وزن‌های ثابت (نرمال‌سازی شده)
+
         weights = torch.tensor(fixed_weights, dtype=torch.float32)
         weights = weights / weights.sum()
         self.register_buffer("fixed_weights", weights)
-        
-        # فریز کردن مدل‌ها
+
         for model in self.models:
             model.eval()
             for p in model.parameters():
@@ -82,7 +79,7 @@ class FixedWeightEnsemble(nn.Module):
     def forward(self, x: torch.Tensor):
         batch_size = x.size(0)
         outputs = torch.zeros(batch_size, self.num_models, device=x.device)
-        
+
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
             with torch.no_grad():
@@ -90,10 +87,36 @@ class FixedWeightEnsemble(nn.Module):
                 if isinstance(out, (tuple, list)):
                     out = out[0]
             outputs[:, i] = out.squeeze(1)
-        
-        # وزن‌دهی ثابت
+
         final_logit = (outputs * self.fixed_weights.unsqueeze(0)).sum(dim=1)
         return final_logit
+
+
+# ---------- متریک‌های کمکی ----------
+def _safe_div(a, b):
+    return float(a) / float(b) if b > 0 else 0.0
+
+
+def compute_class_metrics(y_true, y_pred, cls):
+    """متریک‌ها را برای یک کلاس مشخص (cls به عنوان positive) حساب می‌کند."""
+    tp = int(((y_true == cls) & (y_pred == cls)).sum())
+    tn = int(((y_true != cls) & (y_pred != cls)).sum())
+    fp = int(((y_true != cls) & (y_pred == cls)).sum())
+    fn = int(((y_true == cls) & (y_pred != cls)).sum())
+
+    precision = _safe_div(tp, tp + fp)
+    recall    = _safe_div(tp, tp + fn)
+    specificity = _safe_div(tn, tn + fp)          # True Negative Rate (برای این کلاس)
+    f1        = _safe_div(2 * precision * recall, precision + recall)
+
+    return {
+        "tp": tp, "tn": tn, "fp": fp, "fn": fn,
+        "precision": precision,
+        "recall": recall,                 # = sensitivity (TPR) برای این کلاس
+        "specificity": specificity,       # TNR برای این کلاس
+        "f1": f1,
+        "support": tp + fn,
+    }
 
 
 # ---------- ارزیابی ----------
@@ -101,71 +124,138 @@ class FixedWeightEnsemble(nn.Module):
 def evaluate_fixed(ensemble, test_loader, device, save_dir, model_names):
     os.makedirs(save_dir, exist_ok=True)
     ensemble.eval()
-    
+
     all_y_true, all_y_score, all_y_pred = [], [], []
-    TP = TN = FP = FN = 0
-    
+
     print(f"\nEvaluating Fixed Ensemble on {len(test_loader.dataset)} samples...")
-    
+
     for images, labels in tqdm(test_loader, desc="Fixed Ensemble"):
         images = images.to(device)
         labels = labels.to(device).long()
-        
+
         logits = ensemble(images)
-        probs = torch.sigmoid(logits)
-        preds = (probs > 0.5).long()
-        
+        probs  = torch.sigmoid(logits)
+        preds  = (probs > 0.5).long()
+
         all_y_true.extend(labels.cpu().numpy().tolist())
         all_y_score.extend(probs.cpu().numpy().tolist())
         all_y_pred.extend(preds.cpu().numpy().tolist())
-        
-        for t, p in zip(labels, preds):
-            if t == 1:
-                if p == 1: TP += 1
-                else: FN += 1
-            else:
-                if p == 1: FP += 1
-                else: TN += 1
-    
-    total = len(all_y_true)
-    acc = 100.0 * (TP + TN) / total
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-    recall    = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    
+
+    y_true  = np.array(all_y_true,  dtype=np.int64)
+    y_score = np.array(all_y_score, dtype=np.float32)
+    y_pred  = np.array(all_y_pred,  dtype=np.int64)
+    total   = len(y_true)
+
+    # ----- متریک‌های هر کلاس -----
+    # قرارداد کد اصلی: 0 = fake (negative)   |   1 = real (positive)
+    m_fake = compute_class_metrics(y_true, y_pred, cls=0)
+    m_real = compute_class_metrics(y_true, y_pred, cls=1)
+
+    # ----- Overall -----
+    acc = 100.0 * float((y_true == y_pred).sum()) / total
+
+    # ----- Macro -----
+    macro_precision = (m_fake["precision"] + m_real["precision"]) / 2.0
+    macro_recall    = (m_fake["recall"]    + m_real["recall"])    / 2.0
+    macro_f1        = (m_fake["f1"]        + m_real["f1"])        / 2.0
+
+    # ----- Balanced Accuracy = (recall_fake + recall_real) / 2 -----
+    balanced_acc = (m_fake["recall"] + m_real["recall"]) / 2.0
+    balanced_acc_pct = 100.0 * balanced_acc
+
+    # ----- Weighted (اختیاری، بر اساس support) -----
+    weighted_precision = _safe_div(
+        m_fake["precision"] * m_fake["support"] + m_real["precision"] * m_real["support"], total)
+    weighted_recall = _safe_div(
+        m_fake["recall"] * m_fake["support"] + m_real["recall"] * m_real["support"], total)
+    weighted_f1 = _safe_div(
+        m_fake["f1"] * m_fake["support"] + m_real["f1"] * m_real["support"], total)
+
+    # ----- ROC-AUC -----
+    roc_auc = None
+    try:
+        from sklearn.metrics import roc_auc_score, roc_curve
+        roc_auc = float(roc_auc_score(y_true, y_score))
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        roc_curve_data = {"fpr": fpr.tolist(), "tpr": tpr.tolist()}
+    except ImportError:
+        roc_curve_data = None
+
     results = {
         "method": "Fixed_Ensemble_Mean_HFDE_Weights",
         "fixed_weights": ensemble.fixed_weights.cpu().tolist(),
         "model_names": model_names,
+
         "accuracy": float(acc),
-        "precision_real": float(precision),
-        "recall_real": float(recall),
-        "f1_real": float(f1),
-        "TP": TP, "TN": TN, "FP": FP, "FN": FN,
-        "num_samples": total
+        "balanced_accuracy": float(balanced_acc_pct),
+
+        # --- Per-class (0 = fake, 1 = real طبق کد اصلی) ---
+        "class_0_fake": m_fake,
+        "class_1_real": m_real,
+
+        # --- Macro ---
+        "macro_precision": float(macro_precision),
+        "macro_recall":    float(macro_recall),
+        "macro_f1":        float(macro_f1),
+
+        # --- Weighted ---
+        "weighted_precision": float(weighted_precision),
+        "weighted_recall":    float(weighted_recall),
+        "weighted_f1":        float(weighted_f1),
+
+        # --- AUC ---
+        "roc_auc": roc_auc,
+
+        "num_samples": int(total),
+        "num_samples_per_class": {
+            "fake": int(m_fake["support"]),
+            "real": int(m_real["support"]),
+        },
+        # ماتریس درهم‌ریختگی برای شفافیت
+        "confusion_matrix": {
+            "TP_real": m_real["tp"], "TN_real": m_real["tn"],
+            "FP_real": m_real["fp"], "FN_real": m_real["fn"],
+        },
     }
-    
-    print("\n" + "="*70)
+
+    # ---------- چاپ ----------
+    print("\n" + "=" * 72)
     print("FIXED ENSEMBLE (Mean HFDE Weights) RESULTS")
-    print("="*70)
+    print("=" * 72)
     print(f"Fixed weights : {[round(w, 6) for w in results['fixed_weights']]}")
-    print(f"Accuracy      : {acc:.2f}%")
-    print(f"Precision     : {precision:.4f}")
-    print(f"Recall        : {recall:.4f}")
-    print(f"F1-Score      : {f1:.4f}")
-    print("="*70)
-    
-    # ذخیره نتایج
+    print(f"Samples       : {total}  (fake={m_fake['support']}, real={m_real['support']})")
+    print("-" * 72)
+    print(f"{'Metric':<20}{'Fake (0)':>15}{'Real (1)':>15}{'Macro Avg':>15}")
+    print("-" * 72)
+    print(f"{'Precision':<20}{m_fake['precision']:>15.4f}{m_real['precision']:>15.4f}{macro_precision:>15.4f}")
+    print(f"{'Recall (TPR)':<20}{m_fake['recall']:>15.4f}{m_real['recall']:>15.4f}{macro_recall:>15.4f}")
+    print(f"{'Specificity':<20}{m_fake['specificity']:>15.4f}{m_real['specificity']:>15.4f}{'-':>15}")
+    print(f"{'F1-Score':<20}{m_fake['f1']:>15.4f}{m_real['f1']:>15.4f}{macro_f1:>15.4f}")
+    print(f"{'Support':<20}{m_fake['support']:>15d}{m_real['support']:>15d}{total:>15d}")
+    print("-" * 72)
+    print(f"{'Accuracy':<20}: {acc:.2f}%")
+    print(f"{'Balanced Accuracy':<20}: {balanced_acc_pct:.2f}%")
+    print(f"{'Weighted Precision':<20}: {weighted_precision:.4f}")
+    print(f"{'Weighted Recall':<20}: {weighted_recall:.4f}")
+    print(f"{'Weighted F1':<20}: {weighted_f1:.4f}")
+    if roc_auc is not None:
+        print(f"{'ROC-AUC':<20}: {roc_auc:.4f}")
+    print("=" * 72)
+
+    # ---------- ذخیره ----------
     with open(os.path.join(save_dir, "fixed_mean_weights_results.json"), "w") as f:
         json.dump(results, f, indent=2)
-    
-    np.savez(
-        os.path.join(save_dir, "roc_data_fixed.npz"),
-        y_true=np.array(all_y_true),
-        y_score=np.array(all_y_score),
-        y_pred=np.array(all_y_pred)
-    )
-    
+
+    save_dict = {
+        "y_true": y_true,
+        "y_score": y_score,
+        "y_pred": y_pred,
+    }
+    if roc_curve_data is not None:
+        save_dict["fpr"] = np.array(roc_curve_data["fpr"])
+        save_dict["tpr"] = np.array(roc_curve_data["tpr"])
+    np.savez(os.path.join(save_dir, "roc_data_fixed.npz"), **save_dict)
+
     print(f"\nنتایج ذخیره شد در: {save_dir}")
     return results
 
@@ -180,30 +270,26 @@ def main():
     parser.add_argument('--save_dir', type=str, default='./ablation_fixed_mean_weights')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=42)
-    
-    # میانگین وزن‌هایی که از خروجی HFDE گرفتی
-    parser.add_argument('--fixed_weights', type=float, nargs='+', 
+
+    parser.add_argument('--fixed_weights', type=float, nargs='+',
                         default=[0.130522, 0.775484, 0.093994],
                         help="Mean weights from HFDE final evaluation")
-    
+
     args = parser.parse_args()
-    
+
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
-    # نرمال‌سازی (همان مقادیر کد اصلی)
+
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-    
+
     num_models = len(args.model_paths)
     MEANS = DEFAULT_MEANS[:num_models]
     STDS  = DEFAULT_STDS[:num_models]
-    
-    # لود مدل‌ها
+
     base_models = load_pruned_models(args.model_paths, device)
     MODEL_NAMES = args.model_names[:len(base_models)]
-    
-    # ساخت Fixed Ensemble
+
     fixed_ensemble = FixedWeightEnsemble(
         models=base_models,
         means=MEANS,
@@ -211,16 +297,14 @@ def main():
         fixed_weights=args.fixed_weights,
         device=device
     ).to(device)
-    
+
     print(f"\nFixed weights being used: {args.fixed_weights}")
-    
-    # دیتالودر تست
+
     _, _, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=False, seed=args.seed, is_main=True
     )
-    
-    # ارزیابی
+
     results = evaluate_fixed(
         ensemble=fixed_ensemble,
         test_loader=test_loader,
@@ -228,7 +312,6 @@ def main():
         save_dir=args.save_dir,
         model_names=MODEL_NAMES
     )
-
 
 if __name__ == "__main__":
     main()
