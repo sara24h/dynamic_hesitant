@@ -21,7 +21,7 @@ try:
     from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
 except ImportError as e:
     raise ImportError(
-     
+        "Cannot import ResNet_50_pruned_hardfakevsreal from model.ResNet_pruned"
     ) from e
 
 
@@ -48,7 +48,6 @@ def setup_device():
 
 
 def load_single_pruned_model(checkpoint_path: str, device: torch.device) -> nn.Module:
-    """دقیقاً مطابق load_pruned_models فایل اصلی، ولی فقط یک چک‌پوینت."""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     print(f"Loading checkpoint: {checkpoint_path}")
@@ -63,6 +62,134 @@ def normalize(x, mean, std, device):
     mean_t = torch.tensor(mean).view(1, 3, 1, 1).to(device)
     std_t = torch.tensor(std).view(1, 3, 1, 1).to(device)
     return (x - mean_t) / std_t
+
+
+# ================== METRIC HELPERS ==================
+def _safe_div(a, b):
+    return float(a) / float(b) if b > 0 else 0.0
+
+
+def _class_metrics(tp, fp, fn, tn):
+    """
+    متریک‌های یک کلاس را وقتی همان کلاس 'positive' است حساب می‌کند.
+    - Precision = TP / (TP + FP)
+    - Recall (Sensitivity/TPR) = TP / (TP + FN)
+    - Specificity (TNR)         = TN / (TN + FP)
+    - F1                        = 2PR / (P+R)
+    """
+    p = _safe_div(tp, tp + fp)
+    r = _safe_div(tp, tp + fn)
+    s = _safe_div(tn, tn + fp)
+    f = _safe_div(2 * p * r, p + r)
+    return {
+        "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
+        "support": int(tp + fn),
+        "precision": p,
+        "recall": r,
+        "specificity": s,
+        "f1": f,
+    }
+
+
+def compute_all_metrics(y_true, y_score, y_pred, threshold=0.5):
+    """
+    همه متریک‌ها را با قرارداد:
+        0 = fake (negative in code)   |   1 = real (positive in code)
+    خروجی: یک دیکشنری جامع که هم برای چاپ و هم برای JSON مناسب است.
+    """
+    y_true  = np.asarray(y_true,  dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float32)
+    y_pred  = np.asarray(y_pred,  dtype=np.int64)
+
+    TP = int(((y_true == 1) & (y_pred == 1)).sum())
+    TN = int(((y_true == 0) & (y_pred == 0)).sum())
+    FP = int(((y_true == 0) & (y_pred == 1)).sum())
+    FN = int(((y_true == 1) & (y_pred == 0)).sum())
+    total = TP + TN + FP + FN
+
+    # ---- per-class ----
+    real_m = _class_metrics(TP, FP, FN, TN)          # positive = real
+    fake_m = _class_metrics(TN, FN, FP, TP)          # positive = fake (TN↔TP, FN↔FP)
+
+    # ---- overall ----
+    accuracy = _safe_div(TP + TN, total)
+
+    # ---- macro ----
+    macro_p  = (real_m["precision"] + fake_m["precision"]) / 2
+    macro_r  = (real_m["recall"]    + fake_m["recall"])    / 2
+    macro_f1 = (real_m["f1"]        + fake_m["f1"])        / 2
+
+    # ---- weighted (by support) ----
+    s_real = real_m["support"]
+    s_fake = fake_m["support"]
+    weighted_p  = _safe_div(real_m["precision"] * s_real + fake_m["precision"] * s_fake, total)
+    weighted_r  = _safe_div(real_m["recall"]    * s_real + fake_m["recall"]    * s_fake, total)
+    weighted_f1 = _safe_div(real_m["f1"]        * s_real + fake_m["f1"]        * s_fake, total)
+
+    # ---- Balanced Accuracy = (recall_real + recall_fake) / 2 ----
+    balanced_acc = (real_m["recall"] + fake_m["recall"]) / 2
+
+    # ---- ROC-AUC (اختیاری) ----
+    roc_auc = None
+    try:
+        from sklearn.metrics import roc_auc_score
+        roc_auc = float(roc_auc_score(y_true, y_score))
+    except ImportError:
+        pass
+
+    return {
+        "confusion": {"TP": TP, "TN": TN, "FP": FP, "FN": FN},
+        "num_samples": total,
+        "num_per_class": {"fake": s_fake, "real": s_real},
+
+        "accuracy": float(accuracy),
+        "balanced_accuracy": float(balanced_acc),
+
+        "class_0_fake": fake_m,
+        "class_1_real": real_m,
+
+        "macro_precision": float(macro_p),
+        "macro_recall":    float(macro_r),
+        "macro_f1":        float(macro_f1),
+
+        "weighted_precision": float(weighted_p),
+        "weighted_recall":    float(weighted_r),
+        "weighted_f1":        float(weighted_f1),
+
+        "roc_auc": roc_auc,
+        "threshold": float(threshold),
+    }
+
+
+def _print_metric_table(metrics, title):
+    cm = metrics["confusion"]
+    fr = metrics["class_0_fake"]
+    rl = metrics["class_1_real"]
+
+    print(f"\n{'='*76}")
+    print(title)
+    print('='*76)
+    print(f"Samples: {metrics['num_samples']}  "
+          f"(fake={metrics['num_per_class']['fake']}, real={metrics['num_per_class']['real']})")
+    print('-'*76)
+    print(f"{'Metric':<20}{'Fake (0)':>15}{'Real (1)':>15}{'Macro Avg':>15}")
+    print('-'*76)
+    print(f"{'Precision':<20}{fr['precision']:>15.4f}{rl['precision']:>15.4f}{metrics['macro_precision']:>15.4f}")
+    print(f"{'Recall (TPR)':<20}{fr['recall']:>15.4f}{rl['recall']:>15.4f}{metrics['macro_recall']:>15.4f}")
+    print(f"{'Specificity (TNR)':<20}{fr['specificity']:>15.4f}{rl['specificity']:>15.4f}{'-':>15}")
+    print(f"{'F1-Score':<20}{fr['f1']:>15.4f}{rl['f1']:>15.4f}{metrics['macro_f1']:>15.4f}")
+    print(f"{'Support':<20}{fr['support']:>15d}{rl['support']:>15d}{metrics['num_samples']:>15d}")
+    print('-'*76)
+    print(f"{'Accuracy':<20}: {metrics['accuracy']*100:.2f}%")
+    print(f"{'Balanced Accuracy':<20}: {metrics['balanced_accuracy']*100:.2f}%")
+    print(f"{'Weighted Precision':<20}: {metrics['weighted_precision']:.4f}")
+    print(f"{'Weighted Recall':<20}: {metrics['weighted_recall']:.4f}")
+    print(f"{'Weighted F1':<20}: {metrics['weighted_f1']:.4f}")
+    if metrics["roc_auc"] is not None:
+        print(f"{'ROC-AUC':<20}: {metrics['roc_auc']:.4f}")
+    print('='*76)
+    print(f"Confusion: TP={cm['TP']}  TN={cm['TN']}  FP={cm['FP']}  FN={cm['FN']}")
+    print('='*76)
 
 
 # ================== AUTO-DETECT DATASET ==================
@@ -103,7 +230,6 @@ def evaluate_model2_single(model, test_loader, device, mean, std, save_dir, mode
     num_samples = len(test_dataset)
 
     all_y_true, all_y_score, all_y_pred = [], [], []
-    TP = TN = FP = FN = 0
     lines = []
     lines.append("=" * 100)
     lines.append(f"MODEL 2 ONLY — SAMPLE-BY-SAMPLE PREDICTIONS ({model_name})")
@@ -138,43 +264,38 @@ def evaluate_model2_single(model, test_loader, device, mean, std, save_dir, mode
             all_y_score.append(prob)
             all_y_pred.append(pred_int)
 
-            if label_int == 1:
-                if pred_int == 1:
-                    TP += 1
-                else:
-                    FN += 1
-            else:
-                if pred_int == 1:
-                    FP += 1
-                else:
-                    TN += 1
-
             correct_str = "Yes" if pred_int == label_int else "No"
             filename = os.path.basename(path)
             if len(filename) > 55:
                 filename = filename[:25] + "..." + filename[-27:]
             lines.append(f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}")
 
-    total = len(all_y_true)
-    correct_count = TP + TN
-    acc = 100.0 * correct_count / total if total > 0 else 0.0
+    y_true_np  = np.array(all_y_true,  dtype=np.int64)
+    y_score_np = np.array(all_y_score, dtype=np.float32)
+    y_pred_np  = np.array(all_y_pred,  dtype=np.int64)
 
-    precision_real = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-    recall_real = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-    f1_real = (2 * precision_real * recall_real / (precision_real + recall_real)
-               if (precision_real + recall_real) > 0 else 0.0)
+    # ============ همه متریک‌ها در یک جا ============
+    metrics = compute_all_metrics(y_true_np, y_score_np, y_pred_np, threshold=0.5)
 
-    precision_fake = TN / (TN + FN) if (TN + FN) > 0 else 0.0
-    recall_fake = TN / (TN + FP) if (TN + FP) > 0 else 0.0
-    f1_fake = (2 * precision_fake * recall_fake / (precision_fake + recall_fake)
-               if (precision_fake + recall_fake) > 0 else 0.0)
+    acc            = metrics["accuracy"] * 100.0
+    balanced_acc   = metrics["balanced_accuracy"] * 100.0
+    macro_f1       = metrics["macro_f1"]
+    macro_precision = metrics["macro_precision"]
+    macro_recall    = metrics["macro_recall"]
+    precision_fake = metrics["class_0_fake"]["precision"]
+    recall_fake    = metrics["class_0_fake"]["recall"]
+    f1_fake        = metrics["class_0_fake"]["f1"]
+    precision_real = metrics["class_1_real"]["precision"]
+    recall_real    = metrics["class_1_real"]["recall"]
+    f1_real        = metrics["class_1_real"]["f1"]
+    TP = metrics["confusion"]["TP"]
+    TN = metrics["confusion"]["TN"]
+    FP = metrics["confusion"]["FP"]
+    FN = metrics["confusion"]["FN"]
+    total = metrics["num_samples"]
+    roc_auc = metrics["roc_auc"]
 
-    macro_precision = (precision_real + precision_fake) / 2
-    macro_recall = (recall_real + recall_fake) / 2
-    macro_f1 = (f1_real + f1_fake) / 2
-    balanced_acc = ((recall_real + recall_fake) / 2) * 100
-
-    # ---------- Confusion Matrix ----------
+    # ---------- Confusion Matrix Figure ----------
     cm = np.array([[TN, FP], [FN, TP]])
     plt.figure(figsize=(8, 6))
     sns.heatmap(
@@ -183,11 +304,13 @@ def evaluate_model2_single(model, test_loader, device, mean, std, save_dir, mode
         yticklabels=["Actual Fake", "Actual Real"],
         cbar=True, annot_kws={"size": 16},
     )
-    plt.title(
+    title = (
         f"Model 2 Only ({model_name})\n"
-        f"Acc: {acc:.2f}% | Bal Acc: {balanced_acc:.2f}% | Macro-F1: {macro_f1:.4f}",
-        fontsize=13, fontweight="bold",
+        f"Acc: {acc:.2f}% | Bal Acc: {balanced_acc:.2f}% | Macro-F1: {macro_f1:.4f}"
     )
+    if roc_auc is not None:
+        title += f" | AUC: {roc_auc:.4f}"
+    plt.title(title, fontsize=12, fontweight="bold")
     plt.ylabel("True Label"); plt.xlabel("Predicted Label")
     plt.tight_layout()
     cm_path = os.path.join(save_dir, "confusion_matrix.png")
@@ -196,21 +319,7 @@ def evaluate_model2_single(model, test_loader, device, mean, std, save_dir, mode
     print(f"✅ Confusion Matrix saved: {cm_path}")
 
     # ---------- Console summary ----------
-    print(f"\n{'='*70}")
-    print(f"MODEL 2 ONLY — FINAL RESULTS ({model_name})")
-    print(f"{'='*70}")
-    print(f"Accuracy          : {acc:.2f}%")
-    print(f"Balanced Accuracy : {balanced_acc:.2f}%")
-    print(f"Macro-F1          : {macro_f1:.4f}")
-    print()
-    print(f"{'Class':<12} {'Precision':>10} {'Recall':>10} {'F1-Score':>10}")
-    print("-" * 45)
-    print(f"{'Fake (0)':<12} {precision_fake:10.4f} {recall_fake:10.4f} {f1_fake:10.4f}")
-    print(f"{'Real (1)':<12} {precision_real:10.4f} {recall_real:10.4f} {f1_real:10.4f}")
-    print("-" * 45)
-    print(f"{'Macro Avg':<12} {macro_precision:10.4f} {macro_recall:10.4f} {macro_f1:10.4f}")
-    print(f"\nTP={TP} TN={TN} FP={FP} FN={FN} | Total={total}")
-    print("=" * 70)
+    _print_metric_table(metrics, f"MODEL 2 ONLY — FINAL RESULTS ({model_name})")
 
     # ---------- results JSON ----------
     results = {
@@ -218,19 +327,41 @@ def evaluate_model2_single(model, test_loader, device, mean, std, save_dir, mode
         "model_name": model_name,
         "dataset": dataset_name,
         "seed": seed,
-        "accuracy": float(acc),
-        "balanced_accuracy": float(balanced_acc),
-        "macro_precision": float(macro_precision),
-        "macro_recall": float(macro_recall),
-        "macro_f1": float(macro_f1),
-        "precision_fake": float(precision_fake),
-        "recall_fake": float(recall_fake),
-        "f1_fake": float(f1_fake),
-        "precision_real": float(precision_real),
-        "recall_real": float(recall_real),
-        "f1_real": float(f1_real),
+
+        # overall
+        "accuracy": metrics["accuracy"] * 100.0,
+        "balanced_accuracy": metrics["balanced_accuracy"] * 100.0,
+
+        # macro
+        "macro_precision": macro_precision,
+        "macro_recall":    macro_recall,
+        "macro_f1":        macro_f1,
+
+        # weighted
+        "weighted_precision": metrics["weighted_precision"],
+        "weighted_recall":    metrics["weighted_recall"],
+        "weighted_f1":        metrics["weighted_f1"],
+
+        # per-class
+        "precision_fake": precision_fake,
+        "recall_fake":    recall_fake,
+        "specificity_fake": metrics["class_0_fake"]["specificity"],
+        "f1_fake":        f1_fake,
+        "support_fake":   metrics["class_0_fake"]["support"],
+
+        "precision_real": precision_real,
+        "recall_real":    recall_real,
+        "specificity_real": metrics["class_1_real"]["specificity"],
+        "f1_real":        f1_real,
+        "support_real":   metrics["class_1_real"]["support"],
+
+        # raw confusion
         "TP": int(TP), "TN": int(TN), "FP": int(FP), "FN": int(FN),
         "num_samples": int(total),
+
+        # AUC
+        "roc_auc": roc_auc,
+        "decision_threshold": 0.5,
     }
     with open(os.path.join(save_dir, "model2_only_results.json"), "w") as f:
         json.dump(results, f, indent=2)
@@ -241,10 +372,16 @@ def evaluate_model2_single(model, test_loader, device, mean, std, save_dir, mode
         "-" * 100, "SUMMARY STATISTICS:", "-" * 100,
         f"Accuracy          : {acc:.2f}%",
         f"Balanced Accuracy : {balanced_acc:.2f}%",
+        f"Macro Precision   : {macro_precision:.4f}",
+        f"Macro Recall      : {macro_recall:.4f}",
         f"Macro F1          : {macro_f1:.4f}",
-        f"Real  P/R/F1 : {precision_real:.4f} / {recall_real:.4f} / {f1_real:.4f}",
-        f"Fake  P/R/F1 : {precision_fake:.4f} / {recall_fake:.4f} / {f1_fake:.4f}",
+        f"Real  P/R/F1 : {precision_real:.4f} / {recall_real:.4f} / {f1_real:.4f} "
+        f"(support={metrics['class_1_real']['support']})",
+        f"Fake  P/R/F1 : {precision_fake:.4f} / {recall_fake:.4f} / {f1_fake:.4f} "
+        f"(support={metrics['class_0_fake']['support']})",
     ]
+    if roc_auc is not None:
+        summary_lines.append(f"ROC-AUC     : {roc_auc:.4f}")
     summary_lines.extend(lines)
     log_path = os.path.join(save_dir, "prediction_log.txt")
     with open(log_path, "w") as f:
@@ -252,10 +389,6 @@ def evaluate_model2_single(model, test_loader, device, mean, std, save_dir, mode
     print(f"✅ Prediction log saved: {log_path}")
 
     # ---------- ROC data ----------
-    y_true_np = np.array(all_y_true)
-    y_score_np = np.array(all_y_score)
-    y_pred_np = np.array(all_y_pred)
-
     roc_json_path = os.path.join(save_dir, "roc_data_test.json")
     with open(roc_json_path, "w", encoding="utf-8") as f:
         json.dump({
@@ -267,6 +400,7 @@ def evaluate_model2_single(model, test_loader, device, mean, std, save_dir, mode
                 "num_samples": int(total),
                 "positive_count": int(y_true_np.sum()),
                 "negative_count": int(total - y_true_np.sum()),
+                "roc_auc": roc_auc,
             },
             "y_true": y_true_np.tolist(),
             "y_score": y_score_np.tolist(),
@@ -284,11 +418,9 @@ def evaluate_model2_single(model, test_loader, device, mean, std, save_dir, mode
     return results
 
 
-# ================== EFFICIENCY BENCHMARK (single model) ==================
+# ================== EFFICIENCY BENCHMARK ==================
 def benchmark_single_model(model, test_loader, device, mean, std):
-  
     model.eval()
-    # warm-up
     with torch.no_grad():
         dummy = torch.randn(1, 3, 256, 256).to(device)
         _ = model(normalize(dummy, mean, std, device))
@@ -345,7 +477,6 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    # ---------- sanity ----------
     if not (0 <= args.model_index < len(args.model_paths)):
         raise ValueError(f"--model_index={args.model_index} خارج از محدوده است")
     if len(args.model_names) != len(args.model_paths):
@@ -357,7 +488,6 @@ def main():
     device = setup_device()
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # ---------- normalization (همان DEFAULTهای فایل اصلی) ----------
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806),
                      (0.4460, 0.3622, 0.3416),
                      (0.4668, 0.3816, 0.3414)]
@@ -378,7 +508,6 @@ def main():
     print(f"Mean / Std  : {mean} / {std}")
     print("=" * 70 + "\n")
 
-    # ---------- data_dir ----------
     data_dir = args.data_dir
     if data_dir is None:
         candidates = find_dataset_dir(args.dataset)
@@ -389,24 +518,20 @@ def main():
         data_dir = candidates[0]
         print(f"[Auto-detect] Using data_dir: {data_dir}")
 
-    # ---------- dataloaders ----------
     _, _, test_loader = create_dataloaders(
         data_dir, args.batch_size, num_workers=args.num_workers,
         dataset_type=args.dataset, is_distributed=False,
         seed=args.seed, is_main=True,
     )
 
-    # ---------- load Model 2 ----------
     model2 = load_single_pruned_model(args.model_paths[idx], device)
     n_params = sum(p.numel() for p in model2.parameters())
     print(f"Model 2 parameters: {n_params:,}")
 
-    # ---------- efficiency ----------
     eff = benchmark_single_model(model2, test_loader, device, mean, std)
     with open(os.path.join(args.save_dir, "efficiency_report.json"), "w") as f:
         json.dump(eff, f, indent=2)
 
-    # ---------- evaluation ----------
     sw = Stopwatch(device).start()
     results = evaluate_model2_single(
         model2, test_loader, device, mean, std,
