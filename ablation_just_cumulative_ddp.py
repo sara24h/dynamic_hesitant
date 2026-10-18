@@ -15,9 +15,10 @@ import json
 import random
 import matplotlib.pyplot as plt
 import seaborn as sns
-
 from old_dataset_utils import create_dataloaders, get_sample_info
+
 warnings.filterwarnings("ignore")
+
 
 # ================== UTILITY ==================
 def set_seed(seed: int = 42):
@@ -29,17 +30,22 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
+
 def setup_ddp():
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
 
+
 def cleanup_ddp():
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
 
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
+
 
 # ================== METRICS ==================
 def compute_full_metrics(y_true, y_pred):
@@ -82,6 +88,7 @@ def compute_full_metrics(y_true, y_pred):
         "TP": TP, "TN": TN, "FP": FP, "FN": FN
     }
 
+
 # ================== MODEL CLASSES ==================
 class MultiModelNormalization(nn.Module):
     def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
@@ -109,10 +116,12 @@ class HesitantFuzzyMembership(nn.Module):
             nn.BatchNorm2d(128), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1)
         )
+
         self.membership_generator = nn.Sequential(
             nn.Linear(128, 128), nn.ReLU(inplace=True), nn.Dropout(dropout),
             nn.Linear(128, num_models * num_memberships)
         )
+
         self.aggregation_weights = nn.Parameter(torch.ones(num_memberships) / num_memberships)
 
     def forward(self, x: torch.Tensor):
@@ -120,9 +129,11 @@ class HesitantFuzzyMembership(nn.Module):
         memberships = self.membership_generator(features)
         memberships = memberships.view(-1, self.num_models, self.num_memberships)
         memberships = torch.sigmoid(memberships)
+
         agg_weights = F.softmax(self.aggregation_weights, dim=0)
         final_weights = (memberships * agg_weights.view(1, 1, -1)).sum(dim=2)
         final_weights = F.softmax(final_weights, dim=1)
+
         return final_weights, memberships
 
 
@@ -146,27 +157,36 @@ class FuzzyHesitantEnsemble(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
+        # base models always stay in eval mode
         for model in self.models:
             model.eval()
         return self
 
     def _compute_mask_vectorized(self, final_weights: torch.Tensor):
-        # فقط Cumulative Thresholding (بدون Override)
+        """Only Cumulative Weight Thresholding (no hesitancy override)"""
         sorted_weights, sorted_indices = torch.sort(final_weights, dim=1, descending=True)
         cum_weights = torch.cumsum(sorted_weights, dim=1)
+
+        # keep models while cumulative sum <= T; always keep the top-1
         mask = (cum_weights <= self.cum_weight_threshold).float()
-        mask[:, 0] = 1.0          # حداقل یک مدل
+        mask[:, 0] = 1.0
+
         final_mask = torch.zeros_like(final_weights)
         final_mask.scatter_(1, sorted_indices, mask)
         return final_mask
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
+
+        # ---- Ablation: only cumulative thresholding ----
         mask = self._compute_mask_vectorized(final_weights)
+
         final_weights = final_weights * mask
         final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
 
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
+
+        # only forward the active models (saves FLOPs)
         active = torch.any(final_weights > 1e-4, dim=0).nonzero(as_tuple=True)[0]
         for i in active:
             x_n = self.normalizations(x, i.item())
@@ -177,6 +197,7 @@ class FuzzyHesitantEnsemble(nn.Module):
             outputs[:, i] = out
 
         final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
+
         if return_details:
             return final_output, final_weights, all_memberships, outputs
         return final_output, final_weights
@@ -188,7 +209,8 @@ def load_pruned_models(model_paths, device):
     models = []
     for i, path in enumerate(model_paths):
         if not os.path.exists(path):
-            print(f"[WARNING] File not found: {path}")
+            if is_main_process():
+                print(f"[WARNING] File not found: {path}")
             continue
         if is_main_process():
             print(f"[{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
@@ -211,6 +233,7 @@ def evaluate_full(model, loader, device, save_dir, model_names, args):
     for images, labels in tqdm(loader, desc="Final Eval", disable=not is_main_process()):
         images = images.to(device)
         labels = labels.to(device).long()
+
         outputs, _ = model(images)
         probs = torch.sigmoid(outputs.squeeze(1))
         preds = (probs > 0.5).long()
@@ -219,7 +242,6 @@ def evaluate_full(model, loader, device, save_dir, model_names, args):
         all_y_score.extend(probs.cpu().numpy().tolist())
         all_y_pred.extend(preds.cpu().numpy().tolist())
 
-    # فقط rank 0 متریک را حساب و چاپ می‌کند
     if is_main_process():
         metrics = compute_full_metrics(all_y_true, all_y_pred)
 
@@ -252,7 +274,7 @@ def evaluate_full(model, loader, device, save_dir, model_names, args):
         plt.savefig(os.path.join(save_dir, "confusion_matrix_no_override.png"), dpi=300)
         plt.close()
 
-        # Save JSON
+        # Save results
         results = {
             "method": "Fuzzy_Hesitant_No_Override",
             "seed": args.seed,
@@ -279,6 +301,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
 
     for images, labels in tqdm(loader, desc=f"Epoch {epoch}", disable=not is_main_process()):
         images, labels = images.to(device), labels.to(device).float()
+
         optimizer.zero_grad()
         outputs, _ = model(images)
         loss = criterion(outputs.squeeze(1), labels)
@@ -309,7 +332,7 @@ def validate(model, loader, device):
 
 # ================== MAIN ==================
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Ablation: No Hesitancy Override (DDP)")
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--lr', type=float, default=0.002)
     parser.add_argument('--batch_size', type=int, default=16)
@@ -326,16 +349,18 @@ def main():
     # ---------- DDP setup ----------
     local_rank = setup_ddp()
     device = torch.device(f'cuda:{local_rank}')
-    set_seed(args.seed + local_rank)   # کمی متفاوت برای هر process
+    set_seed(args.seed)   # same seed for reproducibility
 
     if is_main_process():
         os.makedirs(args.save_dir, exist_ok=True)
         print("="*70)
-        print("ABLATION: NO HESITANCY OVERRIDE  |  2-GPU DDP")
+        print("ABLATION: NO HESITANCY OVERRIDE  |  Multi-GPU DDP")
+        print(f"Seed: {args.seed} | cum_weight_threshold: {args.cum_weight_threshold}")
         print("="*70)
 
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+
     num_models = len(args.model_paths)
     MEANS = DEFAULT_MEANS[:num_models]
     STDS  = DEFAULT_STDS[:num_models]
@@ -358,7 +383,7 @@ def main():
         find_unused_parameters=False
     )
 
-    # DataLoaders
+    # DataLoaders (distributed)
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=True, seed=args.seed, is_main=is_main_process()
@@ -393,39 +418,50 @@ def main():
                 print(f"  → Best model saved ({val_acc:.2f}%)")
 
     # ================================================================
-    # ---------- Final evaluation (FIXED for DDP) ----------
+    # ---------- Final evaluation (Robust for DDP) ----------
     # ================================================================
-    # همه processها به این نقطه می‌رسند (همه epochها تمام شده‌اند)
 
-    # 1) DDP را unwrap می‌کنیم تا forward هیچ collective نداشته باشد
+    # 1. همه processها اینجا همگام می‌شوند
     if dist.is_initialized():
+        dist.barrier()
+
+    # 2. DDP wrapper را باز می‌کنیم
+    if hasattr(ensemble.hesitant_fuzzy, 'module'):
         ensemble.hesitant_fuzzy = ensemble.hesitant_fuzzy.module
 
-    # 2) فقط rank 0 روی کل دیتاست ارزیابی می‌کند
+    # 3. فقط rank 0 ارزیابی نهایی را انجام می‌دهد
     if is_main_process():
-        ckpt = torch.load(
-            os.path.join(args.save_dir, 'best_no_override.pt'),
-            map_location=device
-        )
-        ensemble.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
+        ckpt_path = os.path.join(args.save_dir, 'best_no_override.pt')
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device)
+            ensemble.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
+            print("Best model loaded for final evaluation.")
+        else:
+            print("[WARNING] No checkpoint found. Using last model weights.")
 
-        # یک loader غیر-distributed بساز تا کل تست‌ست دیده شود
+        # ساخت loader کاملاً مستقل و غیر-distributed از کل دیتاست تست
+        base_dataset = test_loader.dataset
+        # اگر Subset یا wrapper بود، به dataset اصلی برویم
+        while hasattr(base_dataset, 'dataset'):
+            base_dataset = base_dataset.dataset
+
         eval_loader = DataLoader(
-            test_loader.dataset,
+            base_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=getattr(test_loader, 'num_workers', 4),
+            num_workers=4,
             pin_memory=True,
             drop_last=False,
         )
 
+        print(f"Evaluating on full test set: {len(base_dataset)} samples")
         final_acc = evaluate_full(
             ensemble, eval_loader, device,
             args.save_dir, MODEL_NAMES, args
         )
         print(f"\nFinal No-Override Accuracy: {final_acc:.2f}%")
 
-    # 3) هر دو rank به barrier می‌رسند تا teardown امن باشد
+    # 4. همه processها دوباره همگام می‌شوند قبل از cleanup
     if dist.is_initialized():
         dist.barrier()
 
