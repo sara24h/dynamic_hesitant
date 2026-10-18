@@ -392,16 +392,42 @@ def main():
                 }, os.path.join(args.save_dir, 'best_no_override.pt'))
                 print(f"  → Best model saved ({val_acc:.2f}%)")
 
-    # ---------- Final evaluation ----------
-    if is_main_process():
-        ckpt = torch.load(os.path.join(args.save_dir, 'best_no_override.pt'), map_location=device)
-        ensemble.hesitant_fuzzy.module.load_state_dict(ckpt['hesitant_state_dict'])
+    # ================================================================
+    # ---------- Final evaluation (FIXED for DDP) ----------
+    # ================================================================
+    # همه processها به این نقطه می‌رسند (همه epochها تمام شده‌اند)
 
-    # همه processها باید در evaluate شرکت کنند (برای DDP)
-    final_acc = evaluate_full(ensemble, test_loader, device, args.save_dir, MODEL_NAMES, args)
+    # 1) DDP را unwrap می‌کنیم تا forward هیچ collective نداشته باشد
+    if dist.is_initialized():
+        ensemble.hesitant_fuzzy = ensemble.hesitant_fuzzy.module
 
+    # 2) فقط rank 0 روی کل دیتاست ارزیابی می‌کند
     if is_main_process():
+        ckpt = torch.load(
+            os.path.join(args.save_dir, 'best_no_override.pt'),
+            map_location=device
+        )
+        ensemble.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
+
+        # یک loader غیر-distributed بساز تا کل تست‌ست دیده شود
+        eval_loader = DataLoader(
+            test_loader.dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=getattr(test_loader, 'num_workers', 4),
+            pin_memory=True,
+            drop_last=False,
+        )
+
+        final_acc = evaluate_full(
+            ensemble, eval_loader, device,
+            args.save_dir, MODEL_NAMES, args
+        )
         print(f"\nFinal No-Override Accuracy: {final_acc:.2f}%")
+
+    # 3) هر دو rank به barrier می‌رسند تا teardown امن باشد
+    if dist.is_initialized():
+        dist.barrier()
 
     cleanup_ddp()
 
