@@ -10,17 +10,14 @@ import warnings
 import argparse
 import json
 import random
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-from metrics_utils import plot_roc_and_f1
-from old_dataset_utils import (
-    UADFVDataset, CustomGenAIDataset, NewGenAIDataset,
-    create_dataloaders, get_sample_info
-)
+from old_dataset_utils import create_dataloaders, get_sample_info
 from visualization_utils import generate_visualizations
-
 warnings.filterwarnings("ignore")
 
-# ================== UTILITY FUNCTIONS ==================
+# ================== UTILITY ==================
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -31,7 +28,6 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 def setup_device():
-    """تنظیم دستگاه برای اجرای تک GPU"""
     if torch.cuda.is_available():
         device = torch.device('cuda:0')
         torch.cuda.set_device(0)
@@ -41,14 +37,55 @@ def setup_device():
         print("WARNING: GPU not found. Running on CPU.")
     return device
 
+# ================== FULL METRICS ==================
+def compute_full_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    TP = int(((y_true == 1) & (y_pred == 1)).sum())
+    TN = int(((y_true == 0) & (y_pred == 0)).sum())
+    FP = int(((y_true == 0) & (y_pred == 1)).sum())
+    FN = int(((y_true == 1) & (y_pred == 0)).sum())
+
+    # Real (positive = 1)
+    prec_real = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+    rec_real  = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+    f1_real   = 2 * prec_real * rec_real / (prec_real + rec_real) if (prec_real + rec_real) > 0 else 0.0
+
+    # Fake (positive = 0)
+    prec_fake = TN / (TN + FN) if (TN + FN) > 0 else 0.0
+    rec_fake  = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+    f1_fake   = 2 * prec_fake * rec_fake / (prec_fake + rec_fake) if (prec_fake + rec_fake) > 0 else 0.0
+
+    macro_p  = (prec_real + prec_fake) / 2
+    macro_r  = (rec_real  + rec_fake)  / 2
+    macro_f1 = (f1_real   + f1_fake)   / 2
+    bal_acc  = (rec_real  + rec_fake)  / 2
+    acc      = (TP + TN) / max(TP + TN + FP + FN, 1)
+
+    return {
+        "accuracy": acc * 100,
+        "balanced_accuracy": bal_acc * 100,
+        "macro_precision": macro_p,
+        "macro_recall": macro_r,
+        "macro_f1": macro_f1,
+        "precision_real": prec_real,
+        "recall_real": rec_real,
+        "f1_real": f1_real,
+        "precision_fake": prec_fake,
+        "recall_fake": rec_fake,
+        "f1_fake": f1_fake,
+        "TP": TP, "TN": TN, "FP": FP, "FN": FN
+    }
+
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader, device, save_dir, model_names, args):
     model.eval()
-    
+
     base_dataset = test_loader.dataset
     if hasattr(base_dataset, 'dataset'):
         base_dataset = base_dataset.dataset
-    
+
     if hasattr(test_loader, 'sampler') and hasattr(test_loader.sampler, 'indices'):
         test_indices = test_loader.sampler.indices
     elif hasattr(test_loader.dataset, 'indices'):
@@ -56,6 +93,7 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
     else:
         test_indices = list(range(len(base_dataset)))
 
+    all_y_true, all_y_score, all_y_pred = [], [], []
     lines = []
     lines.append("="*100)
     lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test Comparison):")
@@ -64,13 +102,8 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
     lines.append(header)
     lines.append("-"*100)
 
-    TP, TN, FP, FN = 0, 0, 0, 0
-    all_y_true = []
-    all_y_score = []
-    all_y_pred = []
-    
     print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
-    
+
     with torch.no_grad():
         for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
             try:
@@ -81,112 +114,91 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
 
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
-            
+
             output = model(image)
-            if isinstance(output, (tuple, list)): output = output[0]
-            
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+
             prob = torch.sigmoid(output.squeeze()).item()
             pred_int = int(prob > 0.5)
-            
+
             all_y_true.append(label_int)
             all_y_score.append(prob)
             all_y_pred.append(pred_int)
-            
-            if label_int == 1:
-                if pred_int == 1: TP += 1
-                else: FN += 1
-            else:
-                if pred_int == 1: FP += 1
-                else: TN += 1
-            
+
             correct_str = "Yes" if pred_int == label_int else "No"
             filename = os.path.basename(path)
-            if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
-            line = f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}"
-            lines.append(line)
+            if len(filename) > 55:
+                filename = filename[:25] + "..." + filename[-27:]
+            lines.append(f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}")
 
-    total_samples = len(all_y_true)
-    correct_count = TP + TN
-    acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
-    
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+    # ---------- Full metrics ----------
+    metrics = compute_full_metrics(all_y_true, all_y_pred)
 
     print(f"\n{'='*70}")
-    print("FINAL RESULTS")
+    print("ABLATION: NO CUMULATIVE THRESHOLDING — FINAL RESULTS")
     print(f"{'='*70}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"Specificity: {specificity:.4f}")
-    print(f"\nConfusion Matrix:")
-    print(f"                 Predicted Real  Predicted Fake")
-    print(f"    Actual Real      {TP:<15} {FN:<15}")
-    print(f"    Actual Fake      {FP:<15} {TN:<15}")
-    print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
-    print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
+    print(f"Accuracy          : {metrics['accuracy']:.2f}%")
+    print(f"Balanced Accuracy : {metrics['balanced_accuracy']:.2f}%")
+    print(f"Macro-F1          : {metrics['macro_f1']:.4f}")
+    print()
+    print(f"{'Class':<12} {'Precision':>10} {'Recall':>10} {'F1-Score':>10}")
+    print("-"*45)
+    print(f"{'Fake (0)':<12} {metrics['precision_fake']:10.4f} {metrics['recall_fake']:10.4f} {metrics['f1_fake']:10.4f}")
+    print(f"{'Real (1)':<12} {metrics['precision_real']:10.4f} {metrics['recall_real']:10.4f} {metrics['f1_real']:10.4f}")
+    print("-"*45)
+    print(f"{'Macro Avg':<12} {metrics['macro_precision']:10.4f} {metrics['macro_recall']:10.4f} {metrics['macro_f1']:10.4f}")
+    print()
+    print(f"Confusion Matrix: TP={metrics['TP']}  TN={metrics['TN']}  FP={metrics['FP']}  FN={metrics['FN']}")
     print("="*70)
 
-    output_str = []
-    output_str.append("-" * 100)
-    output_str.append("SUMMARY STATISTICS:")
-    output_str.append("-" * 100)
-    output_str.append(f"Accuracy: {acc:.2f}%")
-    output_str.append(f"Precision: {precision:.4f}")
-    output_str.append(f"Recall: {recall:.4f}")
-    output_str.append(f"Specificity: {specificity:.4f}")
-    output_str.append("\nConfusion Matrix:")
-    output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
-    output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
-    output_str.append(f"    Actual Fake   {FP:<15} {TN:<15}")
-    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
-    output_str.append(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
-    output_str.extend(lines)
-    
+    # Confusion matrix plot
+    cm = np.array([[metrics['TN'], metrics['FP']],
+                   [metrics['FN'], metrics['TP']]])
+    plt.figure(figsize=(7, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Pred Fake', 'Pred Real'],
+                yticklabels=['True Fake', 'True Real'])
+    plt.title(f"No-Cumsum Ablation\nAcc={metrics['accuracy']:.2f}% | BalAcc={metrics['balanced_accuracy']:.2f}%")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "confusion_matrix_no_cumsum.png"), dpi=300)
+    plt.close()
+    print(f" Confusion matrix saved")
+
+    # Save log
     log_path = os.path.join(save_dir, 'prediction_log.txt')
     with open(log_path, 'w') as f:
-        f.write("\n".join(output_str))
-    print(f"✅ Prediction log saved to: {log_path}")
+        f.write("\n".join(lines))
+    print(f" Prediction log saved to: {log_path}")
 
-    print("\nCollecting ROC data (y_true & y_score) ...")
-    
+    # ROC data
     y_true_np = np.array(all_y_true)
     y_score_np = np.array(all_y_score)
     y_pred_np = np.array(all_y_pred)
 
     roc_json_path = os.path.join(save_dir, "roc_data_test.json")
-    roc_data_json = {
-        "metadata": {
-            "seed": args.seed,
-            "dataset": args.dataset,
-            "num_samples": int(total_samples),
-            "positive_count": int(np.sum(y_true_np)),
-            "negative_count": int(total_samples - np.sum(y_true_np)),
-            "model": "fuzzy_hesitant_ensemble_ablation_no_cumsum"
-        },
-        "y_true": y_true_np.tolist(),
-        "y_score": y_score_np.tolist(),
-        "y_pred": y_pred_np.tolist()
-    }
-    with open(roc_json_path, 'w', encoding='utf-8') as f:
-        json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
+    with open(roc_json_path, 'w') as f:
+        json.dump({
+            "metadata": {
+                "seed": args.seed,
+                "dataset": args.dataset,
+                "num_samples": len(all_y_true),
+                "model": "fuzzy_hesitant_ensemble_ablation_no_cumsum"
+            },
+            "y_true": y_true_np.tolist(),
+            "y_score": y_score_np.tolist(),
+            "y_pred": y_pred_np.tolist()
+        }, f, indent=2)
     print(f"ROC data saved (JSON): {roc_json_path}")
 
-    roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
-    with open(roc_txt_path, 'w', encoding='utf-8') as f:
-        f.write("y_true\ty_score\ty_pred\n")
-        for t, s, p in zip(y_true_np, y_score_np, y_pred_np):
-            f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
-    print(f"ROC data saved (TXT):  {roc_txt_path}")
-
+    # Visualizations
     vis_dir = os.path.join(save_dir, 'visualizations')
     generate_visualizations(
         model, test_loader, device, vis_dir, model_names,
         args.num_grad_cam_samples, args.num_lime_samples,
         args.dataset, is_main=True)
 
-    return acc, y_true_np, y_score_np
-
+    return metrics['accuracy'], y_true_np, y_score_np
 
 # ================== MODEL CLASSES ==================
 class MultiModelNormalization(nn.Module):
@@ -198,6 +210,7 @@ class MultiModelNormalization(nn.Module):
 
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
+
 
 class HesitantFuzzyMembership(nn.Module):
     def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, dropout: float = 0.3):
@@ -229,10 +242,11 @@ class HesitantFuzzyMembership(nn.Module):
         final_weights = F.softmax(final_weights, dim=1)
         return final_weights, memberships
 
+
 class FuzzyHesitantEnsemble(nn.Module):
-    def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
-                 stds: List[Tuple[float]], num_memberships: int = 3, freeze_models: bool = True,
-                 cum_weight_threshold: float = 0.9, hesitancy_threshold: float = 0.2):
+    """Ablation: No Cumulative Thresholding (all models always active)"""
+    def __init__(self, models, means, stds, num_memberships=3, freeze_models=True,
+                 cum_weight_threshold=0.9, hesitancy_threshold=0.2):
         super().__init__()
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
@@ -248,25 +262,29 @@ class FuzzyHesitantEnsemble(nn.Module):
                 for p in model.parameters():
                     p.requires_grad = False
 
-    def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
-  
+    def train(self, mode=True):
+        super().train(mode)
+        for model in self.models:
+            model.eval()
+        return self
+
+    def _compute_mask_vectorized(self, final_weights, avg_hesitancy):
+        # Ablation: همیشه همه مدل‌ها فعال
         return torch.ones_like(final_weights)
 
-    def forward(self, x: torch.Tensor, return_details: bool = False):
+    def forward(self, x, return_details=False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
         hesitancy = all_memberships.var(dim=2)
         avg_hesitancy = hesitancy.mean(dim=1)
-        
+
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
-        
         final_weights = final_weights * mask
         final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
 
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-        active_models = torch.any(final_weights > 0, dim=0).nonzero(as_tuple=True)[0]
-
-        for i in active_models:
-            x_n = self.normalizations(x, i.item())
+        # همه مدل‌ها همیشه فعال‌اند
+        for i in range(self.num_models):
+            x_n = self.normalizations(x, i)
             with torch.no_grad():
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
@@ -279,13 +297,9 @@ class FuzzyHesitantEnsemble(nn.Module):
         return final_output, final_weights
 
 
-# ================== MODEL LOADING ==================
-def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.Module]:
-    try:
-        from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
-    except ImportError:
-        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
-
+# ================== LOAD & EVAL HELPERS ==================
+def load_pruned_models(model_paths, device):
+    from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     models = []
     print(f"Loading {len(model_paths)} pruned models...")
     for i, path in enumerate(model_paths):
@@ -293,23 +307,18 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
             print(f" [WARNING] File not found: {path}")
             continue
         print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
-        try:
-            ckpt = torch.load(path, map_location='cpu', weights_only=False)
-            model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
-            model.load_state_dict(ckpt['model_state_dict'])
-            model = model.to(device).eval()
-            models.append(model)
-        except Exception as e:
-            print(f" [ERROR] Failed to load {path}: {e}")
-    if len(models) == 0: raise ValueError("No models loaded!")
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
+        model.load_state_dict(ckpt['model_state_dict'])
+        model = model.to(device).eval()
+        models.append(model)
+    if len(models) == 0:
+        raise ValueError("No models loaded!")
     return models
 
 
-# ================== EVALUATION FUNCTIONS (Single GPU) ==================
 @torch.no_grad()
-def evaluate_single_model(model: nn.Module, loader: DataLoader, device: torch.device,
-                          name: str, mean: Tuple[float, float, float],
-                          std: Tuple[float, float, float]) -> float:
+def evaluate_single_model(model, loader, device, name, mean, std):
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
@@ -317,13 +326,14 @@ def evaluate_single_model(model: nn.Module, loader: DataLoader, device: torch.de
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
         out = model(images)
-        if isinstance(out, (tuple, list)): out = out[0]
+        if isinstance(out, (tuple, list)):
+            out = out[0]
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-
     acc = 100. * correct / len(loader.dataset)
     print(f" {name}: {acc:.2f}%")
     return acc
+
 
 @torch.no_grad()
 def evaluate_accuracy(model, loader, device):
@@ -334,13 +344,12 @@ def evaluate_accuracy(model, loader, device):
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-    
     return 100. * correct / len(loader.dataset)
 
 
 # ================== TRAINING ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
-                        device, save_dir, model_names):
+                         device, save_dir, model_names):
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -352,177 +361,103 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     print("Training Fuzzy Hesitant Network (ABLATION: No Cumulative Thresholding)")
     print("="*70)
     print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
-    print(f"Epochs: {num_epochs} | Initial LR: {lr}")
-    print(f"Hesitant memberships per model: {hesitant_net.num_memberships}")
-    print(f"Number of models: {len(model_names)}\n")
+    print(f"Epochs: {num_epochs} | LR: {lr}\n")
 
     for epoch in range(num_epochs):
-        if hasattr(train_loader.sampler, 'set_epoch'): train_loader.sampler.set_epoch(epoch)
         ensemble_model.train()
-        
         train_loss = 0.0
         train_correct = 0
         train_total = 0
-        
-        sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
-        sum_active_models = torch.zeros(len(model_names), device=device)
-        
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
-        for images, labels in pbar:
+
+        for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}'):
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
-            
             outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
             optimizer.step()
 
-            batch_size = images.size(0)
-            train_loss += loss.item() * batch_size
+            train_loss += loss.item() * images.size(0)
             pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
-            train_total += batch_size
-            
-            per_model_hesitancy = memberships.var(dim=2)
-            sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
-            
-            active_mask = (weights > 1e-4).float()
-            sum_active_models += active_mask.sum(dim=0)
+            train_total += images.size(0)
 
         train_acc = 100. * train_correct / train_total
         train_loss = train_loss / train_total
-        
-        avg_per_model_hesitancy = sum_per_model_hesitancy / train_total
-        avg_model_activation = (sum_active_models / train_total) * 100
-        overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
-        
         val_acc = evaluate_accuracy(ensemble_model, val_loader, device)
         scheduler.step()
 
-        print(f"\n{'='*70}")
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        print(f"{'='*70}")
-        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-        print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
-        
-        print(f"\n{'Hesitancy (Variance) per Model:':^70}")
-        print(f"{'-'*70}")
-        for i, name in enumerate(model_names):
-            hesitancy_val = avg_per_model_hesitancy[i].item()
-            print(f"  {i+1:2d}. {name:<30}: {hesitancy_val:.6f}")
-        print(f"{'-'*70}")
-        print(f"  {'Overall Mean Hesitancy:':<30}  {overall_mean_hesitancy:.6f}")
-        
-        print(f"\n{'NOTE: Cumulative Thresholding is DISABLED (Ablation)':^70}")
-        print(f"{'-'*70}")
-        print(f"  All models are active for all samples.")
-        print(f"  Decision is purely based on Fuzzy Weights.")
-        
-        print(f"\n{'Model Activation Frequency (Always 100%):':^70}")
-        print(f"{'-'*70}")
-        for i, name in enumerate(model_names):
-            activation_pct = avg_model_activation[i].item()
-            bar_length = int(activation_pct / 2)
-            bar = '█' * bar_length
-            print(f"  {i+1:2d}. {name:<30}: {activation_pct:5.1f}% {bar}")
+        print(f"Epoch {epoch+1:3d} | Train Loss: {train_loss:.4f} | "
+              f"Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            save_path = os.path.join(save_dir, 'best_hesitant_fuzzy.pt')
-            torch.save({'hesitant_state_dict': hesitant_net.state_dict()}, save_path)
-            print(f"\n✓ Best model saved → {val_acc:.2f}%")
-
-        print()
+            torch.save({'hesitant_state_dict': hesitant_net.state_dict()},
+                       os.path.join(save_dir, 'best_hesitant_fuzzy.pt'))
+            print(f"  → Best model saved ({val_acc:.2f}%)")
 
     return best_val_acc
 
 
-# ================== MAIN FUNCTION ==================
+# ================== MAIN ==================
 def main():
-    parser = argparse.ArgumentParser(description="Ablation Study: No Cumulative Thresholding (Single GPU)")
-    parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--lr', type=float, default=0.0001)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--dataset', type=str, required=True, choices=['wild', 'hard_fake_real', 'deepfake_lab', 'uadfV', 'custom_genai', 'custom_genai_v2', 'real_fake_dataset'])
+    parser = argparse.ArgumentParser(description="Ablation: No Cumulative Thresholding (Single GPU)")
+    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--lr', type=float, default=0.002)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
-    parser.add_argument('--save_dir', type=str, default='./output')
+    parser.add_argument('--save_dir', type=str, default='./ablation_no_cumsum')
     parser.add_argument('--seed', type=int, default=42)
-    
     parser.add_argument('--num_memberships', type=int, default=3)
-    parser.add_argument('--cum_weight_threshold', type=float, default=0.9) # استفاده نمی‌شود
+    parser.add_argument('--cum_weight_threshold', type=float, default=0.9)  # استفاده نمی‌شود
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
-    
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
-    
     args = parser.parse_args()
-
-    if len(args.model_names) != len(args.model_paths):
-        raise ValueError("Number of model_names must match model_paths")
 
     set_seed(args.seed)
     device = setup_device()
 
     print("="*70)
-    print(f"ABLATION STUDY: NO CUMULATIVE THRESHOLDING (Single GPU Mode)")
+    print("ABLATION: NO CUMULATIVE THRESHOLDING (Single GPU)")
     print(f"Seed: {args.seed}")
     print("="*70)
-    print(f"Dataset: {args.dataset}")
-    print(f"Data directory: {args.data_dir}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Models: {len(args.model_paths)}")
-    print("="*70 + "\n")
 
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
-    DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-    
+    DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
     num_models = len(args.model_paths)
-    if num_models > len(DEFAULT_MEANS):
-        MEANS = DEFAULT_MEANS + [DEFAULT_MEANS[-1]] * (num_models - len(DEFAULT_MEANS))
-        STDS = DEFAULT_STDS + [DEFAULT_STDS[-1]] * (num_models - len(DEFAULT_STDS))
-    else:
-        MEANS = DEFAULT_MEANS[:num_models]
-        STDS = DEFAULT_STDS[:num_models]
+    MEANS = DEFAULT_MEANS[:num_models]
+    STDS  = DEFAULT_STDS[:num_models]
 
     base_models = load_pruned_models(args.model_paths, device)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
     ensemble = FuzzyHesitantEnsemble(
         base_models, MEANS, STDS,
-        num_memberships=args.num_memberships, 
+        num_memberships=args.num_memberships,
         freeze_models=True,
         cum_weight_threshold=args.cum_weight_threshold,
         hesitancy_threshold=args.hesitancy_threshold
     ).to(device)
 
-    trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in ensemble.parameters())
-    print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
+    print(f"Trainable params: {sum(p.numel() for p in ensemble.parameters() if p.requires_grad):,}")
 
-    # ایجاد دیتالودرها بدون DDP (is_distributed=False)
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=False, seed=args.seed, is_main=True)
 
-    print("\n" + "="*70)
-    print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
-    print("="*70)
-
+    print("\nINDIVIDUAL MODEL PERFORMANCE")
     individual_accs = []
     for i, model in enumerate(base_models):
-        acc = evaluate_single_model(
-            model, test_loader, device,
-            f"Model {i+1} ({MODEL_NAMES[i]})",
-            MEANS[i], STDS[i])
+        acc = evaluate_single_model(model, test_loader, device,
+                                    f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i])
         individual_accs.append(acc)
-
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
-
-    print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
-    print("="*70)
+    print(f"Best Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%\n")
 
     best_val_acc = train_hesitant_fuzzy(
         ensemble, train_loader, val_loader,
@@ -534,21 +469,16 @@ def main():
         ensemble.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
         print("Best model loaded.\n")
 
-    print("\n" + "="*70)
-    print("FINAL ENSEMBLE EVALUATION (ABLATION: NO CUMSUM)")
-    print("="*70)
-
-    # همان تست لودر را مجدداً استفاده میکنیم (نیازی به ساخت دوباره نیست)
+    print("\nFINAL ENSEMBLE EVALUATION (NO CUMSUM)")
     final_acc, y_true, y_scores = final_evaluation_unified(
-        ensemble, test_loader, device, args.save_dir, MODEL_NAMES, args
-    )
+        ensemble, test_loader, device, args.save_dir, MODEL_NAMES, args)
 
     print("\n" + "="*70)
     print("FINAL COMPARISON")
     print("="*70)
-    print(f"Best Single Model: {best_single:.2f}%")
-    print(f"Ensemble Accuracy: {final_acc:.2f}%")
-    print(f"Improvement: {final_acc - best_single:+.2f}%")
+    print(f"Best Single Model : {best_single:.2f}%")
+    print(f"No-Cumsum Acc     : {final_acc:.2f}%")
+    print(f"Improvement       : {final_acc - best_single:+.2f}%")
     print("="*70)
 
     final_results = {
@@ -570,14 +500,6 @@ def main():
         'seed': args.seed
     }, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
 
-    plot_roc_and_f1(
-        ensemble,
-        test_loader, 
-        device, 
-        args.save_dir, 
-        MODEL_NAMES,
-        is_main=True
-    )
 
 if __name__ == "__main__":
     main()
