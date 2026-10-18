@@ -12,7 +12,6 @@ import json
 import random
 import matplotlib.pyplot as plt
 import seaborn as sns
-
 from old_dataset_utils import create_dataloaders, get_sample_info
 from visualization_utils import generate_visualizations
 warnings.filterwarnings("ignore")
@@ -41,18 +40,15 @@ def setup_device():
 def compute_full_metrics(y_true, y_pred):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
-
     TP = int(((y_true == 1) & (y_pred == 1)).sum())
     TN = int(((y_true == 0) & (y_pred == 0)).sum())
     FP = int(((y_true == 0) & (y_pred == 1)).sum())
     FN = int(((y_true == 1) & (y_pred == 0)).sum())
 
-    # Real (positive = 1)
     prec_real = TP / (TP + FP) if (TP + FP) > 0 else 0.0
     rec_real  = TP / (TP + FN) if (TP + FN) > 0 else 0.0
     f1_real   = 2 * prec_real * rec_real / (prec_real + rec_real) if (prec_real + rec_real) > 0 else 0.0
 
-    # Fake (positive = 0)
     prec_fake = TN / (TN + FN) if (TN + FN) > 0 else 0.0
     rec_fake  = TN / (TN + FP) if (TN + FP) > 0 else 0.0
     f1_fake   = 2 * prec_fake * rec_fake / (prec_fake + rec_fake) if (prec_fake + rec_fake) > 0 else 0.0
@@ -81,7 +77,6 @@ def compute_full_metrics(y_true, y_pred):
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader, device, save_dir, model_names, args):
     model.eval()
-
     base_dataset = test_loader.dataset
     if hasattr(base_dataset, 'dataset'):
         base_dataset = base_dataset.dataset
@@ -103,13 +98,12 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
     lines.append("-"*100)
 
     print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
-
     with torch.no_grad():
         for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
             try:
                 image, label = base_dataset[global_idx]
                 path, _ = get_sample_info(base_dataset, global_idx)
-            except Exception as e:
+            except Exception:
                 continue
 
             image = image.unsqueeze(0).to(device)
@@ -132,11 +126,10 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
                 filename = filename[:25] + "..." + filename[-27:]
             lines.append(f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}")
 
-    # ---------- Full metrics ----------
     metrics = compute_full_metrics(all_y_true, all_y_pred)
 
     print(f"\n{'='*70}")
-    print("ABLATION: NO CUMULATIVE THRESHOLDING — FINAL RESULTS")
+    print("ABLATION: JUST-HESITANCY (No Cumulative Thresholding) — FINAL RESULTS")
     print(f"{'='*70}")
     print(f"Accuracy          : {metrics['accuracy']:.2f}%")
     print(f"Balanced Accuracy : {metrics['balanced_accuracy']:.2f}%")
@@ -152,26 +145,23 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
     print(f"Confusion Matrix: TP={metrics['TP']}  TN={metrics['TN']}  FP={metrics['FP']}  FN={metrics['FN']}")
     print("="*70)
 
-    # Confusion matrix plot
     cm = np.array([[metrics['TN'], metrics['FP']],
                    [metrics['FN'], metrics['TP']]])
     plt.figure(figsize=(7, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=['Pred Fake', 'Pred Real'],
                 yticklabels=['True Fake', 'True Real'])
-    plt.title(f"No-Cumsum Ablation\nAcc={metrics['accuracy']:.2f}% | BalAcc={metrics['balanced_accuracy']:.2f}%")
+    plt.title(f"Just-Hesitancy Ablation\nAcc={metrics['accuracy']:.2f}% | BalAcc={metrics['balanced_accuracy']:.2f}%")
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "confusion_matrix_no_cumsum.png"), dpi=300)
+    plt.savefig(os.path.join(save_dir, "confusion_matrix_just_hesitancy.png"), dpi=300)
     plt.close()
-    print(f" Confusion matrix saved")
+    print("Confusion matrix saved")
 
-    # Save log
     log_path = os.path.join(save_dir, 'prediction_log.txt')
     with open(log_path, 'w') as f:
         f.write("\n".join(lines))
-    print(f" Prediction log saved to: {log_path}")
+    print(f"Prediction log saved to: {log_path}")
 
-    # ROC data
     y_true_np = np.array(all_y_true)
     y_score_np = np.array(all_y_score)
     y_pred_np = np.array(all_y_pred)
@@ -183,7 +173,7 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
                 "seed": args.seed,
                 "dataset": args.dataset,
                 "num_samples": len(all_y_true),
-                "model": "fuzzy_hesitant_ensemble_ablation_no_cumsum"
+                "model": "fuzzy_hesitant_ensemble_ablation_just_hesitancy"
             },
             "y_true": y_true_np.tolist(),
             "y_score": y_score_np.tolist(),
@@ -191,7 +181,6 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
         }, f, indent=2)
     print(f"ROC data saved (JSON): {roc_json_path}")
 
-    # Visualizations
     vis_dir = os.path.join(save_dir, 'visualizations')
     generate_visualizations(
         model, test_loader, device, vis_dir, model_names,
@@ -211,12 +200,12 @@ class MultiModelNormalization(nn.Module):
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
-
 class HesitantFuzzyMembership(nn.Module):
     def __init__(self, input_dim: int, num_models: int, num_memberships: int = 3, dropout: float = 0.3):
         super().__init__()
         self.num_models = num_models
         self.num_memberships = num_memberships
+
         self.feature_net = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(32), nn.ReLU(inplace=True),
@@ -237,14 +226,18 @@ class HesitantFuzzyMembership(nn.Module):
         memberships = self.membership_generator(features)
         memberships = memberships.view(-1, self.num_models, self.num_memberships)
         memberships = torch.sigmoid(memberships)
+
         agg_weights = F.softmax(self.aggregation_weights, dim=0)
         final_weights = (memberships * agg_weights.view(1, 1, -1)).sum(dim=2)
         final_weights = F.softmax(final_weights, dim=1)
         return final_weights, memberships
 
-
 class FuzzyHesitantEnsemble(nn.Module):
-    """Ablation: No Cumulative Thresholding (all models always active)"""
+    """
+    Ablation: Just-Hesitancy
+    - Cumulative Weight Thresholding: REMOVED
+    - Hesitancy Override: ACTIVE
+    """
     def __init__(self, models, means, stds, num_memberships=3, freeze_models=True,
                  cum_weight_threshold=0.9, hesitancy_threshold=0.2):
         super().__init__()
@@ -253,6 +246,8 @@ class FuzzyHesitantEnsemble(nn.Module):
         self.normalizations = MultiModelNormalization(means, stds)
         self.hesitant_fuzzy = HesitantFuzzyMembership(
             input_dim=128, num_models=self.num_models, num_memberships=num_memberships)
+        
+        # cum_weight_threshold دیگر استفاده نمی‌شود (ablation)
         self.cum_weight_threshold = cum_weight_threshold
         self.hesitancy_threshold = hesitancy_threshold
 
@@ -269,20 +264,45 @@ class FuzzyHesitantEnsemble(nn.Module):
         return self
 
     def _compute_mask_vectorized(self, final_weights, avg_hesitancy):
-        # Ablation: همیشه همه مدل‌ها فعال
-        return torch.ones_like(final_weights)
+        """
+        Just-Hesitancy Ablation Logic:
+        - No Cumulative Thresholding → همه مدل‌ها در نظر گرفته می‌شوند
+        - Hesitancy Override → اگر hesitancy بالا باشد، به مدل با بیشترین وزن سوییچ می‌کنیم
+        """
+        batch_size = final_weights.size(0)
+        device = final_weights.device
+
+        # حالت پیش‌فرض: همه مدل‌ها فعال (بدون cumulative selection)
+        mask = torch.ones_like(final_weights)
+
+        # ---------- Hesitancy Override ----------
+        # اگر میانگین hesitancy از آستانه بیشتر باشد → فقط قوی‌ترین مدل را نگه دار
+        high_hesitancy = avg_hesitancy > self.hesitancy_threshold   # (B,)
+
+        if high_hesitancy.any():
+            top_idx = final_weights.argmax(dim=1)                   # (B,)
+            override_mask = torch.zeros_like(final_weights)
+            override_mask[torch.arange(batch_size, device=device), top_idx] = 1.0
+
+            # فقط برای نمونه‌هایی که hesitancy بالا دارند override اعمال شود
+            mask = torch.where(high_hesitancy.unsqueeze(1), override_mask, mask)
+
+        return mask
 
     def forward(self, x, return_details=False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
-        hesitancy = all_memberships.var(dim=2)
-        avg_hesitancy = hesitancy.mean(dim=1)
 
+        # محاسبه hesitancy (واریانس membershipها)
+        hesitancy = all_memberships.var(dim=2)          # (B, num_models)
+        avg_hesitancy = hesitancy.mean(dim=1)           # (B,)
+
+        # اعمال mask (فقط hesitancy override)
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
         final_weights = final_weights * mask
         final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
 
+        # اجرای همه مدل‌ها
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-        # همه مدل‌ها همیشه فعال‌اند
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
             with torch.no_grad():
@@ -292,10 +312,10 @@ class FuzzyHesitantEnsemble(nn.Module):
             outputs[:, i] = out
 
         final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
+
         if return_details:
             return final_output, final_weights, all_memberships, outputs
         return final_output, final_weights
-
 
 # ================== LOAD & EVAL HELPERS ==================
 def load_pruned_models(model_paths, device):
@@ -316,7 +336,6 @@ def load_pruned_models(model_paths, device):
         raise ValueError("No models loaded!")
     return models
 
-
 @torch.no_grad()
 def evaluate_single_model(model, loader, device, name, mean, std):
     model.eval()
@@ -334,7 +353,6 @@ def evaluate_single_model(model, loader, device, name, mean, std):
     print(f" {name}: {acc:.2f}%")
     return acc
 
-
 @torch.no_grad()
 def evaluate_accuracy(model, loader, device):
     model.eval()
@@ -346,7 +364,6 @@ def evaluate_accuracy(model, loader, device):
         correct += pred.eq(labels.long()).sum().item()
     return 100. * correct / len(loader.dataset)
 
-
 # ================== TRAINING ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                          device, save_dir, model_names):
@@ -355,10 +372,10 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
-    best_val_acc = 0.0
 
+    best_val_acc = 0.0
     print("="*70)
-    print("Training Fuzzy Hesitant Network (ABLATION: No Cumulative Thresholding)")
+    print("Training Fuzzy Hesitant Network (ABLATION: Just-Hesitancy)")
     print("="*70)
     print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
     print(f"Epochs: {num_epochs} | LR: {lr}\n")
@@ -372,6 +389,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}'):
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
+
             outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
@@ -398,10 +416,9 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
 
     return best_val_acc
 
-
 # ================== MAIN ==================
 def main():
-    parser = argparse.ArgumentParser(description="Ablation: No Cumulative Thresholding (Single GPU)")
+    parser = argparse.ArgumentParser(description="Ablation: Just-Hesitancy (No Cumulative Thresholding)")
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--lr', type=float, default=0.002)
     parser.add_argument('--batch_size', type=int, default=16)
@@ -409,10 +426,10 @@ def main():
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
-    parser.add_argument('--save_dir', type=str, default='./ablation_no_cumsum')
+    parser.add_argument('--save_dir', type=str, default='./ablation_just_hesitancy')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num_memberships', type=int, default=3)
-    parser.add_argument('--cum_weight_threshold', type=float, default=0.9)  # استفاده نمی‌شود
+    parser.add_argument('--cum_weight_threshold', type=float, default=0.9)   # استفاده نمی‌شود
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
@@ -422,12 +439,14 @@ def main():
     device = setup_device()
 
     print("="*70)
-    print("ABLATION: NO CUMULATIVE THRESHOLDING (Single GPU)")
+    print("ABLATION: JUST-HESITANCY (No Cumulative Thresholding)")
     print(f"Seed: {args.seed}")
+    print(f"Hesitancy Threshold: {args.hesitancy_threshold}")
     print("="*70)
 
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+
     num_models = len(args.model_paths)
     MEANS = DEFAULT_MEANS[:num_models]
     STDS  = DEFAULT_STDS[:num_models]
@@ -455,6 +474,7 @@ def main():
         acc = evaluate_single_model(model, test_loader, device,
                                     f"Model {i+1} ({MODEL_NAMES[i]})", MEANS[i], STDS[i])
         individual_accs.append(acc)
+
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
     print(f"Best Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%\n")
@@ -469,7 +489,7 @@ def main():
         ensemble.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
         print("Best model loaded.\n")
 
-    print("\nFINAL ENSEMBLE EVALUATION (NO CUMSUM)")
+    print("\nFINAL ENSEMBLE EVALUATION (JUST-HESITANCY)")
     final_acc, y_true, y_scores = final_evaluation_unified(
         ensemble, test_loader, device, args.save_dir, MODEL_NAMES, args)
 
@@ -477,14 +497,15 @@ def main():
     print("FINAL COMPARISON")
     print("="*70)
     print(f"Best Single Model : {best_single:.2f}%")
-    print(f"No-Cumsum Acc     : {final_acc:.2f}%")
+    print(f"Just-Hesitancy Acc: {final_acc:.2f}%")
     print(f"Improvement       : {final_acc - best_single:+.2f}%")
     print("="*70)
 
     final_results = {
         'seed': args.seed,
-        'method': 'Fuzzy_Hesitant_No_Cumsum',
-        'ablation': 'Cumulative Thresholding Removed',
+        'method': 'Fuzzy_Hesitant_Just_Hesitancy',
+        'ablation': 'Cumulative Thresholding Removed (Hesitancy Override Active)',
+        'hesitancy_threshold': args.hesitancy_threshold,
         'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
         'ensemble': {'test_accuracy': float(final_acc)},
         'improvement': float(final_acc - best_single)
@@ -497,9 +518,9 @@ def main():
         'model_names': MODEL_NAMES,
         'means': MEANS,
         'stds': STDS,
-        'seed': args.seed
+        'seed': args.seed,
+        'hesitancy_threshold': args.hesitancy_threshold
     }, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
-
 
 if __name__ == "__main__":
     main()
