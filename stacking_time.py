@@ -599,7 +599,7 @@ def measure_latency_throughput(model, loader, device, is_main=True, num_runs=10)
         t1 = time.perf_counter()
         lat_runs.append((t1 - t0) / N * 1000.0)
     lat_mean = float(np.mean(lat_runs))
-    lat_std = float(np.std(lat_runs))
+    lat_std = float(np.std(lat_runs, ddof=1))
     
     tp_runs = []
     for _ in range(num_runs):
@@ -614,7 +614,7 @@ def measure_latency_throughput(model, loader, device, is_main=True, num_runs=10)
         t1 = time.perf_counter()
         tp_runs.append(N / (t1 - t0))
     tp_mean = float(np.mean(tp_runs))
-    tp_std = float(np.std(tp_runs))
+    tp_std = float(np.std(tp_runs, ddof=1))
     
     ct_runs = []
     for _ in range(num_runs):
@@ -629,7 +629,7 @@ def measure_latency_throughput(model, loader, device, is_main=True, num_runs=10)
         t1 = time.perf_counter()
         ct_runs.append(t1 - t0)
     ct_mean = float(np.mean(ct_runs))
-    ct_std = float(np.std(ct_runs))
+    ct_std = float(np.std(ct_runs, ddof=1))
     
     results = {
         'num_test_images': int(N),
