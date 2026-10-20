@@ -566,13 +566,13 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
 
     with open(save_path, 'w') as f:
         json.dump(output_data, f, indent=4)
-    print(f"✅ Predictions JSON saved to: {save_path}")
+    print(f"Predictions JSON saved to: {save_path}")
 
 
 # ================== ADDED: formatted efficiency summary ==================
 @torch.no_grad()
 def print_efficiency_summary_formatted(model, test_loader, device,
-                                       n_runs=3, bs_lat=1, bs_thr=16,
+                                       n_runs=10, bs_lat=1, bs_thr=16,
                                        title="HFDE"):
     """Prints latency / throughput / computational time in the requested format."""
     model.eval()
@@ -586,7 +586,7 @@ def print_efficiency_summary_formatted(model, test_loader, device,
     img_size = images_gpu.shape[-1]
 
     # ---- latency (bs=1), 30 measurements ----
-    x1 = torch.randn(bs_lat, 3, img_size, img_size, device=device)
+    x1 = torch.randn(bs_lat, 10, img_size, img_size, device=device)
     for _ in range(10):
         _ = model(x1)
     if device.type == "cuda":
@@ -604,7 +604,7 @@ def print_efficiency_summary_formatted(model, test_loader, device,
     lat_m, lat_s = float(lat.mean()), float(lat.std())
 
     # ---- throughput (bs=bs_thr), n_runs batches of 10 forwards ----
-    xb = torch.randn(bs_thr, 3, img_size, img_size, device=device)
+    xb = torch.randn(bs_thr, 10, img_size, img_size, device=device)
     for _ in range(5):
         _ = model(xb)
     if device.type == "cuda":
@@ -778,7 +778,7 @@ def main():
         try:
             fmt = print_efficiency_summary_formatted(
                 ensemble_module, test_loader, device,
-                n_runs=3, bs_lat=1, bs_thr=args.batch_size,
+                n_runs=10, bs_lat=1, bs_thr=args.batch_size,
                 title="HFDE",
             )
             if not isinstance(efficiency, dict):
