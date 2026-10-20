@@ -14,7 +14,7 @@ import time
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-from metrics_utils import plot_roc_and_f1
+# from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
 
@@ -27,8 +27,8 @@ from old_dataset_utils import (
 
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
 
-# ================== NEW IMPORT: EFFICIENCY BENCHMARK ==================
-from efficiency_utils import Stopwatch, benchmark_efficiency
+# ================== EFFICIENCY BENCHMARK ==================
+from efficiency_utils import Stopwatch, benchmark_efficiency, print_headline
 
 
 # ================== UTILITY FUNCTIONS ==================
@@ -88,64 +88,6 @@ class WeightedAverageEnsemble(nn.Module):
         if return_details:
             return final_output, norm_weights, None, outputs
         return final_output, norm_weights
-
-
-# ================== BENCHMARK ADAPTER (NEW) ==================
-class _WeightedAvgBenchmarkAdapter(nn.Module):
-    """
-    Adapter so that `benchmark_efficiency` (written for the HFDE ensemble)
-    can be reused with the Weighted Average ensemble:
-
-      * exposes `.models`, `.normalizations`, `.num_models` for the warm-up
-        routine,
-      * exposes `.hesitant_fuzzy(x)` -> dummy (N, num_models) weight matrix
-        built from the learned softmax weights (constant per batch),
-      * `forward(x)` returns `(final_output, weights)` so `measure_latency`,
-        `measure_throughput` and `measure_full_pass` work without changes.
-    """
-
-    def __init__(self, ensemble: 'WeightedAverageEnsemble'):
-        super().__init__()
-        self.ensemble = ensemble
-        self.models = ensemble.models
-        self.normalizations = ensemble.normalizations
-        self.num_models = ensemble.num_models
-
-    def eval(self):
-        self.ensemble.eval()
-        return self
-
-    @torch.no_grad()
-    def hesitant_fuzzy(self, x: torch.Tensor):
-        # Learned global weights (softmax) broadcast to (N, num_models).
-        w = F.softmax(self.ensemble.weights, dim=0)
-        return w.unsqueeze(0).expand(x.size(0), -1).contiguous()
-
-    def forward(self, x: torch.Tensor):
-        out, w, _, _ = self.ensemble(x, return_details=True)
-        return out, w
-
-
-def print_headline_weighted_avg(results):
-    """Print ONLY the three headline numbers for the Weighted Average ensemble."""
-    h = results['methods'].get('Weighted Average', {})
-    if not h:
-        return
-    thr = h['throughput']
-    bs = thr['batch_size']
-    fp = results.get('full_test_pass', {})
-    print("=" * 70)
-    print("WEIGHTED AVERAGE EFFICIENCY SUMMARY")
-    print("=" * 70)
-    print(f"Latency (bs=1)          : {h['latency']['mean_ms']:.2f} ± {h['latency']['std_ms']:.2f} ms / image")
-    print(f"Throughput (bs={bs})".ljust(24) +
-          f": {thr['throughput_img_per_s']:.1f} ± {thr['throughput_std_img_per_s']:.1f} images/s "
-          f"(mean ± std of {thr['repeats']} runs)")
-    if fp:
-        print(f"Computational time      : {fp['model_compute_time_s']:.2f} ± {fp['model_compute_time_std_s']:.2f} s "
-              f"(model inference on the whole test set, {fp['num_images']} images, "
-              f"mean of {fp['repeats']} passes; data loading excluded)")
-    print("=" * 70 + "\n")
 
 
 # ================== MODEL LOADING ==================
@@ -326,11 +268,9 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
 
         ensemble_model.train()
 
-        # --- این بخش باید باشد تا BatchNorm مدل‌های پایه آپدیت نشود ---
         actual_module = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
         for model in actual_module.models:
             model.eval()
-        # -------------------------------------------------------------
 
         train_loss = 0.0
         train_correct = 0
@@ -566,7 +506,7 @@ def main():
     device, local_rank, rank, world_size = setup_distributed()
     is_main = rank == 0
 
-    # ============ PIPELINE STOPWATCH (NEW) ============
+    # ============ PIPELINE STOPWATCH ============
     pipeline_sw = Stopwatch(device).start()
 
     if is_main:
@@ -633,33 +573,20 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
 
-    # ============ EFFICIENCY BENCHMARK (REPLACED measure_latency_throughput) ============
+    # ============ EFFICIENCY BENCHMARK (مثل اسکریپت Fuzzy) ============
     os.makedirs(args.save_dir, exist_ok=True)
 
     efficiency = {}
     bench_time = 0.0
     if is_main:
         try:
-            adapter = _WeightedAvgBenchmarkAdapter(ensemble_module).to(device)
             bench_sw = Stopwatch(device).start()
             efficiency = benchmark_efficiency(
-                adapter, test_loader, device, MODEL_NAMES,
-                latency_samples=min(300, len(test_loader.dataset)),
-                verbose=True,
+                ensemble_module, test_loader, device, MODEL_NAMES,
+                latency_samples=len(test_loader.dataset),
             )
             bench_time = bench_sw.stop()
-
-            # Rename HFDE labels to Weighted Average labels
-            if 'HFDE (dynamic)' in efficiency.get('methods', {}):
-                efficiency['methods']['Weighted Average'] = efficiency['methods'].pop('HFDE (dynamic)')
-            efficiency.get('methods', {}).pop('Router only', None)
-            if 'full_test_pass_hfde' in efficiency:
-                efficiency['full_test_pass'] = efficiency.pop('full_test_pass_hfde')
-
-            efficiency['method'] = 'Weighted Average'
-            efficiency['benchmark_time_s'] = float(bench_time)
-
-            print_headline_weighted_avg(efficiency)
+            print_headline(efficiency)
         except Exception as e:
             print(f"[WARNING] Efficiency benchmark failed: {e}")
             efficiency = {}
@@ -744,7 +671,7 @@ def main():
             'seed': args.seed
         }, final_model_path)
 
-        # Save efficiency report separately
+        # Save efficiency report separately (مثل Fuzzy)
         if efficiency:
             efficiency['individual_model_eval_times_s'] = {
                 name: float(t) for name, t in zip(MODEL_NAMES, individual_times)
@@ -764,17 +691,6 @@ def main():
             args.dataset, is_main)
 
     cleanup_distributed()
-
-    if is_main:
-        plot_roc_and_f1(
-            ensemble_module,
-            test_loader,
-            device,
-            args.save_dir,
-            MODEL_NAMES,
-            is_main
-        )
-
 
 if __name__ == "__main__":
     main()
