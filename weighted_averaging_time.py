@@ -15,7 +15,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
 import matplotlib.pyplot as plt
-# from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
 
@@ -93,6 +92,11 @@ class WeightedAverageEnsemble(nn.Module):
         if return_details:
             return final_output, norm_weights, None, outputs
         return final_output, norm_weights
+
+    # ---- compat shim for efficiency_utils.benchmark_efficiency ----
+    def hesitant_fuzzy(self, x: torch.Tensor):
+        # Only used by the old benchmark. Returns uniform weights.
+        return torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
 
 
 # ================== MODEL LOADING ==================
@@ -756,6 +760,7 @@ def main():
     efficiency = {}
     bench_time = 0.0
     if is_main:
+        # --- existing benchmark (now won't fail: hesitant_fuzzy shim added) ---
         try:
             bench_sw = Stopwatch(device).start()
             efficiency = benchmark_efficiency(
@@ -764,22 +769,24 @@ def main():
             )
             bench_time = bench_sw.stop()
             print_headline(efficiency)
-
-            # ============ ADDED: formatted efficiency summary ============
-            try:
-                fmt = print_efficiency_summary_formatted(
-                    ensemble_module, test_loader, device,
-                    n_runs=3, bs_lat=1, bs_thr=args.batch_size,
-                    title="HFDE",
-                )
-                efficiency["formatted_summary"] = fmt
-            except Exception as e:
-                print(f"[WARNING] Formatted efficiency summary failed: {e}")
-            # ==============================================================
         except Exception as e:
             print(f"[WARNING] Efficiency benchmark failed: {e}")
             efficiency = {}
             bench_time = 0.0
+
+        # --- ADDED: formatted summary (independent — always runs) ---
+        try:
+            fmt = print_efficiency_summary_formatted(
+                ensemble_module, test_loader, device,
+                n_runs=3, bs_lat=1, bs_thr=args.batch_size,
+                title="HFDE",
+            )
+            if not isinstance(efficiency, dict):
+                efficiency = {}
+            efficiency["formatted_summary"] = fmt
+        except Exception as e:
+            print(f"[WARNING] Formatted efficiency summary failed: {e}")
+        # ---------------------------------------------------------------
 
     # ============ FINAL EVALUATION ============
     eval_sw = Stopwatch(device).start()
