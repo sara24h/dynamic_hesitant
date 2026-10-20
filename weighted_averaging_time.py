@@ -36,7 +36,6 @@ from efficiency_utils import (
     summarize_training_times,
 )
 
-
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -47,7 +46,6 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
-
 class MultiModelNormalization(nn.Module):
     def __init__(self, means: List[Tuple[float]], stds: List[Tuple[float]]):
         super().__init__()
@@ -57,7 +55,6 @@ class MultiModelNormalization(nn.Module):
 
     def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
-
 
 # ================== WEIGHTED AVERAGING ENSEMBLE ==================
 class WeightedAverageEnsemble(nn.Module):
@@ -77,6 +74,11 @@ class WeightedAverageEnsemble(nn.Module):
                 for p in model.parameters():
                     p.requires_grad = False
 
+
+    def hesitant_fuzzy(self, x: torch.Tensor):
+ 
+        return torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
+
     def forward(self, x: torch.Tensor, return_details: bool = False):
         norm_weights = F.softmax(self.weights, dim=0)
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
@@ -94,7 +96,6 @@ class WeightedAverageEnsemble(nn.Module):
         if return_details:
             return final_output, norm_weights, None, outputs
         return final_output, norm_weights
-
 
 # ================== MODEL LOADING ==================
 def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
