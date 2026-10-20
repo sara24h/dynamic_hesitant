@@ -12,38 +12,34 @@ import json
 import random
 import time
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
+from torch.nn.parallel import DistributedDataParallel as DDP
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
-from old_dataset_utils import (
-    UADFVDataset, 
-    CustomGenAIDataset, 
-    create_dataloaders, 
-    get_sample_info, 
-    worker_init_fn
-)
+from old_dataset_utils import create_dataloaders
+from visualization_utils import generate_visualizations
 
-from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
-
-# ================== EFFICIENCY BENCHMARK ==================
 from efficiency_utils import (
     Stopwatch,
     benchmark_efficiency,
     summarize_training_times,
 )
 
-# ================== UTILITY FUNCTIONS ==================
+
+# ================== UTILITY ==================
 def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
+
+
+def _sync(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
 
 
 class MultiModelNormalization(nn.Module):
@@ -51,66 +47,54 @@ class MultiModelNormalization(nn.Module):
         super().__init__()
         for i, (m, s) in enumerate(zip(means, stds)):
             self.register_buffer(f'mean_{i}', torch.tensor(m).view(1, 3, 1, 1))
-            self.register_buffer(f'std_{i}', torch.tensor(s).view(1, 3, 1, 1))
+            self.register_buffer(f'std_{i}',  torch.tensor(s).view(1, 3, 1, 1))
 
-    def forward(self, x: torch.Tensor, idx: int) -> torch.Tensor:
+    def forward(self, x, idx):
         return (x - getattr(self, f'mean_{idx}')) / getattr(self, f'std_{idx}')
 
 
-# ================== STACKING META LEARNER (Logistic Regression) ==================
+# ================== STACKING ENSEMBLE ==================
 class StackingMetaLearner(nn.Module):
     def __init__(self, num_models: int):
         super().__init__()
         self.linear = nn.Linear(num_models, 1)
-
     def forward(self, x):
         return self.linear(x)
 
 
-# ================== STACKING ENSEMBLE CLASS ==================
 class StackingEnsemble(nn.Module):
-    def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
-                 stds: List[Tuple[float]], freeze_models: bool = True):
+    def __init__(self, models, means, stds, freeze_models=True):
         super().__init__()
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
         self.normalizations = MultiModelNormalization(means, stds)
         self.meta_learner = StackingMetaLearner(self.num_models)
-
         if freeze_models:
-            for model in self.models:
-                model.eval()
-                for p in model.parameters():
+            for m in self.models:
+                m.eval()
+                for p in m.parameters():
                     p.requires_grad = False
 
-    def forward(self, x: torch.Tensor, return_details: bool = False):
-        logits_list = []
+    def forward(self, x, return_details=False):
+        logits = []
         for i in range(self.num_models):
-            x_n = self.normalizations(x, i)
+            xn = self.normalizations(x, i)
             with torch.no_grad():
-                out = self.models[i](x_n)
-                if isinstance(out, (tuple, list)):
-                    out = out[0]
-            logits_list.append(out)
-        
-        stacked_logits = torch.cat(logits_list, dim=1)
-        final_output = self.meta_learner(stacked_logits)
-
+                out = self.models[i](xn)
+                if isinstance(out, (tuple, list)): out = out[0]
+            logits.append(out)
+        stacked = torch.cat(logits, dim=1)
+        final = self.meta_learner(stacked)
+        bs = x.size(0)
+        dummy_w = torch.ones(bs, self.num_models, device=x.device) / self.num_models
         if return_details:
-            batch_size = x.size(0)
-            dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
-            dummy_memberships = torch.zeros(batch_size, self.num_models, 3, device=x.device)
-            return final_output, dummy_weights, dummy_memberships, stacked_logits
-        else:
-            batch_size = x.size(0)
-            dummy_weights = torch.ones(batch_size, self.num_models, device=x.device) / self.num_models
-            return final_output, dummy_weights
+            dummy_m = torch.zeros(bs, self.num_models, 3, device=x.device)
+            return final, dummy_w, dummy_m, stacked
+        return final, dummy_w
 
 
-# ================== BENCHMARK ADAPTER ==================
 class _StackingBenchmarkAdapter(nn.Module):
-
-    def __init__(self, ensemble: 'StackingEnsemble'):
+    def __init__(self, ensemble: StackingEnsemble):
         super().__init__()
         self.ensemble = ensemble
         self.models = ensemble.models
@@ -118,88 +102,70 @@ class _StackingBenchmarkAdapter(nn.Module):
         self.num_models = ensemble.num_models
 
     def eval(self):
-        self.ensemble.eval()
-        return self
+        self.ensemble.eval(); return self
 
     @torch.no_grad()
-    def hesitant_fuzzy(self, x: torch.Tensor):
-        # Stacking has no router → uniform dummy weights.
+    def hesitant_fuzzy(self, x):
         return torch.full((x.size(0), self.num_models),
                           1.0 / self.num_models, device=x.device)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         out, w = self.ensemble(x)
         return out, w
 
 
 # ================== MODEL LOADING ==================
-def load_pruned_models(model_paths: List[str], device: torch.device, is_main: bool) -> List[nn.Module]:
-    try:
-        from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
-    except ImportError:
-        raise ImportError("Cannot import ResNet_50_pruned_hardfakevsreal")
-
+def load_pruned_models(paths, device, is_main):
+    from model.ResNet_pruned import ResNet_50_pruned_hardfakevsreal
     models = []
-    if is_main:
-        print(f"Loading {len(model_paths)} pruned models...")
-
-    for i, path in enumerate(model_paths):
-        if not os.path.exists(path):
-            if is_main:
-                print(f" [WARNING] File not found: {path}")
+    if is_main: print(f"Loading {len(paths)} pruned models...")
+    for i, p in enumerate(paths):
+        if not os.path.exists(p):
+            if is_main: print(f" [WARNING] Missing: {p}")
             continue
-        if is_main:
-            print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
+        if is_main: print(f" [{i+1}/{len(paths)}] {os.path.basename(p)}")
         try:
-            ckpt = torch.load(path, map_location='cpu', weights_only=False)
-            model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
-            model.load_state_dict(ckpt['model_state_dict'])
-            model = model.to(device).eval()
-            param_count = sum(p.numel() for p in model.parameters())
+            ck = torch.load(p, map_location='cpu', weights_only=False)
+            m = ResNet_50_pruned_hardfakevsreal(masks=ck['masks'])
+            m.load_state_dict(ck['model_state_dict'])
+            m = m.to(device).eval()
             if is_main:
-                print(f" → Parameters: {param_count:,}")
-            models.append(model)
+                print(f" → Params: {sum(x.numel() for x in m.parameters()):,}")
+            models.append(m)
         except Exception as e:
-            if is_main:
-                print(f" [ERROR] Failed to load {path}: {e}")
-            continue
-
-    if len(models) == 0:
-        raise ValueError("No models loaded!")
-    if is_main:
-        print(f"All {len(models)} models loaded!\n")
+            if is_main: print(f" [ERROR] {e}")
+    if not models: raise ValueError("No models loaded")
     return models
 
 
-# ================== EVALUATION FUNCTIONS ==================
+def _reduce_correct_total(correct, total, device):
+    c = torch.tensor(correct, dtype=torch.long, device=device)
+    t = torch.tensor(total,   dtype=torch.long, device=device)
+    if dist.is_initialized():
+        dist.all_reduce(c, op=dist.ReduceOp.SUM)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return c.item(), t.item()
+
+
 @torch.no_grad()
-def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torch.device,
-                              name: str, mean: Tuple[float, float, float],
-                              std: Tuple[float, float, float], is_main: bool) -> float:
+def evaluate_single_model_ddp(model, loader, device, name, mean, std, is_main):
     model.eval()
-    normalizer = MultiModelNormalization([mean], [std]).to(device)
+    norm = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
-    
-    total_real_samples = len(loader.dataset)
-    
-    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
-        images, labels = images.to(device), labels.to(device).float()
-        images = normalizer(images, 0)
+    seen = 0
+    for images, labels in tqdm(loader, desc=f"Eval {name}", disable=not is_main):
+        images = norm(images.to(device), 0)
+        labels = labels.to(device).float()
         out = model(images)
-        if isinstance(out, (tuple, list)):
-            out = out[0]
+        if isinstance(out, (tuple, list)): out = out[0]
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
+        seen += labels.size(0)
 
-    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    
-    if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    
-    acc = 100. * correct_tensor.item() / total_real_samples
-    
+    correct, seen = _reduce_correct_total(correct, seen, device)
+    acc = 100. * correct / seen if seen > 0 else 0.0
     if is_main:
-        print(f" {name}: {acc:.2f}% (Real samples: {total_real_samples})")
+        print(f" {name}: {acc:.2f}%  (samples seen: {seen})")
     return acc
 
 
@@ -207,266 +173,218 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 def evaluate_accuracy_ddp(model, loader, device):
     model.eval()
     correct = 0
-    total_real_samples = len(loader.dataset)
-    
+    seen = 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
+        seen += labels.size(0)
 
-    correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
-    
-    if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
-    
-    return 100. * correct_tensor.item() / total_real_samples
+    correct, seen = _reduce_correct_total(correct, seen, device)
+    return 100. * correct / seen if seen > 0 else 0.0
 
 
 @torch.no_grad()
 def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_main=True):
     model.eval()
-    total_correct = 0
-    total_real_samples = len(loader.dataset)
+    correct = 0
+    seen = 0
     ws = dist.get_world_size() if dist.is_initialized() else 1
-    
-    all_y_true = []
-    all_y_score = []
-    all_y_pred = []
+
+    all_true, all_score, all_pred = [], [], []
 
     if is_main:
-        print(f"\nEvaluating {name} set (Stacking - Logistic Regression)...")
-    
-    for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
-        images, labels = images.to(device), labels.to(device)
-        outputs, _ = model(images, return_details=False)
-        
-        probs = torch.sigmoid(outputs.squeeze(1))
-        pred_int = (probs > 0.5).long()
-        
-        all_y_true.extend(labels.cpu().numpy().tolist())
-        all_y_score.extend(probs.cpu().numpy().tolist())
-        all_y_pred.extend(pred_int.cpu().numpy().tolist())
-        
-        total_correct += pred_int.eq(labels.long()).sum().item()
+        print(f"\nEvaluating {name} set (Stacking - LR)...")
 
-    correct_tensor = torch.tensor(total_correct, dtype=torch.long, device=device)
-    
-    if dist.is_initialized():
-        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+    for images, labels in tqdm(loader, desc=f"Eval {name}", disable=not is_main):
+        images, labels = images.to(device), labels.to(device)
+        out, _ = model(images, return_details=False)
+        probs = torch.sigmoid(out.squeeze(1))
+        pred_int = (probs > 0.5).long()
+
+        all_true.extend(labels.cpu().numpy().tolist())
+        all_score.extend(probs.cpu().numpy().tolist())
+        all_pred.extend(pred_int.cpu().numpy().tolist())
+
+        correct += pred_int.eq(labels.long()).sum().item()
+        seen    += labels.size(0)
+
+    correct, seen = _reduce_correct_total(correct, seen, device)
 
     if ws > 1:
-        gathered_true = [None for _ in range(ws)]
-        gathered_score = [None for _ in range(ws)]
-        gathered_pred = [None for _ in range(ws)]
-        
-        dist.all_gather_object(gathered_true, all_y_true)
-        dist.all_gather_object(gathered_score, all_y_score)
-        dist.all_gather_object(gathered_pred, all_y_pred)
-        
+        gt = [None for _ in range(ws)]; gs = [None for _ in range(ws)]; gp = [None for _ in range(ws)]
+        dist.all_gather_object(gt, all_true)
+        dist.all_gather_object(gs, all_score)
+        dist.all_gather_object(gp, all_pred)
         if is_main:
-            all_y_true = [item for sublist in gathered_true for item in sublist]
-            all_y_score = [item for sublist in gathered_score for item in sublist]
-            all_y_pred = [item for sublist in gathered_pred for item in sublist]
+            all_true  = [i for s in gt for i in s]
+            all_score = [i for s in gs for i in s]
+            all_pred  = [i for s in gp for i in s]
 
-    if is_main:
-        all_y_true = all_y_true[:total_real_samples]
-        all_y_score = all_y_score[:total_real_samples]
-        all_y_pred = all_y_pred[:total_real_samples]
-        
-        acc = 100. * correct_tensor.item() / total_real_samples
-        
-        meta_learner = model.meta_learner
-        weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
-        bias = meta_learner.linear.bias.data.cpu().item()
+    if not is_main:
+        return 0.0, [0.0]*len(model_names), 0.0, ([], [], [])
 
-        print(f"\n{'='*70}")
-        print(f"{name.upper()} SET RESULTS (Stacking - Logistic Regression)")
-        print(f"{'='*70}")
-        print(f" → Accuracy: {acc:.3f}%")
-        print(f" → Total Real Samples: {total_real_samples:,}")
-        
-        print(f"\nMeta-Learner (Logistic Regression) Analysis:")
-        print(f"  Bias (Intercept): {bias:+.4f}")
-        print(f"  Learned Weights (Importance of each base model):")
-        for i, (w, mname) in enumerate(zip(weights, model_names)):
-            print(f"    {i+1:2d}. {mname:<25}: {w:+.4f}")
-        
-        print(f"{'='*70}")
-        return acc, weights.tolist(), bias, (all_y_true, all_y_score, all_y_pred)
-    
-    return 0.0, [0.0]*len(model_names), 0.0, ([], [], [])
+    # برای JSON: با shuffle=False و DistributedSampler، ترتیب concat برابر
+    # با ترتیب دیتاست است؛ پس truncate به len(dataset) درست است.
+    N = len(loader.dataset)
+    all_true  = all_true[:N]
+    all_score = all_score[:N]
+    all_pred  = all_pred[:N]
+
+    acc = 100. * correct / seen if seen > 0 else 0.0
+
+    meta = model.meta_learner
+    w = meta.linear.weight.data.cpu().squeeze().numpy()
+    b = meta.linear.bias.data.cpu().item()
+
+    print(f"\n{'='*70}")
+    print(f"{name.upper()} SET RESULTS (Stacking - LR)")
+    print(f"{'='*70}")
+    print(f" → Accuracy: {acc:.3f}%  (evaluated: {seen})")
+    print(f"\nMeta-Learner (LR):")
+    print(f"  Bias: {b:+.4f}")
+    for i, (wi, mn) in enumerate(zip(w, model_names)):
+        print(f"    {i+1:2d}. {mn:<25}: {wi:+.4f}")
+    print(f"{'='*70}")
+    return acc, w.tolist(), b, (all_true, all_score, all_pred)
 
 
+# ================== TRAINING ==================
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
-    
-    actual_module = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
-    meta_learner = actual_module.meta_learner
-    
-    optimizer = torch.optim.AdamW(meta_learner.parameters(), lr=lr, weight_decay=1e-4)
+    actual = ensemble_model.module if hasattr(ensemble_model, 'module') else ensemble_model
+    meta = actual.meta_learner
+
+    optimizer = torch.optim.AdamW(meta.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     criterion = nn.BCEWithLogitsLoss()
 
-    best_val_acc = 0.0
+    best_val = 0.0
     history = {'train_loss': [], 'train_acc': [], 'val_acc': []}
 
-    # ---------- Training time tracking ----------
     epoch_times, train_times, val_times = [], [], []
     total_sw = Stopwatch(device).start()
-    # -------------------------------------------
 
     if is_main:
-        print("="*70)
-        print("Training Stacking Meta-Learner (Logistic Regression)")
-        print("="*70)
-        print(f"Trainable params: {sum(p.numel() for p in meta_learner.parameters()):,}")
-        print(f"Epochs: {num_epochs} | Initial LR: {lr}")
-        print(f"Number of base models: {len(model_names)}\n")
+        print("="*70); print("Training Stacking LR"); print("="*70)
+        print(f"Trainable: {sum(p.numel() for p in meta.parameters()):,}")
+        print(f"Epochs: {num_epochs} | LR: {lr} | Models: {len(model_names)}\n")
 
-    for epoch in range(num_epochs):
+    for ep in range(num_epochs):
         epoch_sw = Stopwatch(device).start()
-
         if hasattr(train_loader.sampler, 'set_epoch'):
-            train_loader.sampler.set_epoch(epoch)
-        
+            train_loader.sampler.set_epoch(ep)
+
         ensemble_model.train()
-        
-        for model in actual_module.models:
-            model.eval()
-        
-        train_loss = 0.0
+        for m in actual.models:
+            m.eval()
+
+        train_loss_sum = 0.0
         train_correct = 0
-        train_total = 0
-        
-        for images, labels in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', disable=not is_main):
+        train_seen = 0
+
+        for images, labels in tqdm(train_loader, desc=f'Epoch {ep+1}/{num_epochs}',
+                                   disable=not is_main):
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
-            
-            outputs, _ = ensemble_model(images)
-            loss = criterion(outputs.squeeze(1), labels)
-            loss.backward()
-            optimizer.step()
+            out, _ = ensemble_model(images)
+            loss = criterion(out.squeeze(1), labels)
+            loss.backward(); optimizer.step()
 
-            batch_size = images.size(0)
-            train_loss += loss.item() * batch_size
-            pred = (outputs.squeeze(1) > 0).long()
+            bs = images.size(0)
+            train_loss_sum += loss.item() * bs
+            pred = (out.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
-            train_total += batch_size
+            train_seen += bs
 
         t_train = epoch_sw.stop()
 
-        train_acc = 100. * train_correct / train_total
-        train_loss = train_loss / train_total
-        
+        # ---- DDP-safe aggregate ----
+        tl_t = torch.tensor(train_loss_sum, device=device)
+        tc_t = torch.tensor(train_correct,  device=device)
+        ts_t = torch.tensor(train_seen,     device=device)
+        if dist.is_initialized():
+            dist.all_reduce(tl_t); dist.all_reduce(tc_t); dist.all_reduce(ts_t)
+        train_loss = tl_t.item() / max(ts_t.item(), 1)
+        train_acc  = 100. * tc_t.item() / max(ts_t.item(), 1)
+
         val_sw = Stopwatch(device).start()
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
         t_val = val_sw.stop()
 
-        t_epoch = epoch_sw.stop()
+        # t_epoch = t_train + t_val (syncs اضافی Stopwatch را حذف می‌کنیم)
+        t_epoch = t_train + t_val
         epoch_times.append(t_epoch)
         train_times.append(t_train)
         val_times.append(t_val)
 
         scheduler.step()
-
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
 
         if is_main:
-            print(f"\n{'='*70}")
-            print(f"Epoch {epoch+1}/{num_epochs}")
-            print(f"{'='*70}")
+            print(f"\n{'='*70}\nEpoch {ep+1}/{num_epochs}\n{'='*70}")
             print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
             print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
             print(f"Time: epoch {t_epoch:.1f}s (train {t_train:.1f}s | val {t_val:.1f}s)")
 
-        if is_main and val_acc > best_val_acc:
-            best_val_acc = val_acc
-            save_path = os.path.join(save_dir, 'best_stacking_lr.pt')
+        if is_main and val_acc > best_val:
+            best_val = val_acc
             torch.save({
-                'epoch': epoch + 1,
-                'meta_state_dict': meta_learner.state_dict(),
+                'epoch': ep + 1,
+                'meta_state_dict': meta.state_dict(),
                 'val_acc': val_acc,
-                'history': history
-            }, save_path)
-            print(f"\n✓ Best model saved → {val_acc:.2f}%")
+                'history': history,
+            }, os.path.join(save_dir, 'best_stacking_lr.pt'))
+            print(f"\n✓ Best saved → {val_acc:.2f}%")
 
-        if is_main:
-            print()
-
-    # ---------- Summarize training time ----------
     total_time = total_sw.stop()
     timing = summarize_training_times(epoch_times, train_times, val_times, total_time)
 
     if is_main:
-        print(f"\n{'='*70}")
-        print("TRAINING TIME SUMMARY")
-        print(f"{'='*70}")
-        print(f"Total training time       : {timing['total_training_time_s']:.1f}s "
-              f"({timing['total_training_time_min']:.2f} min)")
-        print(f"Mean epoch time           : {timing['mean_epoch_time_s']:.1f}s")
-        print(f"Mean epoch (excl. first)  : {timing['mean_epoch_time_excl_first_s']:.1f}s  "
-              f"[CUDA/cuDNN init excluded]")
-        print(f"Mean train phase          : {timing['mean_train_phase_s']:.1f}s")
-        print(f"Mean val phase            : {timing['mean_val_phase_s']:.1f}s")
+        print(f"\n{'='*70}\nTRAINING TIME SUMMARY\n{'='*70}")
+        print(f"Total       : {timing['total_training_time_s']:.1f}s ({timing['total_training_time_min']:.2f} min)")
+        print(f"Mean epoch  : {timing['mean_epoch_time_s']:.1f}s")
+        print(f"Mean (excl 1st): {timing['mean_epoch_time_excl_first_s']:.1f}s")
+        print(f"Mean train  : {timing['mean_train_phase_s']:.1f}s")
+        print(f"Mean val    : {timing['mean_val_phase_s']:.1f}s")
         print(f"{'='*70}\n")
 
-        print(f"{'='*70}")
-        print(f"Training Completed!")
-        print(f"Best Validation Accuracy: {best_val_acc:.2f}%")
-        print(f"{'='*70}\n")
-
-        # ---------- Training curves (Loss & Accuracy) ----------
         try:
             plt.figure(figsize=(14, 5))
-            epochs_range = range(1, num_epochs + 1)
-
+            r = range(1, num_epochs + 1)
             plt.subplot(1, 2, 1)
-            plt.plot(epochs_range, history['train_loss'], label='train', color='blue', linewidth=2)
-            plt.title('Loss', fontsize=16)
-            plt.xlabel('Epoch', fontsize=12)
-            plt.ylabel('Loss', fontsize=12)
-            plt.grid(True, linestyle='--', alpha=0.7)
-            plt.legend(fontsize=12)
-
+            plt.plot(r, history['train_loss'], label='train', color='blue', lw=2)
+            plt.title('Loss'); plt.xlabel('Epoch'); plt.ylabel('Loss')
+            plt.grid(True, ls='--', alpha=0.7); plt.legend()
             plt.subplot(1, 2, 2)
-            plt.plot(epochs_range, history['train_acc'], label='train', color='blue', linewidth=2)
-            plt.plot(epochs_range, history['val_acc'], label='validation', color='orange', linewidth=2)
-            plt.title('Accuracy', fontsize=16)
-            plt.xlabel('Epoch', fontsize=12)
-            plt.ylabel('Accuracy (%)', fontsize=12)
-            plt.grid(True, linestyle='--', alpha=0.7)
-            plt.legend(fontsize=12)
-
+            plt.plot(r, history['train_acc'], label='train', color='blue', lw=2)
+            plt.plot(r, history['val_acc'], label='val', color='orange', lw=2)
+            plt.title('Accuracy'); plt.xlabel('Epoch'); plt.ylabel('Acc (%)')
+            plt.grid(True, ls='--', alpha=0.7); plt.legend()
             plt.tight_layout()
-            curves_path = os.path.join(save_dir, 'training_curves.png')
-            plt.savefig(curves_path, dpi=300, bbox_inches='tight')
+            plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=300, bbox_inches='tight')
             plt.close()
-            print(f"✅ Training curves saved to: {curves_path}")
+            print(f"✅ Curves saved.")
         except Exception as e:
-            print(f"[WARNING] Could not save training curves: {e}")
-    
-    return best_val_acc, history, timing
+            print(f"[WARN] Curves failed: {e}")
+
+    return best_val, history, timing
 
 
-# ================== DISTRIBUTED SETUP ==================
+# ================== DDP SETUP ==================
 def setup_distributed():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ['LOCAL_RANK'])
+        ws   = int(os.environ['WORLD_SIZE'])
+        lr_  = int(os.environ['LOCAL_RANK'])
         dist.init_process_group(backend='nccl')
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f'cuda:{local_rank}')
-        if rank == 0:
-            print(f"Distributed: rank {rank}/{world_size}, local_rank {local_rank}")
-        return device, local_rank, rank, world_size
-    else:
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        return device, 0, 0, 1
+        torch.cuda.set_device(lr_)
+        return torch.device(f'cuda:{lr_}'), lr_, rank, ws
+    return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'), 0, 0, 1
 
 
 def cleanup_distributed():
@@ -474,485 +392,383 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-# ================== SAVE PREDICTIONS JSON ==================
-def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name):
-    pos_count = sum(y_true)
-    neg_count = len(y_true) - pos_count
-    
-    output_data = {
-        "metadata": {
-            "seed": seed,
-            "dataset": dataset_name,
-            "num_samples": len(y_true),
-            "positive_count": pos_count,
-            "negative_count": neg_count,
-        },
-        "y_true": y_true,
-        "y_score": y_score,
-        "y_pred": y_pred
-    }
-
-    with open(save_path, 'w') as f:
-        json.dump(output_data, f, indent=4)
-    
-    print(f" Predictions JSON saved to: {save_path}")
-
-
-# ================== REAL/FAKE METRICS ==================
+# ================== METRICS ==================
 def compute_real_fake_metrics(y_true, y_pred):
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
-    
-    real_precision, real_recall, real_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=[1], average=None, zero_division=0
-    )
-    real_precision = real_precision[0]
-    real_recall = real_recall[0]
-    real_f1 = real_f1[0]
-    
-    fake_precision, fake_recall, fake_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=[0], average=None, zero_division=0
-    )
-    fake_precision = fake_precision[0]
-    fake_recall = fake_recall[0]
-    fake_f1 = fake_f1[0]
-    
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])  # Fake=0, Real=1
+    y_true = np.array(y_true); y_pred = np.array(y_pred)
+    rp, rr, rf, _ = precision_recall_fscore_support(y_true, y_pred, labels=[1], average=None, zero_division=0)
+    fp_, fr, ff, _ = precision_recall_fscore_support(y_true, y_pred, labels=[0], average=None, zero_division=0)
+    rp, rr, rf = rp[0], rr[0], rf[0]
+    fp_, fr, ff = fp_[0], fr[0], ff[0]
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     TN, FP, FN, TP = cm.ravel()
-    
-    real_specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
-    fake_specificity = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-    
-    metrics = {
-        'real': {
-            'precision': float(real_precision),
-            'recall': float(real_recall),
-            'f1': float(real_f1),
-            'specificity': float(real_specificity),
-            'support': int(np.sum(y_true == 1))
-        },
-        'fake': {
-            'precision': float(fake_precision),
-            'recall': float(fake_recall),
-            'f1': float(fake_f1),
-            'specificity': float(fake_specificity),
-            'support': int(np.sum(y_true == 0))
-        },
-        'macro_f1': float((real_f1 + fake_f1) / 2),
-        'confusion_matrix': {
-            'TN': int(TN), 'FP': int(FP), 'FN': int(FN), 'TP': int(TP)
-        }
+    return {
+        'real': {'precision': float(rp), 'recall': float(rr), 'f1': float(rf),
+                 'specificity': float(TN/(TN+FP)) if (TN+FP) else 0.0,
+                 'support': int(np.sum(y_true == 1))},
+        'fake': {'precision': float(fp_), 'recall': float(fr), 'f1': float(ff),
+                 'specificity': float(TP/(TP+FN)) if (TP+FN) else 0.0,
+                 'support': int(np.sum(y_true == 0))},
+        'macro_f1': float((rf + ff) / 2),
+        'confusion_matrix': {'TN': int(TN), 'FP': int(FP), 'FN': int(FN), 'TP': int(TP)},
     }
-    return metrics
 
 
-def print_real_fake_metrics(metrics, title="REAL/FAKE METRICS"):
-    print(f"\n{'='*70}")
-    print(title)
-    print(f"{'='*70}")
-    print(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'F1':<12} {'Specificity':<12} {'Support':<10}")
-    print(f"{'-'*70}")
-    for cls in ['real', 'fake']:
-        m = metrics[cls]
-        print(f"{cls.upper():<10} {m['precision']:<12.4f} {m['recall']:<12.4f} "
-              f"{m['f1']:<12.4f} {m['specificity']:<12.4f} {m['support']:<10}")
-    print(f"{'-'*70}")
-    print(f"Macro F1: {metrics['macro_f1']:.4f}")
-    print(f"Confusion Matrix: TN={metrics['confusion_matrix']['TN']}, "
-          f"FP={metrics['confusion_matrix']['FP']}, "
-          f"FN={metrics['confusion_matrix']['FN']}, "
-          f"TP={metrics['confusion_matrix']['TP']}")
-    print(f"{'='*70}")
+def print_real_fake_metrics(m, title="REAL/FAKE"):
+    print(f"\n{'='*70}\n{title}\n{'='*70}")
+    print(f"{'Class':<10}{'Prec':<12}{'Rec':<12}{'F1':<12}{'Spec':<12}{'Support':<10}")
+    print('-'*70)
+    for c in ('real', 'fake'):
+        x = m[c]
+        print(f"{c.upper():<10}{x['precision']:<12.4f}{x['recall']:<12.4f}"
+              f"{x['f1']:<12.4f}{x['specificity']:<12.4f}{x['support']:<10}")
+    print('-'*70)
+    print(f"Macro F1: {m['macro_f1']:.4f}")
+    print(f"CM: TN={m['confusion_matrix']['TN']}, FP={m['confusion_matrix']['FP']}, "
+          f"FN={m['confusion_matrix']['FN']}, TP={m['confusion_matrix']['TP']}")
+    print('='*70)
 
 
-# ================== LATENCY / THROUGHPUT / COMPUTE TIME ==================
+def save_predictions_json(y_true, y_score, y_pred, path, seed, ds):
+    out = {"metadata": {"seed": seed, "dataset": ds, "num_samples": len(y_true),
+                        "positive_count": sum(y_true),
+                        "negative_count": len(y_true) - sum(y_true)},
+           "y_true": y_true, "y_score": y_score, "y_pred": y_pred}
+    with open(path, 'w') as f:
+        json.dump(out, f, indent=4)
+    print(f"Predictions JSON: {path}")
+
+
+def save_accuracy_log_from_results(y_true, y_pred, path, model_name):
+    total = len(y_true)
+    correct = sum(1 for a, b in zip(y_true, y_pred) if a == b)
+    acc = 100. * correct / total if total else 0.0
+    TP = sum(1 for a, b in zip(y_true, y_pred) if a == 1 and b == 1)
+    TN = sum(1 for a, b in zip(y_true, y_pred) if a == 0 and b == 0)
+    FP = sum(1 for a, b in zip(y_true, y_pred) if a == 0 and b == 1)
+    FN = sum(1 for a, b in zip(y_true, y_pred) if a == 1 and b == 0)
+
+    lines = ["="*70, f"Model: {model_name}", "="*70,
+             f"Accuracy: {acc:.3f}%", f"Total: {total}",
+             f"Correct: {correct}", f"Incorrect: {total-correct}",
+             "", "Confusion Matrix:",
+             f"                 Pred Fake  Pred Real",
+             f"    Actual Fake   {TN:<10} {FP:<10}",
+             f"    Actual Real   {FN:<10} {TP:<10}",
+             "", "Sample-by-sample:",
+             f"{'ID':<8}{'True':<8}{'Pred':<8}{'Status':<10}", '-'*40]
+    for i, (a, b) in enumerate(zip(y_true, y_pred)):
+        lines.append(f"{i+1:<8}{a:<8}{b:<8}{'Correct' if a==b else 'Wrong':<10}")
+    with open(path, 'w') as f:
+        f.write("\n".join(lines))
+    print(f"Log saved: {path}")
+
+
+# ================== CORRECTED LATENCY / THROUGHPUT / COMPUTE ==================
+# FIX خلاصه:
+#   • داده برای latency و throughput یک‌بار روی GPU preload می‌شود (H2D از حلقه حذف شد).
+#   • Latency با cuda.Event (زمان خالص GPU) به‌جای perf_counter.
+#   • bs=1 هم warmup می‌شود + clock ramp-up.
+#   • throughput و computational time دیگر duplicate نیستند:
+#       - throughput: روی batch‌های preloaded (با bs=loader.batch_size)
+#       - computational time: یک pass کامل روی test loader، H2D هر batch حذف می‌شود
+#                              (سازگار با measure_full_pass در efficiency_utils).
 @torch.no_grad()
-def measure_latency_throughput(model, loader, device, is_main=True, num_runs=10):
-  
+def measure_latency_throughput(model, loader, device, is_main=True, num_runs=10,
+                               n_lat=100, bs_tp=None, warmup=30, ramp_up_s=2.0):
     model.eval()
-    
-    cached_images = []
-    for images, _ in loader:
-        cached_images.append(images)
-    cached_images = torch.cat(cached_images, dim=0)
-    N = cached_images.size(0)
-    
-    bs_lat = 1
-    bs_tp = 16
-    
-    warmup_img = cached_images[:bs_tp].to(device)
-    for _ in range(10):
-        _ = model(warmup_img)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    
-    lat_runs = []
-    for _ in range(num_runs):
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
+    bs_tp = bs_tp or (loader.batch_size or 16)
+
+    # ---- latency inputs: preload on GPU ----
+    n_lat = min(n_lat, len(loader.dataset))
+    lat_x = torch.stack([loader.dataset[i][0] for i in range(n_lat)]).to(device)
+
+    # ---- throughput inputs: preload on GPU (چند batch کافی است) ----
+    tp_x = []
+    for imgs, _ in loader:
+        tp_x.append(imgs.to(device))
+        if len(tp_x) >= 20:
+            break
+
+    # ---- warmup: هر دو batch size + clock ramp-up ----
+    for x in (lat_x[:1], tp_x[0]):
+        for _ in range(warmup):
+            _ = model(x)
+    _sync(device)
+    if device.type == 'cuda' and ramp_up_s > 0:
         t0 = time.perf_counter()
-        for i in range(N):
-            img = cached_images[i:i+bs_lat].to(device)
-            _ = model(img)
+        while time.perf_counter() - t0 < ramp_up_s:
+            _ = model(tp_x[0]); _sync(device)
+
+    # ---- latency (CUDA events, GPU-only) ----
+    lat_ms = []
+    for i in range(n_lat):
+        x = lat_x[i:i+1]
         if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        lat_runs.append((t1 - t0) / N * 1000.0)
-    lat_mean = float(np.mean(lat_runs))
-    lat_std = float(np.std(lat_runs, ddof=1))
-    
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record(); _ = model(x); e.record(); _sync(device)
+            lat_ms.append(s.elapsed_time(e))
+        else:
+            t0 = time.perf_counter(); _ = model(x)
+            lat_ms.append((time.perf_counter() - t0) * 1000.)
+    lat_mean = float(np.mean(lat_ms))
+    lat_std  = float(np.std(lat_ms, ddof=1)) if len(lat_ms) > 1 else 0.0
+
+    # ---- throughput (preloaded batches) ----
+    n_per_run = sum(x.size(0) for x in tp_x)
     tp_runs = []
     for _ in range(num_runs):
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for i in range(0, N, bs_tp):
-            img = cached_images[i:i+bs_tp].to(device)
-            _ = model(img)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        tp_runs.append(N / (t1 - t0))
+        _sync(device); t0 = time.perf_counter()
+        for x in tp_x:
+            _ = model(x)
+        _sync(device)
+        tp_runs.append(n_per_run / (time.perf_counter() - t0))
     tp_mean = float(np.mean(tp_runs))
-    tp_std = float(np.std(tp_runs, ddof=1))
-    
-    ct_runs = []
+    tp_std  = float(np.std(tp_runs, ddof=1)) if len(tp_runs) > 1 else 0.0
+
+    # ---- full-pass compute time (H2D excluded, on whole test set) ----
+    ct_runs, n_full = [], 0
     for _ in range(num_runs):
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for i in range(0, N, bs_tp):
-            img = cached_images[i:i+bs_tp].to(device)
-            _ = model(img)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        ct_runs.append(t1 - t0)
+        compute_s = 0.0
+        for imgs, _ in loader:
+            imgs = imgs.to(device)
+            _sync(device)              # H2D done — not counted below
+            t0 = time.perf_counter()
+            _ = model(imgs)
+            _sync(device)
+            compute_s += time.perf_counter() - t0
+            n_full = len(loader.dataset)
+        ct_runs.append(compute_s)
     ct_mean = float(np.mean(ct_runs))
-    ct_std = float(np.std(ct_runs, ddof=1))
-    
-    results = {
-        'num_test_images': int(N),
-        'num_runs': int(num_runs),
-        'latency_bs1_ms_per_image': {'mean': lat_mean, 'std': lat_std},
-        'throughput_bs16_images_per_sec': {'mean': tp_mean, 'std': tp_std},
-        'computational_time_sec': {'mean': ct_mean, 'std': ct_std}
-    }
-    
+    ct_std  = float(np.std(ct_runs, ddof=1)) if len(ct_runs) > 1 else 0.0
+
     if is_main:
         print("="*70)
-        print(f"Latency (bs=1)          : {lat_mean:.2f} ± {lat_std:.2f} ms / image")
-        print(f"Throughput (bs=16)      : {tp_mean:.1f} ± {tp_std:.1f} images/s (mean ± std of {num_runs} runs)")
-        print(f"Computational time      : {ct_mean:.2f} ± {ct_std:.2f} s (model inference on the whole test set, {N} images, mean of {num_runs} passes; data loading excluded)")
+        print(f"Latency (bs=1)          : {lat_mean:.2f} ± {lat_std:.2f} ms / image  (cuda.Event)")
+        print(f"Throughput (bs={bs_tp})".ljust(24) +
+              f": {tp_mean:.1f} ± {tp_std:.1f} images/s  (mean ± std of {num_runs} runs)")
+        print(f"Computational time      : {ct_mean:.2f} ± {ct_std:.2f} s "
+              f"(model inference on the whole test set, {n_full} images, mean of {num_runs} passes; "
+              f"H2D excluded)")
         print("="*70)
-    
-    return results
+
+    return {
+        'num_test_images': int(n_full),
+        'num_runs': int(num_runs),
+        'latency_bs1_ms_per_image':        {'mean': lat_mean, 'std': lat_std},
+        'throughput_bs{}_images_per_sec'.format(bs_tp): {'mean': tp_mean, 'std': tp_std},
+        'computational_time_sec':          {'mean': ct_mean, 'std': ct_std},
+    }
 
 
-# ================== SAVE ACCURACY LOG ==================
-def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
-
-    total = len(y_true)
-    correct = sum(1 for yt, yp in zip(y_true, y_pred) if yt == yp)
-    acc = 100.0 * correct / total if total > 0 else 0.0
-    
-    TP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 1)
-    TN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 0)
-    FP = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 0 and yp == 1)
-    FN = sum(1 for yt, yp in zip(y_true, y_pred) if yt == 1 and yp == 0)
-
-    lines = []
-    lines.append("="*70)
-    lines.append(f"SUMMARY STATISTICS (Exact Console Match)")
-    lines.append(f"Model: {model_name}")
-    lines.append("="*70)
-    lines.append(f"Accuracy: {acc:.3f}%")
-    lines.append(f"Total Samples: {total}")
-    lines.append(f"Correct Predictions: {correct}")
-    lines.append(f"Incorrect Predictions: {total - correct}")
-    
-    lines.append("\nConfusion Matrix:")
-    lines.append(f"                 Predicted Fake  Predicted Real")
-    lines.append(f"    Actual Fake   {TN:<15} {FP:<15}")
-    lines.append(f"    Actual Real   {FN:<15} {TP:<15}")
-    
-    lines.append("\nClassification Metrics:")
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
-    lines.append(f"Precision: {precision:.4f}")
-    lines.append(f"Recall: {recall:.4f}")
-    lines.append(f"Specificity: {specificity:.4f}")
-
-    rf = compute_real_fake_metrics(y_true, y_pred)
-    lines.append("\n" + "="*70)
-    lines.append("REAL/FAKE METRICS")
-    lines.append("="*70)
-    lines.append(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'F1':<12} {'Specificity':<12}")
-    lines.append("-"*70)
-    for cls in ['real', 'fake']:
-        m = rf[cls]
-        lines.append(f"{cls.upper():<10} {m['precision']:<12.4f} {m['recall']:<12.4f} "
-                     f"{m['f1']:<12.4f} {m['specificity']:<12.4f}")
-    lines.append("-"*70)
-    lines.append(f"Macro F1: {rf['macro_f1']:.4f}")
-    
-    lines.append("-" * 70)
-    lines.append("SAMPLE-BY-SAMPLE PREDICTIONS (For McNemar Test):")
-    lines.append(f"{'ID':<10} {'True':<10} {'Pred':<10} {'Status':<10}")
-    lines.append("-" * 70)
-    
-    for i, (yt, yp) in enumerate(zip(y_true, y_pred)):
-        status = "Correct" if yt == yp else "Wrong"
-        lines.append(f"{i+1:<10} {yt:<10} {yp:<10} {status:<10}")
-
-    with open(save_path, 'w') as f:
-        f.write("\n".join(lines))
-    
-    print(f" Accuracy log (Console-Accurate) saved to: {save_path}")
-
-
-# ================== MAIN FUNCTION ==================
+# ================== MAIN ==================
 def main():
-    parser = argparse.ArgumentParser(description="Stacking Ensemble Training with Logistic Regression")
-    parser.add_argument('--epochs', type=int, default=10) 
-    parser.add_argument('--lr', type=float, default=0.01) 
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--num_grad_cam_samples', type=int, default=5)
-    parser.add_argument('--num_lime_samples', type=int, default=5)
-    parser.add_argument('--dataset', type=str, required=True,
-                       choices=['wild', 'deepfake_lab', 'hard_fake_real', 'custom_genai', 'custom_genai_v2', 'uadfV', 'real_fake_dataset'])    
-    parser.add_argument('--data_dir', type=str, required=True)
-    parser.add_argument('--model_paths', type=str, nargs='+', required=True)
-    parser.add_argument('--model_names', type=str, nargs='+', required=True)
-    parser.add_argument('--save_dir', type=str, default='./output')
-    parser.add_argument('--seed', type=int, nargs='+', required=True, help='List of seeds to run')
-    
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--epochs', type=int, default=10)
+    p.add_argument('--lr', type=float, default=0.01)
+    p.add_argument('--batch_size', type=int, default=32)
+    p.add_argument('--num_grad_cam_samples', type=int, default=5)
+    p.add_argument('--num_lime_samples', type=int, default=5)
+    p.add_argument('--dataset', type=str, required=True,
+                   choices=['wild','deepfake_lab','hard_fake_real','custom_genai',
+                            'custom_genai_v2','uadfV','real_fake_dataset'])
+    p.add_argument('--data_dir', type=str, required=True)
+    p.add_argument('--model_paths', type=str, nargs='+', required=True)
+    p.add_argument('--model_names', type=str, nargs='+', required=True)
+    p.add_argument('--save_dir', type=str, default='./output')
+    p.add_argument('--seed', type=int, nargs='+', required=True)
+    args = p.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
-        raise ValueError("Number of model_names must match model_paths")
+        raise ValueError("model_names و model_paths باید هم‌طول باشند")
 
     for current_seed in args.seed:
-        print(f"\n{'#'*80}")
-        print(f"# STARTING RUN FOR SEED: {current_seed}")
-        print(f"{'#'*80}\n")
-
+        print(f"\n{'#'*80}\n# SEED: {current_seed}\n{'#'*80}\n")
         set_seed(current_seed)
         device, local_rank, rank, world_size = setup_distributed()
         is_main = rank == 0
 
-        # ============ PIPELINE STOPWATCH ============
-        pipeline_sw = Stopwatch(device).start()
+        try:
+            pipeline_sw = Stopwatch(device).start()
+            save_dir = os.path.join(args.save_dir, f'seed_{current_seed}')
 
-        current_save_dir = os.path.join(args.save_dir, f'seed_{current_seed}')
-        
-        if is_main:
-            print("="*70)
-            print(f"STACKING ENSEMBLE TRAINING (Logistic Regression)")
-            print(f"Distributed on {world_size} GPU(s) | Seed: {current_seed}")
-            print("="*70)
-            print(f"Dataset: {args.dataset}")
-            print(f"Data directory: {args.data_dir}")
-            print(f"Batch size: {args.batch_size}")
-            print(f"Models: {len(args.model_paths)}")
-            print(f"Output Dir: {current_save_dir}")
-            print("="*70 + "\n")
-
-        MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
-        STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-        MEANS = MEANS[:len(args.model_paths)]
-        STDS = STDS[:len(args.model_paths)]
-
-        base_models = load_pruned_models(args.model_paths, device, is_main)
-        MODEL_NAMES = args.model_names[:len(base_models)]
-
-        ensemble = StackingEnsemble(
-            base_models, MEANS, STDS,
-            freeze_models=True
-        ).to(device)
-
-        if world_size > 1:
-            ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
-
-        if is_main:
-            trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
-            total = sum(p.numel() for p in ensemble.parameters())
-            print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
-
-        train_loader, val_loader, test_loader = create_dataloaders(
-            args.data_dir, args.batch_size, dataset_type=args.dataset,
-            is_distributed=(world_size > 1), seed=current_seed, is_main=is_main)
-
-        if is_main:
-            print("\n" + "="*70)
-            print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
-            print("="*70)
-
-        individual_accs = []
-        for i, model in enumerate(base_models):
-            acc = evaluate_single_model_ddp(
-                model, test_loader, device,
-                f"Model {i+1} ({MODEL_NAMES[i]})",
-                MEANS[i], STDS[i], is_main)
-            individual_accs.append(acc)
-
-        best_single = max(individual_accs)
-        best_idx = individual_accs.index(best_single)
-
-        if is_main:
-            print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
-            print("="*70)
-
-        # ---------- TRAINING (with timing) ----------
-        best_val_acc, history, train_timing = train_stacking(
-            ensemble, train_loader, val_loader,
-            args.epochs, args.lr, device, current_save_dir, is_main, MODEL_NAMES)
-
-        ckpt_path = os.path.join(current_save_dir, 'best_stacking_lr.pt')
-        if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            meta_learner = ensemble.module.meta_learner if hasattr(ensemble, 'module') else ensemble.meta_learner
-            meta_learner.load_state_dict(ckpt['meta_state_dict'])
             if is_main:
-                print("Best model loaded.\n")
+                print("="*70); print("STACKING ENSEMBLE (LR)"); print("="*70)
+                print(f"GPU(s): {world_size} | Seed: {current_seed} | Dataset: {args.dataset}")
+                print(f"Output: {save_dir}\n")
 
-        if is_main:
-            print("\n" + "="*70)
-            print("FINAL ENSEMBLE EVALUATION")
-            print("="*70)
+            MEANS = [(0.5207,0.4258,0.3806),(0.4460,0.3622,0.3416),(0.4668,0.3816,0.3414)]
+            STDS  = [(0.2490,0.2239,0.2212),(0.2057,0.1849,0.1761),(0.2410,0.2161,0.2081)]
+            MEANS = MEANS[:len(args.model_paths)]
+            STDS  = STDS[:len(args.model_paths)]
 
-        ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
-        
-        ensemble_test_acc, learned_weights, learned_bias, predictions_data = evaluate_ensemble_final_ddp(
-            ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
+            base_models = load_pruned_models(args.model_paths, device, is_main)
+            model_names = args.model_names[:len(base_models)]
 
-        if is_main:
-            print("\n" + "="*70)
-            print("FINAL COMPARISON")
-            print("="*70)
-            print(f"Best Single Model: {best_single:.2f}%")
-            print(f"Stacking Accuracy (LR): {ensemble_test_acc:.2f}%")
-            print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
-            print("="*70)
+            ensemble = StackingEnsemble(base_models, MEANS, STDS, freeze_models=True).to(device)
+            if world_size > 1:
+                ensemble = DDP(ensemble, device_ids=[local_rank], output_device=local_rank)
 
-            y_true, y_score, y_pred = predictions_data
+            if is_main:
+                trainable = sum(q.numel() for q in ensemble.parameters() if q.requires_grad)
+                total     = sum(q.numel() for q in ensemble.parameters())
+                print(f"Params: total={total:,} | trainable={trainable:,} | frozen={total-trainable:,}\n")
 
-            # ============ REAL/FAKE METRICS ============
-            rf_metrics = compute_real_fake_metrics(y_true, y_pred)
-            print_real_fake_metrics(rf_metrics, title="STACKING ENSEMBLE — REAL/FAKE METRICS")
-            
-            # ============ LATENCY / THROUGHPUT ============
-            adapter = _StackingBenchmarkAdapter(ensemble_module).to(device)
-            perf_metrics = benchmark_efficiency(
-                adapter, test_loader, device, MODEL_NAMES,
-                latency_samples=min(300, len(test_loader.dataset)),
-                verbose=is_main,
-            )
+            train_loader, val_loader, test_loader = create_dataloaders(
+                args.data_dir, args.batch_size, dataset_type=args.dataset,
+                is_distributed=(world_size > 1), seed=current_seed, is_main=is_main)
 
-            # ============ ADDED: formatted efficiency summary ============
-            try:
-                fmt_metrics = measure_latency_throughput(
-                    adapter, test_loader, device, is_main=is_main, num_runs=10
-                )
-                if not isinstance(perf_metrics, dict):
-                    perf_metrics = {}
-                perf_metrics['formatted_summary'] = fmt_metrics
-            except Exception as e:
-                print(f"[WARNING] Formatted efficiency summary failed: {e}")
-            # ===============================================================
-            
-            json_path = os.path.join(current_save_dir, 'test_predictions.json')
-            save_predictions_json(y_true, y_score, y_pred, json_path, current_seed, args.dataset)
+            if is_main:
+                print("\n" + "="*70); print("BASE MODELS (test)"); print("="*70)
+            ind_accs, ind_times = [], []
+            for i, m in enumerate(base_models):
+                sw = Stopwatch(device).start()
+                a = evaluate_single_model_ddp(m, test_loader, device,
+                                             f"{model_names[i]}", MEANS[i], STDS[i], is_main)
+                t = sw.stop()
+                ind_accs.append(a); ind_times.append(t)
+                if is_main:
+                    print(f"  ⏱ {t:.1f}s")
 
-            log_path_ensemble = os.path.join(current_save_dir, 'prediction_log_stacking.txt')
-            save_accuracy_log_from_results(y_true, y_pred, log_path_ensemble, "Stacking Ensemble")
+            best_single = max(ind_accs)
+            best_idx = ind_accs.index(best_single)
+            if is_main:
+                print(f"\nBest: {model_names[best_idx]} → {best_single:.2f}%\n")
 
-            # ============ PIPELINE TIME ============
-            total_pipeline_time = pipeline_sw.stop()
+            # ---------- Training ----------
+            best_val, history, train_timing = train_stacking(
+                ensemble, train_loader, val_loader,
+                args.epochs, args.lr, device, save_dir, is_main, model_names)
 
-            print("\n" + "="*70)
-            print("TIME SUMMARY")
-            print("="*70)
-            print(f"  Training time (LR)            : {train_timing['total_training_time_s']:.1f}s "
-                  f"({train_timing['total_training_time_min']:.2f} min, "
-                  f"mean epoch {train_timing['mean_epoch_time_s']:.1f}s)")
-            print(f"  Total pipeline time           : {total_pipeline_time/60:.2f} min "
-                  f"({total_pipeline_time:.1f}s)")
-            print("="*70)
+            ck_path = os.path.join(save_dir, 'best_stacking_lr.pt')
+            if os.path.exists(ck_path):
+                ck = torch.load(ck_path, map_location=device, weights_only=False)
+                meta_m = ensemble.module.meta_learner if hasattr(ensemble, 'module') else ensemble.meta_learner
+                meta_m.load_state_dict(ck['meta_state_dict'])
+                if is_main: print("Best meta-learner loaded.\n")
 
-            final_results = {
-                'seed': current_seed,
-                'method': 'Stacking_LR',
-                'best_single_model': {
-                    'name': MODEL_NAMES[best_idx],
-                    'accuracy': float(best_single)
-                },
-                'ensemble': {
-                    'test_accuracy': float(ensemble_test_acc),
-                    'learned_weights': {name: float(w) for name, w in zip(MODEL_NAMES, learned_weights)},
-                    'learned_bias': float(learned_bias)
-                },
-                'improvement': float(ensemble_test_acc - best_single),
-                'training_history': history,
-                'real_fake_metrics': rf_metrics,
-                'performance_metrics': perf_metrics,
-                'timing': {
-                    'training_time': train_timing,
-                    'total_pipeline_time_s': float(total_pipeline_time),
+            ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
+
+            # ---------- Final test eval ----------
+            eval_sw = Stopwatch(device).start()
+            acc, w, b, pred_data = evaluate_ensemble_final_ddp(
+                ensemble_module, test_loader, device, "Test", model_names, is_main)
+            final_eval_time = eval_sw.stop()
+
+            if is_main:
+                print(f"\n⏱ Final eval: {final_eval_time:.1f}s")
+                print("\n" + "="*70); print("FINAL COMPARISON"); print("="*70)
+                print(f"Best Single: {best_single:.2f}%")
+                print(f"Stacking   : {acc:.2f}%")
+                print(f"Delta      : {acc - best_single:+.2f}%")
+                print("="*70)
+
+                yt, ys, yp = pred_data
+                rf = compute_real_fake_metrics(yt, yp)
+                print_real_fake_metrics(rf, title="STACKING — REAL/FAKE")
+
+                # ---------- Efficiency ----------
+                adapter = _StackingBenchmarkAdapter(ensemble_module).to(device)
+                bench_sw = Stopwatch(device).start()
+                try:
+                    perf = benchmark_efficiency(
+                        adapter, test_loader, device, model_names,
+                        latency_samples=min(300, len(test_loader.dataset)),
+                        verbose=is_main)
+                except Exception as e:
+                    print(f"[WARN] benchmark_efficiency failed: {e}")
+                    perf = {}
+                bench_time = bench_sw.stop()
+
+                fmt_sw = Stopwatch(device).start()
+                try:
+                    fmt = measure_latency_throughput(
+                        adapter, test_loader, device, is_main=is_main,
+                        num_runs=10, n_lat=100, bs_tp=args.batch_size)
+                    if not isinstance(perf, dict): perf = {}
+                    perf['formatted_summary'] = fmt
+                except Exception as e:
+                    print(f"[WARN] formatted summary failed: {e}")
+                fmt_time = fmt_sw.stop()
+
+                # ---------- Save everything ----------
+                save_predictions_json(yt, ys, yp,
+                                      os.path.join(save_dir, 'test_predictions.json'),
+                                      current_seed, args.dataset)
+                save_accuracy_log_from_results(yt, yp,
+                                               os.path.join(save_dir, 'prediction_log_stacking.txt'),
+                                               "Stacking Ensemble")
+
+                total_pipe = pipeline_sw.stop()
+                print("\n" + "="*70); print("TIME SUMMARY"); print("="*70)
+                print(f"  Training             : {train_timing['total_training_time_s']:.1f}s "
+                      f"(mean epoch {train_timing['mean_epoch_time_s']:.1f}s)")
+                print(f"  Individual evals     : {sum(ind_times):.1f}s")
+                print(f"  benchmark_efficiency : {bench_time:.1f}s")
+                print(f"  formatted summary    : {fmt_time:.1f}s")
+                print(f"  Final eval           : {final_eval_time:.1f}s")
+                print(f"  Total pipeline       : {total_pipe/60:.2f} min ({total_pipe:.1f}s)")
+                print("="*70)
+
+                final_results = {
+                    'seed': current_seed, 'method': 'Stacking_LR',
+                    'best_single_model': {'name': model_names[best_idx], 'accuracy': float(best_single)},
+                    'ensemble': {'test_accuracy': float(acc),
+                                 'learned_weights': {n: float(v) for n, v in zip(model_names, w)},
+                                 'learned_bias': float(b)},
+                    'improvement': float(acc - best_single),
+                    'training_history': history,
+                    'real_fake_metrics': rf,
+                    'performance_metrics': perf,
+                    'timing': {
+                        'training_time': train_timing,
+                        'individual_eval_times_s': {n: float(t) for n, t in zip(model_names, ind_times)},
+                        'benchmark_time_s': float(bench_time),
+                        'formatted_summary_time_s': float(fmt_time),
+                        'final_eval_time_s': float(final_eval_time),
+                        'total_pipeline_time_s': float(total_pipe),
+                    },
                 }
-            }
+                with open(os.path.join(save_dir, 'final_results_stacking_lr.json'), 'w') as f:
+                    json.dump(final_results, f, indent=4)
+                print(f"Results: {os.path.join(save_dir, 'final_results_stacking_lr.json')}")
 
-            results_path = os.path.join(current_save_dir, 'final_results_stacking_lr.json')
-            with open(results_path, 'w') as f:
-                json.dump(final_results, f, indent=4)
-            print(f"\nResults saved: {results_path}")
+                torch.save({
+                    'ensemble_state_dict': ensemble_module.state_dict(),
+                    'meta_learner_state_dict': ensemble_module.meta_learner.state_dict(),
+                    'test_accuracy': acc, 'model_names': model_names,
+                    'means': MEANS, 'stds': STDS, 'seed': current_seed,
+                }, os.path.join(save_dir, 'final_stacking_lr_model.pt'))
+                print(f"Model: {os.path.join(save_dir, 'final_stacking_lr_model.pt')}")
 
-            final_model_path = os.path.join(current_save_dir, 'final_stacking_lr_model.pt')
-            torch.save({
-                'ensemble_state_dict': ensemble_module.state_dict(),
-                'meta_learner_state_dict': ensemble_module.meta_learner.state_dict(),
-                'test_accuracy': ensemble_test_acc,
-                'model_names': MODEL_NAMES,
-                'means': MEANS,
-                'stds': STDS,
-                'seed': current_seed
-            }, final_model_path)
-            print(f"Model saved: {final_model_path}")
-            
-            print("\nGenerating Single Best Model Log...")
-            single_model = base_models[best_idx]
-            single_model.eval()
-            single_y_true = []
-            single_y_pred = []
-            single_normalizer = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
+                # Best single log
+                single_model = base_models[best_idx].eval()
+                norm = MultiModelNormalization([MEANS[best_idx]], [STDS[best_idx]]).to(device)
+                sy, sp = [], []
+                for imgs, labels in tqdm(test_loader, desc="Best-single log"):
+                    imgs = norm(imgs.to(device), 0)
+                    with torch.no_grad():
+                        o = single_model(imgs)
+                        if isinstance(o, (tuple, list)): o = o[0]
+                        pr = (o.squeeze(1) > 0).long()
+                    sy.extend(labels.cpu().numpy().tolist())
+                    sp.extend(pr.cpu().numpy().tolist())
+                N = len(test_loader.dataset)
+                save_accuracy_log_from_results(sy[:N], sp[:N],
+                                               os.path.join(save_dir, 'prediction_log_best_single.txt'),
+                                               model_names[best_idx])
 
-            total_real_samples = len(test_loader.dataset)
-
-            for images, labels in tqdm(test_loader, desc="Eval Single for Log"):
-                images, labels = images.to(device), labels.to(device)
-                images = single_normalizer(images, 0)
-                with torch.no_grad():
-                    out = single_model(images)
-                    if isinstance(out, (tuple, list)): out = out[0]
-                    pred = (out.squeeze(1) > 0).long()
-        
-                single_y_true.extend(labels.cpu().numpy().tolist())
-                single_y_pred.extend(pred.cpu().numpy().tolist())
-
-            single_y_true = single_y_true[:total_real_samples]
-            single_y_pred = single_y_pred[:total_real_samples]
-
-            log_path_single = os.path.join(current_save_dir, 'prediction_log_best_single.txt')
-            save_accuracy_log_from_results(single_y_true, single_y_pred, log_path_single, MODEL_NAMES[best_idx])
-
-            vis_dir = os.path.join(current_save_dir, 'visualizations')
-            generate_visualizations(
-                ensemble_module, test_loader, device, vis_dir, MODEL_NAMES,
-                args.num_grad_cam_samples, args.num_lime_samples,
-                args.dataset, is_main)
-
-        cleanup_distributed()
+                # Visualizations
+                try:
+                    generate_visualizations(
+                        ensemble_module, test_loader, device,
+                        os.path.join(save_dir, 'visualizations'), model_names,
+                        args.num_grad_cam_samples, args.num_lime_samples,
+                        args.dataset, is_main)
+                except Exception as e:
+                    print(f"[WARN] visualizations failed: {e}")
+        finally:
+            cleanup_distributed()
 
 
 if __name__ == "__main__":
