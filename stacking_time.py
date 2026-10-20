@@ -34,8 +34,6 @@ from efficiency_utils import (
     benchmark_efficiency,
     summarize_training_times,
 )
-# ==========================================================
-
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -567,9 +565,9 @@ def print_real_fake_metrics(metrics, title="REAL/FAKE METRICS"):
     print(f"{'='*70}")
 
 
-# ================== LATENCY / THROUGHPUT / COMPUTE TIME (قدیمی — بدون استفاده) ==================
+# ================== LATENCY / THROUGHPUT / COMPUTE TIME ==================
 @torch.no_grad()
-def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
+def measure_latency_throughput(model, loader, device, is_main=True, num_runs=10):
   
     model.eval()
     
@@ -583,7 +581,7 @@ def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
     bs_tp = 16
     
     warmup_img = cached_images[:bs_tp].to(device)
-    for _ in range(3):
+    for _ in range(10):
         _ = model(warmup_img)
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -851,6 +849,18 @@ def main():
                 latency_samples=min(300, len(test_loader.dataset)),
                 verbose=is_main,
             )
+
+            # ============ ADDED: formatted efficiency summary ============
+            try:
+                fmt_metrics = measure_latency_throughput(
+                    adapter, test_loader, device, is_main=is_main, num_runs=10
+                )
+                if not isinstance(perf_metrics, dict):
+                    perf_metrics = {}
+                perf_metrics['formatted_summary'] = fmt_metrics
+            except Exception as e:
+                print(f"[WARNING] Formatted efficiency summary failed: {e}")
+            # ===============================================================
             
             json_path = os.path.join(current_save_dir, 'test_predictions.json')
             save_predictions_json(y_true, y_score, y_pred, json_path, current_seed, args.dataset)
