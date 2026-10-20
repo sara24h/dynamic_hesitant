@@ -14,7 +14,7 @@ import time
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-from metrics_utils import plot_roc_and_f1
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
@@ -28,9 +28,15 @@ from old_dataset_utils import (
 
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
 
-# ================== NEW IMPORT: EFFICIENCY BENCHMARK ==================
-from efficiency_utils import Stopwatch, benchmark_efficiency
-# ======================================================================
+# ================== EFFICIENCY BENCHMARK ==================
+from efficiency_utils import (
+    Stopwatch,
+    benchmark_efficiency,
+    summarize_training_times,
+)
+# ==========================================================
+
+
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -103,7 +109,7 @@ class StackingEnsemble(nn.Module):
             return final_output, dummy_weights
 
 
-# ================== BENCHMARK ADAPTER (NEW) ==================
+# ================== BENCHMARK ADAPTER ==================
 class _StackingBenchmarkAdapter(nn.Module):
 
     def __init__(self, ensemble: 'StackingEnsemble'):
@@ -293,6 +299,7 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     
     return 0.0, [0.0]*len(model_names), 0.0, ([], [], [])
 
+
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
     os.makedirs(save_dir, exist_ok=True)
@@ -307,6 +314,11 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
     best_val_acc = 0.0
     history = {'train_loss': [], 'train_acc': [], 'val_acc': []}
 
+    # ---------- Training time tracking ----------
+    epoch_times, train_times, val_times = [], [], []
+    total_sw = Stopwatch(device).start()
+    # -------------------------------------------
+
     if is_main:
         print("="*70)
         print("Training Stacking Meta-Learner (Logistic Regression)")
@@ -316,6 +328,8 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
         print(f"Number of base models: {len(model_names)}\n")
 
     for epoch in range(num_epochs):
+        epoch_sw = Stopwatch(device).start()
+
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
         
@@ -343,10 +357,20 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
 
+        t_train = epoch_sw.stop()
+
         train_acc = 100. * train_correct / train_total
         train_loss = train_loss / train_total
         
+        val_sw = Stopwatch(device).start()
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
+        t_val = val_sw.stop()
+
+        t_epoch = epoch_sw.stop()
+        epoch_times.append(t_epoch)
+        train_times.append(t_train)
+        val_times.append(t_val)
+
         scheduler.step()
 
         history['train_loss'].append(train_loss)
@@ -359,6 +383,7 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
             print(f"{'='*70}")
             print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
             print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
+            print(f"Time: epoch {t_epoch:.1f}s (train {t_train:.1f}s | val {t_val:.1f}s)")
 
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -374,13 +399,59 @@ def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
         if is_main:
             print()
 
+    # ---------- Summarize training time ----------
+    total_time = total_sw.stop()
+    timing = summarize_training_times(epoch_times, train_times, val_times, total_time)
+
     if is_main:
         print(f"\n{'='*70}")
+        print("TRAINING TIME SUMMARY")
+        print(f"{'='*70}")
+        print(f"Total training time       : {timing['total_training_time_s']:.1f}s "
+              f"({timing['total_training_time_min']:.2f} min)")
+        print(f"Mean epoch time           : {timing['mean_epoch_time_s']:.1f}s")
+        print(f"Mean epoch (excl. first)  : {timing['mean_epoch_time_excl_first_s']:.1f}s  "
+              f"[CUDA/cuDNN init excluded]")
+        print(f"Mean train phase          : {timing['mean_train_phase_s']:.1f}s")
+        print(f"Mean val phase            : {timing['mean_val_phase_s']:.1f}s")
+        print(f"{'='*70}\n")
+
+        print(f"{'='*70}")
         print(f"Training Completed!")
         print(f"Best Validation Accuracy: {best_val_acc:.2f}%")
         print(f"{'='*70}\n")
+
+        # ---------- Training curves (Loss & Accuracy) ----------
+        try:
+            plt.figure(figsize=(14, 5))
+            epochs_range = range(1, num_epochs + 1)
+
+            plt.subplot(1, 2, 1)
+            plt.plot(epochs_range, history['train_loss'], label='train', color='blue', linewidth=2)
+            plt.title('Loss', fontsize=16)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('Loss', fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.legend(fontsize=12)
+
+            plt.subplot(1, 2, 2)
+            plt.plot(epochs_range, history['train_acc'], label='train', color='blue', linewidth=2)
+            plt.plot(epochs_range, history['val_acc'], label='validation', color='orange', linewidth=2)
+            plt.title('Accuracy', fontsize=16)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('Accuracy (%)', fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.legend(fontsize=12)
+
+            plt.tight_layout()
+            curves_path = os.path.join(save_dir, 'training_curves.png')
+            plt.savefig(curves_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"✅ Training curves saved to: {curves_path}")
+        except Exception as e:
+            print(f"[WARNING] Could not save training curves: {e}")
     
-    return best_val_acc, history
+    return best_val_acc, history, timing
 
 
 # ================== DISTRIBUTED SETUP ==================
@@ -405,7 +476,7 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-# ================== NEW HELPER: SAVE PREDICTIONS JSON ==================
+# ================== SAVE PREDICTIONS JSON ==================
 def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name):
     pos_count = sum(y_true)
     neg_count = len(y_true) - pos_count
@@ -429,7 +500,7 @@ def save_predictions_json(y_true, y_score, y_pred, save_path, seed, dataset_name
     print(f" Predictions JSON saved to: {save_path}")
 
 
-# ================== NEW HELPER: REAL/FAKE METRICS ==================
+# ================== REAL/FAKE METRICS ==================
 def compute_real_fake_metrics(y_true, y_pred):
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
@@ -496,8 +567,7 @@ def print_real_fake_metrics(metrics, title="REAL/FAKE METRICS"):
     print(f"{'='*70}")
 
 
-# ================== LATENCY / THROUGHPUT / COMPUTE TIME ==================
-# NOTE: تابع قدیمی حفظ شده ولی دیگر استفاده نمی‌شود (طبق درخواست دست‌نخورده).
+# ================== LATENCY / THROUGHPUT / COMPUTE TIME (قدیمی — بدون استفاده) ==================
 @torch.no_grad()
 def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
   
@@ -581,7 +651,7 @@ def measure_latency_throughput(model, loader, device, is_main=True, num_runs=3):
     return results
 
 
-# ================== NEW HELPER: SAVE ACCURACY LOG FROM RESULTS ==================
+# ================== SAVE ACCURACY LOG ==================
 def save_accuracy_log_from_results(y_true, y_pred, save_path, model_name):
 
     total = len(y_true)
@@ -674,6 +744,9 @@ def main():
         device, local_rank, rank, world_size = setup_distributed()
         is_main = rank == 0
 
+        # ============ PIPELINE STOPWATCH ============
+        pipeline_sw = Stopwatch(device).start()
+
         current_save_dir = os.path.join(args.save_dir, f'seed_{current_seed}')
         
         if is_main:
@@ -733,7 +806,8 @@ def main():
             print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
             print("="*70)
 
-        best_val_acc, history = train_stacking(
+        # ---------- TRAINING (with timing) ----------
+        best_val_acc, history, train_timing = train_stacking(
             ensemble, train_loader, val_loader,
             args.epochs, args.lr, device, current_save_dir, is_main, MODEL_NAMES)
 
@@ -770,7 +844,7 @@ def main():
             rf_metrics = compute_real_fake_metrics(y_true, y_pred)
             print_real_fake_metrics(rf_metrics, title="STACKING ENSEMBLE — REAL/FAKE METRICS")
             
-            # ============ LATENCY / THROUGHPUT (REPLACED) ============
+            # ============ LATENCY / THROUGHPUT ============
             adapter = _StackingBenchmarkAdapter(ensemble_module).to(device)
             perf_metrics = benchmark_efficiency(
                 adapter, test_loader, device, MODEL_NAMES,
@@ -783,6 +857,19 @@ def main():
 
             log_path_ensemble = os.path.join(current_save_dir, 'prediction_log_stacking.txt')
             save_accuracy_log_from_results(y_true, y_pred, log_path_ensemble, "Stacking Ensemble")
+
+            # ============ PIPELINE TIME ============
+            total_pipeline_time = pipeline_sw.stop()
+
+            print("\n" + "="*70)
+            print("TIME SUMMARY")
+            print("="*70)
+            print(f"  Training time (LR)            : {train_timing['total_training_time_s']:.1f}s "
+                  f"({train_timing['total_training_time_min']:.2f} min, "
+                  f"mean epoch {train_timing['mean_epoch_time_s']:.1f}s)")
+            print(f"  Total pipeline time           : {total_pipeline_time/60:.2f} min "
+                  f"({total_pipeline_time:.1f}s)")
+            print("="*70)
 
             final_results = {
                 'seed': current_seed,
@@ -798,10 +885,12 @@ def main():
                 },
                 'improvement': float(ensemble_test_acc - best_single),
                 'training_history': history,
-                # ===== NEW =====
                 'real_fake_metrics': rf_metrics,
-                'performance_metrics': perf_metrics
-                # ===============
+                'performance_metrics': perf_metrics,
+                'timing': {
+                    'training_time': train_timing,
+                    'total_pipeline_time_s': float(total_pipeline_time),
+                }
             }
 
             results_path = os.path.join(current_save_dir, 'final_results_stacking_lr.json')
@@ -854,16 +943,7 @@ def main():
                 args.dataset, is_main)
 
         cleanup_distributed()
-        
-        if is_main:
-            plot_roc_and_f1(
-                ensemble_module,
-                test_loader, 
-                device, 
-                current_save_dir, 
-                MODEL_NAMES,
-                is_main
-            )
+
 
 if __name__ == "__main__":
     main()
