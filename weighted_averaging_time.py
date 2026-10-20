@@ -586,8 +586,8 @@ def print_efficiency_summary_formatted(model, test_loader, device,
     img_size = images_gpu.shape[-1]
 
     # ---- latency (bs=1), 30 measurements ----
-    x1 = torch.randn(bs_lat, 10, img_size, img_size, device=device)
-    for _ in range(10):
+    x1 = torch.randn(bs_lat, 3, img_size, img_size, device=device)   # FIX: 3 channels
+    for _ in range(10):                                              # FIX: warmup for bs=1
         _ = model(x1)
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -601,10 +601,10 @@ def print_efficiency_summary_formatted(model, test_loader, device,
             torch.cuda.synchronize()
         lat.append((time.perf_counter() - t0) * 1000.0 / bs_lat)
     lat = np.array(lat)
-    lat_m, lat_s = float(lat.mean()), float(lat.std())
+    lat_m, lat_s = float(lat.mean()), float(lat.std(ddof=1))         # FIX: ddof=1
 
     # ---- throughput (bs=bs_thr), n_runs batches of 10 forwards ----
-    xb = torch.randn(bs_thr, 10, img_size, img_size, device=device)
+    xb = torch.randn(bs_thr, 3, img_size, img_size, device=device)   # FIX: 3 channels
     for _ in range(5):
         _ = model(xb)
     if device.type == "cuda":
@@ -620,7 +620,7 @@ def print_efficiency_summary_formatted(model, test_loader, device,
             torch.cuda.synchronize()
         thr.append(10 * bs_thr / (time.perf_counter() - t0))
     thr = np.array(thr)
-    thr_m, thr_s = float(thr.mean()), float(thr.std())
+    thr_m, thr_s = float(thr.mean()), float(thr.std(ddof=1))         # FIX: ddof=1
 
     # ---- computational time: n_runs full passes on preloaded test set ----
     chunks = [images_gpu[i:i + bs_thr] for i in range(0, n_images, bs_thr)]
@@ -640,7 +640,7 @@ def print_efficiency_summary_formatted(model, test_loader, device,
             torch.cuda.synchronize()
         ct.append(time.perf_counter() - t0)
     ct = np.array(ct)
-    ct_m, ct_s = float(ct.mean()), float(ct.std())
+    ct_m, ct_s = float(ct.mean()), float(ct.std(ddof=1))             # FIX: ddof=1
 
     # ---- print in requested format ----
     print()
