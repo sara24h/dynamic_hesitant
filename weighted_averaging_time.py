@@ -14,6 +14,7 @@ import time
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+import matplotlib.pyplot as plt
 # from metrics_utils import plot_roc_and_f1
 
 warnings.filterwarnings("ignore")
@@ -28,7 +29,12 @@ from old_dataset_utils import (
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
 
 # ================== EFFICIENCY BENCHMARK ==================
-from efficiency_utils import Stopwatch, benchmark_efficiency, print_headline
+from efficiency_utils import (
+    Stopwatch,
+    benchmark_efficiency,
+    print_headline,
+    summarize_training_times,
+)
 
 
 # ================== UTILITY FUNCTIONS ==================
@@ -257,12 +263,23 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
     best_val_acc = 0.0
     history = {'train_loss': [], 'train_acc': [], 'val_acc': [], 'model_weights': []}
 
+    # ---------- Training time tracking ----------
+    epoch_times, train_times, val_times = [], [], []
+    total_sw = Stopwatch(device).start()
+    # -------------------------------------------
+
     if is_main:
         print("="*70)
         print("Training Weighted Average Ensemble")
         print("="*70)
+        print(f"Trainable params: {sum(p.numel() for p in [weights_param]):,}")
+        print(f"Epochs: {num_epochs} | Initial LR: {lr}")
+        print(f"Number of models: {len(model_names)}")
+        print(f"Total training samples: {len(train_loader.dataset):,}\n")
 
     for epoch in range(num_epochs):
+        epoch_sw = Stopwatch(device).start()
+
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
 
@@ -291,17 +308,37 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
             train_correct += pred.eq(labels.long()).sum().item()
             train_total += batch_size
 
+        t_train = epoch_sw.stop()
+
         train_acc = 100. * train_correct / train_total
         train_loss = train_loss / train_total
 
         current_weights = F.softmax(weights_param, dim=0).detach().cpu()
+
+        val_sw = Stopwatch(device).start()
         val_acc = evaluate_accuracy_ddp(ensemble_model, val_loader, device)
+        t_val = val_sw.stop()
+
+        t_epoch = epoch_sw.stop()
+        epoch_times.append(t_epoch)
+        train_times.append(t_train)
+        val_times.append(t_val)
+
         scheduler.step()
 
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
         history['model_weights'].append(current_weights.numpy().tolist())
+
+        if is_main:
+            print(f"\n{'='*70}")
+            print(f"Epoch {epoch+1}/{num_epochs}")
+            print(f"{'='*70}")
+            print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
+            print(f"Time: epoch {t_epoch:.1f}s (train {t_train:.1f}s | val {t_val:.1f}s)")
+            print(f"Current weights: {[f'{w:.4f}' for w in current_weights.numpy()]}")
 
         if is_main and val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -314,7 +351,54 @@ def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs
             }, save_path)
             print(f"\n✓ Best model saved → {val_acc:.2f}%")
 
-    return best_val_acc, history
+    # ---------- Summarize training time ----------
+    total_time = total_sw.stop()
+    timing = summarize_training_times(epoch_times, train_times, val_times, total_time)
+
+    if is_main:
+        print(f"\n{'='*70}")
+        print("TRAINING TIME SUMMARY")
+        print(f"{'='*70}")
+        print(f"Total training time       : {timing['total_training_time_s']:.1f}s "
+              f"({timing['total_training_time_min']:.2f} min)")
+        print(f"Mean epoch time           : {timing['mean_epoch_time_s']:.1f}s")
+        print(f"Mean epoch (excl. first)  : {timing['mean_epoch_time_excl_first_s']:.1f}s  "
+              f"[CUDA/cuDNN init excluded]")
+        print(f"Mean train phase          : {timing['mean_train_phase_s']:.1f}s")
+        print(f"Mean val phase            : {timing['mean_val_phase_s']:.1f}s")
+        print(f"{'='*70}\n")
+
+        # ---------- Training curves (Loss & Accuracy) ----------
+        try:
+            plt.figure(figsize=(14, 5))
+            epochs_range = range(1, num_epochs + 1)
+
+            plt.subplot(1, 2, 1)
+            plt.plot(epochs_range, history['train_loss'], label='train', color='blue', linewidth=2)
+            plt.title('Loss', fontsize=16)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('Loss', fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.legend(fontsize=12)
+
+            plt.subplot(1, 2, 2)
+            plt.plot(epochs_range, history['train_acc'], label='train', color='blue', linewidth=2)
+            plt.plot(epochs_range, history['val_acc'], label='validation', color='orange', linewidth=2)
+            plt.title('Accuracy', fontsize=16)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('Accuracy (%)', fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.legend(fontsize=12)
+
+            plt.tight_layout()
+            curves_path = os.path.join(save_dir, 'training_curves.png')
+            plt.savefig(curves_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"✅ Training curves saved to: {curves_path}")
+        except Exception as e:
+            print(f"[WARNING] Could not save training curves: {e}")
+
+    return best_val_acc, history, timing
 
 
 # ================== DISTRIBUTED SETUP ==================
@@ -560,7 +644,8 @@ def main():
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
 
-    best_val_acc, history = train_weighted_ensemble(
+    # ---------- TRAINING (with timing) ----------
+    best_val_acc, history, train_timing = train_weighted_ensemble(
         ensemble, train_loader, val_loader,
         args.epochs, args.lr, device, args.save_dir, is_main, MODEL_NAMES)
 
@@ -573,7 +658,7 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
 
-    # ============ EFFICIENCY BENCHMARK (مثل اسکریپت Fuzzy) ============
+    # ============ EFFICIENCY BENCHMARK ============
     os.makedirs(args.save_dir, exist_ok=True)
 
     efficiency = {}
@@ -627,6 +712,9 @@ def main():
         print("\n" + "="*70)
         print("TIME SUMMARY")
         print("="*70)
+        print(f"  Training time                : {train_timing['total_training_time_s']:.1f}s "
+              f"({train_timing['total_training_time_min']:.2f} min, "
+              f"mean epoch {train_timing['mean_epoch_time_s']:.1f}s)")
         for i, name in enumerate(MODEL_NAMES):
             print(f"  Model {i+1} ({name}) evaluation : {individual_times[i]:.1f}s")
         print(f"  Efficiency benchmark          : {bench_time:.1f}s")
@@ -648,6 +736,7 @@ def main():
             'real_fake_metrics': rf_metrics,
             'performance_metrics': efficiency,
             'timing': {
+                'training_time': train_timing,
                 'individual_model_eval_times_s': {
                     name: float(t) for name, t in zip(MODEL_NAMES, individual_times)
                 },
@@ -671,8 +760,9 @@ def main():
             'seed': args.seed
         }, final_model_path)
 
-        # Save efficiency report separately (مثل Fuzzy)
+        # Save efficiency report separately
         if efficiency:
+            efficiency['training_time'] = train_timing
             efficiency['individual_model_eval_times_s'] = {
                 name: float(t) for name, t in zip(MODEL_NAMES, individual_times)
             }
