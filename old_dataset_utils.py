@@ -400,7 +400,7 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 
-def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 0,
+def create_dataloaders(base_dir: str, batch_size: int, num_workers: int = 4,
                        dataset_type: str = 'wild', is_distributed: bool = False,
                        seed: int = 42, is_main: bool = True):
     if is_main:
@@ -511,7 +511,7 @@ if __name__ == '__main__':
         train_loader, val_loader, test_loader = create_dataloaders(
             base_dir=path_to_dataset,
             batch_size=32,
-            num_workers=0,          # در ویندوز بهتر است 0 باشد، در لینوکس 2 یا 4
+            num_workers=4,          # در ویندوز بهتر است 0 باشد، در لینوکس 2 یا 4
             dataset_type='artiface',  # <--- نام دیتاست جدید
             is_distributed=False,
             seed=42
