@@ -759,33 +759,9 @@ def main():
 
     efficiency = {}
     bench_time = 0.0
-    if is_main:
-        # --- existing benchmark (now won't fail: hesitant_fuzzy shim added) ---
-        try:
-            bench_sw = Stopwatch(device).start()
-            efficiency = benchmark_efficiency(
-                ensemble_module, test_loader, device, MODEL_NAMES,
-                latency_samples=len(test_loader.dataset),
-            )
-            bench_time = bench_sw.stop()
-            print_headline(efficiency)
-        except Exception as e:
-            print(f"[WARNING] Efficiency benchmark failed: {e}")
-            efficiency = {}
-            bench_time = 0.0
 
-        # --- ADDED: formatted summary (independent — always runs) ---
-        try:
-            fmt = print_efficiency_summary_formatted(
-                ensemble_module, test_loader, device,
-                n_runs=10, bs_lat=1, bs_thr=args.batch_size,
-                title="HFDE",
-            )
-            if not isinstance(efficiency, dict):
-                efficiency = {}
-            efficiency["formatted_summary"] = fmt
-        except Exception as e:
-            print(f"[WARNING] Formatted efficiency summary failed: {e}")
+    if dist.is_initialized():
+        dist.barrier()
         # ---------------------------------------------------------------
 
     # ============ FINAL EVALUATION ============
@@ -795,7 +771,7 @@ def main():
     final_eval_time = eval_sw.stop()
 
     if is_main:
-        print(f"\n⏱ Final evaluation time: {final_eval_time:.1f}s")
+        print(f"\n Final evaluation time: {final_eval_time:.1f}s")
         print("\n" + "="*70)
         print("FINAL COMPARISON")
         print("="*70)
