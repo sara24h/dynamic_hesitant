@@ -768,6 +768,8 @@ def main():
                 except Exception as e:
                     print(f"[WARN] visualizations failed: {e}")
         finally:
+            if dist.is_initialized():
+                dist.barrier()        
             cleanup_distributed()
 
 
