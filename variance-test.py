@@ -23,12 +23,10 @@ from efficiency_utils import Stopwatch, summarize_training_times, benchmark_effi
 
 warnings.filterwarnings("ignore")
 
-
-# ================== NEW: REVIEWER RESPONSE - HESITANCY VALIDATION UTILS ==================
-# این دو import برای اعتبارسنجی معیار hesitancy لازم است
+# ================== REVIEWER RESPONSE UTILS ==================
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import roc_auc_score
-# =========================================================================================
+# =============================================================
 
 
 # ================== UTILITY FUNCTIONS ==================
@@ -42,9 +40,7 @@ def set_seed(seed: int = 42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
-# ================== DEVICE SETUP (Single GPU) ==================
 def setup_device():
-    """تنظیم دستگاه روی یک GPU واحد"""
     if torch.cuda.is_available():
         device = torch.device('cuda:0')
         torch.cuda.set_device(0)
@@ -57,11 +53,8 @@ def setup_device():
 
 # ================== UNIFIED FINAL EVALUATION ==================
 def final_evaluation_unified(model, test_loader, device, save_dir, model_names, args):
-
     model.eval()
-
-    test_dataset = test_loader.dataset          # این TransformSubset است
-
+    test_dataset = test_loader.dataset
     num_samples = len(test_dataset)
 
     lines = []
@@ -73,21 +66,14 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
     lines.append("-" * 100)
 
     TP, TN, FP, FN = 0, 0, 0, 0
-
-    all_y_true = []
-    all_y_score = []
-    all_y_pred = []
-    all_model_weights = []
+    all_y_true, all_y_score, all_y_pred, all_model_weights = [], [], [], []
 
     print(f"\nRunning Unified Final Evaluation on {num_samples} samples...")
 
     with torch.no_grad():
         for i in tqdm(range(num_samples), desc="Final Eval"):
             try:
-                # خواندن از TransformSubset → ترنسفورم val_test درست اعمال می‌شود
                 image, label = test_dataset[i]
-
-                # گرفتن مسیر فایل برای لاگ
                 original_idx = test_dataset.indices[i]
                 path, _ = get_sample_info(test_dataset.dataset, original_idx)
             except Exception as e:
@@ -97,27 +83,19 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
 
-            # پیش‌بینی مدل با دریافت جزئیات وزن‌ها
             output, final_weights, _, _ = model(image, return_details=True)
-
-            # محاسبه احتمال (Score) و کلاس پیش‌بینی شده
             prob = torch.sigmoid(output.squeeze()).item()
-
-            # ذخیره وزن هر مدل
             all_model_weights.append(final_weights.squeeze(0).cpu().numpy())
-
             pred_int = int(prob > 0.5)
 
-            # ذخیره برای ROC و JSON
             all_y_true.append(label_int)
             all_y_score.append(prob)
             all_y_pred.append(pred_int)
 
-            # محاسبه ماتریس آشفتگی (Real=1, Fake=0)
-            if label_int == 1:          # Real
+            if label_int == 1:
                 if pred_int == 1: TP += 1
                 else: FN += 1
-            else:                       # Fake
+            else:
                 if pred_int == 1: FP += 1
                 else: TN += 1
 
@@ -125,65 +103,44 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
             filename = os.path.basename(path)
             if len(filename) > 55:
                 filename = filename[:25] + "..." + filename[-27:]
-            line = f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}"
-            lines.append(line)
+            lines.append(f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}")
 
     total_samples = len(all_y_true)
     correct_count = TP + TN
     acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
 
-    # محاسبه معیارهای عملکرد
     precision_real = TP / (TP + FP) if (TP + FP) > 0 else 0
     recall_real    = TP / (TP + FN) if (TP + FN) > 0 else 0
     f1_real        = 2 * precision_real * recall_real / (precision_real + recall_real) if (precision_real + recall_real) > 0 else 0
-
-    # Fake class (Negative class = 0)
     precision_fake = TN / (TN + FN) if (TN + FN) > 0 else 0
     recall_fake    = TN / (TN + FP) if (TN + FP) > 0 else 0
     f1_fake        = 2 * precision_fake * recall_fake / (precision_fake + recall_fake) if (precision_fake + recall_fake) > 0 else 0
 
-    # Macro averages
     macro_precision = (precision_real + precision_fake) / 2
     macro_recall    = (recall_real + recall_fake) / 2
     macro_f1        = (f1_real + f1_fake) / 2
+    balanced_acc    = ((recall_real + recall_fake) / 2) * 100
 
-    # Balanced Accuracy
-    balanced_acc = ((recall_real + recall_fake) / 2) * 100
-
-    # ================== Confusion Matrix Plot ==================
-    cm = np.array([[TN, FP],
-                   [FN, TP]])
-
+    cm = np.array([[TN, FP], [FN, TP]])
     plt.figure(figsize=(8, 6))
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt='d',
-        cmap='Blues',
-        xticklabels=['Predicted Fake', 'Predicted Real'],
-        yticklabels=['Actual Fake', 'Actual Real'],
-        cbar=True,
-        annot_kws={"size": 16}
-    )
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Predicted Fake', 'Predicted Real'],
+                yticklabels=['Actual Fake', 'Actual Real'],
+                cbar=True, annot_kws={"size": 16})
     plt.title(f'Confusion Matrix\nAccuracy: {acc:.2f}% | Balanced Acc: {balanced_acc:.2f}% | Macro-F1: {macro_f1:.4f}',
               fontsize=13, fontweight='bold')
     plt.ylabel('True Label', fontsize=12)
     plt.xlabel('Predicted Label', fontsize=12)
     plt.tight_layout()
-
     cm_path = os.path.join(save_dir, 'confusion_matrix.png')
     plt.savefig(cm_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✅ Confusion Matrix saved to: {cm_path}")
 
-    # ================== چاپ نتایج نهایی ==================
-    print(f"\n{'='*70}")
-    print("FINAL RESULTS")
-    print(f"{'='*70}")
+    print(f"\n{'='*70}\nFINAL RESULTS\n{'='*70}")
     print(f"Accuracy          : {acc:.2f}%")
     print(f"Balanced Accuracy : {balanced_acc:.2f}%")
-    print(f"Macro-F1          : {macro_f1:.4f}")
-    print()
+    print(f"Macro-F1          : {macro_f1:.4f}\n")
     print(f"{'Class':<12} {'Precision':>10} {'Recall':>10} {'F1-Score':>10}")
     print("-" * 45)
     print(f"{'Fake (0)':<12} {precision_fake:10.4f} {recall_fake:10.4f} {f1_fake:10.4f}")
@@ -196,14 +153,10 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
 
     if len(all_model_weights) > 0:
         weights_np = np.array(all_model_weights)
-
-        print(f"\n{'='*70}")
-        print("MODEL ACTIVATION STATISTICS (Final Evaluation)")
-        print(f"{'='*70}")
+        print(f"\n{'='*70}\nMODEL ACTIVATION STATISTICS (Final Evaluation)\n{'='*70}")
 
         activation_threshold = 1e-4
         active_mask = (weights_np > activation_threshold).astype(float)
-
         activation_rates = active_mask.mean(axis=0) * 100
         avg_weights = weights_np.mean(axis=0)
         max_weights = weights_np.max(axis=0)
@@ -212,11 +165,9 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
         print(f"  {'-'*70}")
         for i, name in enumerate(model_names):
             act_pct = activation_rates[i]
-            avg_w = avg_weights[i]
-            max_w = max_weights[i]
             bar_length = int(act_pct / 2)
             bar = '█' * bar_length + '░' * (50 - bar_length)
-            print(f"  {i+1:2d}. {name:<30}: {act_pct:6.2f}%  | {avg_w:.6f}  | {max_w:.6f}")
+            print(f"  {i+1:2d}. {name:<30}: {act_pct:6.2f}%  | {avg_weights[i]:.6f}  | {max_weights[i]:.6f}")
             print(f"      [{bar}]")
 
         print(f"  {'-'*70}")
@@ -236,8 +187,6 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
             bar = '█' * int(pct / 2)
             print(f"    {count} model(s): {freq:5d} samples ({pct:5.2f}%) {bar}")
 
-        print(f"{'='*70}\n")
-
         activation_stats = {
             "activation_rates_pct": {name: float(activation_rates[i]) for i, name in enumerate(model_names)},
             "average_weights": {name: float(avg_weights[i]) for i, name in enumerate(model_names)},
@@ -250,80 +199,59 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
             },
             "per_sample_weights": weights_np.tolist()
         }
-        activation_json_path = os.path.join(save_dir, "model_activation_stats.json")
-        with open(activation_json_path, 'w', encoding='utf-8') as f:
+        with open(os.path.join(save_dir, "model_activation_stats.json"), 'w', encoding='utf-8') as f:
             json.dump(activation_stats, f, indent=2, ensure_ascii=False)
-        print(f"Model activation stats saved: {activation_json_path}")
 
-    output_str = []
-
-    output_str.append("-" * 100)
-    output_str.append("SUMMARY STATISTICS:")
-    output_str.append("-" * 100)
-    output_str.append(f"Overall Accuracy: {acc:.2f}%")
-    output_str.append(f"Balanced Accuracy: {balanced_acc:.2f}%")
-    output_str.append(f"Macro F1-Score: {macro_f1:.4f}")
-
-    output_str.append("\n--- Real (1) Class Metrics ---")
-    output_str.append(f"Precision (Real): {precision_real:.4f}")
-    output_str.append(f"Recall (Real):    {recall_real:.4f}")
-    output_str.append(f"F1-Score (Real):  {f1_real:.4f}")
-
-    output_str.append("\n--- Fake (0) Class Metrics ---")
-    output_str.append(f"Precision (Fake): {precision_fake:.4f}")
-    output_str.append(f"Recall (Fake):    {recall_fake:.4f}")
-    output_str.append(f"F1-Score (Fake):  {f1_fake:.4f}")
-
-    output_str.append(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
-    output_str.append(f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)")
-    output_str.append(f"\nConfusion Matrix saved to: confusion_matrix.png")
+    output_str = [
+        "-" * 100, "SUMMARY STATISTICS:", "-" * 100,
+        f"Overall Accuracy: {acc:.2f}%",
+        f"Balanced Accuracy: {balanced_acc:.2f}%",
+        f"Macro F1-Score: {macro_f1:.4f}",
+        "\n--- Real (1) Class Metrics ---",
+        f"Precision (Real): {precision_real:.4f}",
+        f"Recall (Real):    {recall_real:.4f}",
+        f"F1-Score (Real):  {f1_real:.4f}",
+        "\n--- Fake (0) Class Metrics ---",
+        f"Precision (Fake): {precision_fake:.4f}",
+        f"Recall (Fake):    {recall_fake:.4f}",
+        f"F1-Score (Fake):  {f1_fake:.4f}",
+        f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)",
+        f"Incorrect Predictions: {total_samples - correct_count} ({100-acc:.2f}%)",
+        f"\nConfusion Matrix saved to: confusion_matrix.png",
+    ]
     output_str.extend(lines)
-
-    log_path = os.path.join(save_dir, 'prediction_log.txt')
-    with open(log_path, 'w') as f:
+    with open(os.path.join(save_dir, 'prediction_log.txt'), 'w') as f:
         f.write("\n".join(output_str))
-    print(f"✅ Prediction log saved to: {log_path}")
-
-    # ────────────────────────────────────────────────────────────────
-    #                ذخیره داده‌های ROC (JSON & TXT)
-    # ────────────────────────────────────────────────────────────────
-    print("\nCollecting ROC data (y_true & y_score) ...")
 
     y_true_np = np.array(all_y_true)
     y_score_np = np.array(all_y_score)
     y_pred_np = np.array(all_y_pred)
 
-    roc_json_path = os.path.join(save_dir, "roc_data_test.json")
     roc_data_json = {
         "metadata": {
-            "seed": args.seed,
-            "dataset": args.dataset,
+            "seed": args.seed, "dataset": args.dataset,
             "num_samples": int(total_samples),
             "positive_count": int(np.sum(y_true_np)),
             "negative_count": int(total_samples - np.sum(y_true_np)),
-            "model": "fuzzy_hesitant_ensemble"
+            "model": "fuzzy_hesitant_ensemble",
+            "hesitancy_measure": args.hesitancy_measure,
         },
         "y_true": y_true_np.tolist(),
         "y_score": y_score_np.tolist(),
         "y_pred": y_pred_np.tolist()
     }
-    with open(roc_json_path, 'w', encoding='utf-8') as f:
+    with open(os.path.join(save_dir, "roc_data_test.json"), 'w', encoding='utf-8') as f:
         json.dump(roc_data_json, f, indent=2, ensure_ascii=False)
-    print(f"ROC data saved (JSON): {roc_json_path}")
 
-    roc_txt_path = os.path.join(save_dir, "roc_data_test.txt")
-    with open(roc_txt_path, 'w', encoding='utf-8') as f:
+    with open(os.path.join(save_dir, "roc_data_test.txt"), 'w', encoding='utf-8') as f:
         f.write("y_true\ty_score\ty_pred\n")
         for t, s, p in zip(y_true_np, y_score_np, y_pred_np):
             f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
-    print(f"ROC data saved (TXT):  {roc_txt_path}")
 
     vis_dir = os.path.join(save_dir, 'visualizations')
-    generate_visualizations(
-        model, test_loader, device, vis_dir, model_names,
-        args.num_grad_cam_samples, args.num_lime_samples,
-        args.dataset, is_main=True)
-
+    generate_visualizations(model, test_loader, device, vis_dir, model_names,
+                            args.num_grad_cam_samples, args.num_lime_samples,
+                            args.dataset, is_main=True)
     return acc, y_true_np, y_score_np
 
 
@@ -374,7 +302,7 @@ class FuzzyHesitantEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
                  stds: List[Tuple[float]], num_memberships: int = 3, freeze_models: bool = True,
                  cum_weight_threshold: float = 0.9, hesitancy_threshold: float = 0.2,
-                 hesitancy_measure: str = 'variance'):          # ===== NEW: REVIEWER RESPONSE =====
+                 hesitancy_measure: str = 'variance'):
         super().__init__()
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
@@ -383,7 +311,7 @@ class FuzzyHesitantEnsemble(nn.Module):
             input_dim=128, num_models=self.num_models, num_memberships=num_memberships)
         self.cum_weight_threshold = cum_weight_threshold
         self.hesitancy_threshold = hesitancy_threshold
-        self.hesitancy_measure = hesitancy_measure                # ===== NEW: REVIEWER RESPONSE =====
+        self.hesitancy_measure = hesitancy_measure
 
         if freeze_models:
             for model in self.models:
@@ -397,47 +325,46 @@ class FuzzyHesitantEnsemble(nn.Module):
             model.eval()
         return self
 
-    # ================== NEW: REVIEWER RESPONSE ==================
+    # ================== REVIEWER RESPONSE ==================
     def _compute_hesitancy(self, all_memberships: torch.Tensor) -> torch.Tensor:
-        """
-        محاسبه عدم‌قطعیت هر نمونه با معیار انتخاب‌شده.
-        ورودی:  all_memberships  →  (B, N, K)
-        خروجی:  avg_hesitancy   →  (B,)
-        """
         if self.hesitancy_measure == 'variance':
-            # معیار استاندارد HFS: تابع انحراف (Torra 2010)
             return all_memberships.var(dim=2, unbiased=False).mean(dim=1)
-
         elif self.hesitancy_measure == 'cv':
-            # Coefficient of Variation (std / mean) – نرمال‌شده نسبت به سطح
             mean_mem = all_memberships.mean(dim=2)
             std_mem = all_memberships.std(dim=2, unbiased=False)
             return (std_mem / (mean_mem + 1e-8)).mean(dim=1)
-
         elif self.hesitancy_measure == 'entropy':
-            # آنتروپی نرمال‌شده روی K عضویت
             p = all_memberships / (all_memberships.sum(dim=2, keepdim=True) + 1e-8)
             K = all_memberships.size(2)
             ent = -(p * torch.log(p + 1e-8)).sum(dim=2) / np.log(K)
             return ent.mean(dim=1)
-
         elif self.hesitancy_measure == 'range':
-            # Range (max - min) میان K عضویت
             rng = (all_memberships.max(dim=2).values - all_memberships.min(dim=2).values)
             return rng.mean(dim=1)
-
         elif self.hesitancy_measure == 'combined':
-            # ترکیب واریانس با کم‌بودن سطح عضویت (پاسخ به نگرانی داور حالت B)
             var = all_memberships.var(dim=2, unbiased=False).mean(dim=1)
             mean_level = all_memberships.mean(dim=2).mean(dim=1)
             return var + (1.0 - mean_level) * 0.5
-
         else:
             raise ValueError(f"Unknown hesitancy_measure: {self.hesitancy_measure}")
-    # ==============================================================
+
+    # ============ NEW: correct per-model outputs independent of mask ============
+    @torch.no_grad()
+    def compute_all_model_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute outputs from ALL base models (ignoring the mask).
+        Used for correctly validating 'model competence' in the reviewer response.
+        """
+        outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
+        for i in range(self.num_models):
+            x_n = self.normalizations(x, i)
+            out = self.models[i](x_n)
+            if isinstance(out, (tuple, list)):
+                out = out[0]
+            outputs[:, i] = out
+        return outputs
+    # ============================================================================
 
     def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
-        batch_size = final_weights.size(0)
         sorted_weights, sorted_indices = torch.sort(final_weights, dim=1, descending=True)
         cum_weights = torch.cumsum(sorted_weights, dim=1)
         mask = (cum_weights <= self.cum_weight_threshold).float()
@@ -450,18 +377,13 @@ class FuzzyHesitantEnsemble(nn.Module):
 
     def forward(self, x: torch.Tensor, return_details: bool = False):
         final_weights, all_memberships = self.hesitant_fuzzy(x)
-
-        # ===== NEW: REVIEWER RESPONSE - جایگزینی hesitancy محاسبه‌شده =====
         avg_hesitancy = self._compute_hesitancy(all_memberships)
-        # ==================================================================
-
         mask = self._compute_mask_vectorized(final_weights, avg_hesitancy)
         final_weights = final_weights * mask
         final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
 
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
         active_models = torch.any(final_weights > 0, dim=0).nonzero(as_tuple=True)[0]
-
         for i in active_models:
             x_n = self.normalizations(x, i.item())
             with torch.no_grad():
@@ -476,118 +398,128 @@ class FuzzyHesitantEnsemble(nn.Module):
         return final_output, final_weights
 
 
-# ================== NEW: REVIEWER RESPONSE - VALIDATION FUNCTIONS ==================
+# ================== HESITANCY UTILITIES ==================
 def compute_uncertainty_measures(all_memberships: torch.Tensor) -> dict:
-    """
-    محاسبه‌ی همه‌ی معیارهای عدم‌قطعیت برای یک batch.
-    ورودی:  all_memberships → (B, N, K)
-    خروجی:  dict از تنسورهای (B,)
-    """
     var = all_memberships.var(dim=2, unbiased=False).mean(dim=1)
     mean_mem = all_memberships.mean(dim=2)
     std_mem = all_memberships.std(dim=2, unbiased=False)
     cv = (std_mem / (mean_mem + 1e-8)).mean(dim=1)
-
     p = all_memberships / (all_memberships.sum(dim=2, keepdim=True) + 1e-8)
     K = all_memberships.size(2)
     ent = -(p * torch.log(p + 1e-8)).sum(dim=2) / np.log(K)
     ent = ent.mean(dim=1)
-
-    rng = (all_memberships.max(dim=2).values
-           - all_memberships.min(dim=2).values).mean(dim=1)
-
+    rng = (all_memberships.max(dim=2).values - all_memberships.min(dim=2).values).mean(dim=1)
     mean_level = mean_mem.mean(dim=1)
     combined = var + (1.0 - mean_level) * 0.5
-
     return {
-        'variance': var,
-        'cv': cv,
-        'entropy': ent,
-        'range': rng,
-        'mean_level': mean_level,
-        'combined': combined,
+        'variance': var, 'cv': cv, 'entropy': ent, 'range': rng,
+        'mean_level': mean_level, 'combined': combined,
     }
 
 
 @torch.no_grad()
-def validate_hesitancy_measure(ensemble, test_loader, device, model_names, save_dir):
-    """
-    اعتبارسنجی معیار hesitancy در برابر خطای پیش‌بینی و شایستگی مدل‌ها.
-    پاسخ مستقیم به نگرانی داور:
-        «واریانس کم لزوماً به معنی اطمینان بالا نیست.»
+def calibrate_hesitancy_threshold(ensemble, loader, device, measure, percentile=75.0):
+    """Calibrate the hesitancy threshold from a chosen measure on a validation set.
+    Uses percentile-based threshold (default: 75th percentile = ~25% of samples get override).
     """
     ensemble.eval()
-    ds = test_loader.dataset
+    original = ensemble.hesitancy_measure
+    ensemble.hesitancy_measure = measure
+
+    ds = loader.dataset
+    all_vals = []
+    for i in tqdm(range(len(ds)), desc=f"Calibrating [{measure}]"):
+        try:
+            image, _ = ds[i]
+        except Exception:
+            continue
+        image = image.unsqueeze(0).to(device)
+        _, _, mem, _ = ensemble(image, return_details=True)
+        m = compute_uncertainty_measures(mem)
+        all_vals.append(float(m[measure].item()))
+
+    ensemble.hesitancy_measure = original
+
+    if len(all_vals) == 0:
+        raise ValueError("No samples collected for calibration")
+
+    vals = np.array(all_vals)
+    threshold = float(np.percentile(vals, percentile))
+    return threshold, vals
+
+
+@torch.no_grad()
+def validate_hesitancy_measure(ensemble, loader, device, model_names, save_dir, tag="val"):
+    """Validate hesitancy measures against prediction errors and model competence
+    on a held-out set (should be VALIDATION set, not test, to avoid leakage).
+    """
+    ensemble.eval()
+    ds = loader.dataset
     keys = ['variance', 'cv', 'entropy', 'range', 'mean_level', 'combined']
     collected = {k: [] for k in keys}
-    errors, per_model_errors, probs, labels = [], [], [], []
+    errors, per_model_errors = [], []
 
-    for i in tqdm(range(len(ds)), desc="Validate hesitancy"):
+    for i in tqdm(range(len(ds)), desc=f"Validate hesitancy [{tag}]"):
         try:
             image, label = ds[i]
-        except Exception as e:
-            print(f"[skip] sample {i}: {e}")
+        except Exception:
             continue
-
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
 
-        out, w, mem, per_out = ensemble(image, return_details=True)
-
+        out, _, mem, _ = ensemble(image, return_details=True)
         m = compute_uncertainty_measures(mem)
         for k in keys:
             collected[k].append(float(m[k].item()))
 
         p = torch.sigmoid(out.squeeze()).item()
         pred = int(p > 0.5)
-        probs.append(p)
-        labels.append(label_int)
         errors.append(0 if pred == label_int else 1)
 
-        # خطای هر مدل جداگانه (برای همبستگی با شایستگی)
-        m_errs = []
-        for j in range(len(model_names)):
-            logit = per_out[0, j, 0].item()
-            m_errs.append(0 if int(logit > 0) == label_int else 1)
+        # CORRECT per-model error computation (independent of mask)
+        all_logits = ensemble.compute_all_model_logits(image)
+        m_errs = [
+            (0 if int(all_logits[0, j, 0].item() > 0) == label_int else 1)
+            for j in range(ensemble.num_models)
+        ]
         per_model_errors.append(m_errs)
 
     errors_np = np.array(errors)
     model_errs_np = np.array(per_model_errors)
     results = {}
 
-    print("\n" + "=" * 92)
-    print("VALIDATION OF HESITANCY MEASURE (Reviewer Concern Response)")
-    print("=" * 92)
-    print(f"#samples: {len(errors_np)}  |  Overall error rate: {errors_np.mean()*100:.2f}%")
-    print(f"{'-'*92}")
-    print(f"{'Measure':<12} {'Pearson(err)':>14} {'Spearman(err)':>15} "
-          f"{'AUC(err)':>11} {'Spearman(model-err)':>22}")
-    print(f"{'-'*92}")
+    print("\n" + "=" * 110)
+    print(f"VALIDATION OF HESITANCY MEASURES ON {tag.upper()} SET")
+    print("=" * 110)
+    print(f"#samples: {len(errors_np)} | Error rate: {errors_np.mean()*100:.2f}%")
+    print("-" * 110)
+    print(f"{'Measure':<12} {'Pearson':>10} {'p-val':>9} {'Spearman':>10} {'p-val':>9} "
+          f"{'AUC(err)':>10} {'Spear(model-err)':>18}")
+    print("-" * 110)
 
     for name, vals in collected.items():
         v = np.array(vals)
         if name == 'mean_level':
-            # mean_level بالا = اطمینان بالا → همبستگی با «درستی»
             try:
-                r_correct, _ = pearsonr(v, 1 - errors_np)
+                r_correct, p_correct = pearsonr(v, 1 - errors_np)
             except Exception:
-                r_correct = 0.0
+                r_correct, p_correct = 0.0, 1.0
             results[name] = {
                 'note': 'higher is more confident',
                 'pearson_with_correctness': float(r_correct),
+                'p_value': float(p_correct),
             }
-            print(f"{name:<12} {'(confidence)':>14} {'-':>15} {'-':>11} "
-                  f"r_correct={r_correct:+.3f}")
+            print(f"{name:<12} {'(confidence)':>10} {p_correct:>9.4f} {'-':>10} {'-':>9} {'-':>10} {'-':>18}")
             continue
 
         try:
-            pr, _ = pearsonr(v, errors_np)
+            pr, pr_p = pearsonr(v, errors_np)
         except Exception:
-            pr = 0.0
+            pr, pr_p = 0.0, 1.0
         try:
-            sr, _ = spearmanr(v, errors_np)
+            sr, sr_p = spearmanr(v, errors_np)
         except Exception:
-            sr = 0.0
+            sr, sr_p = 0.0, 1.0
 
         if len(np.unique(errors_np)) > 1:
             auc = roc_auc_score(errors_np, v)
@@ -595,73 +527,142 @@ def validate_hesitancy_measure(ensemble, test_loader, device, model_names, save_
             auc = 0.5
 
         try:
-            sm, _ = spearmanr(v, model_errs_np.mean(axis=1))
+            sm, sm_p = spearmanr(v, model_errs_np.mean(axis=1))
         except Exception:
-            sm = 0.0
+            sm, sm_p = 0.0, 1.0
+
+        mean_correct   = float(v[errors_np == 0].mean()) if (errors_np == 0).any() else 0.0
+        mean_incorrect = float(v[errors_np == 1].mean()) if (errors_np == 1).any() else 0.0
 
         results[name] = {
             'pearson_with_error': float(pr),
+            'pearson_p_value': float(pr_p),
             'spearman_with_error': float(sr),
+            'spearman_p_value': float(sr_p),
             'auc_error_detection': float(auc),
             'spearman_with_model_errors': float(sm),
+            'spearman_model_p_value': float(sm_p),
+            'mean_hesitancy_correct': mean_correct,
+            'mean_hesitancy_incorrect': mean_incorrect,
         }
 
-        print(f"{name:<12} {pr:>+14.3f} {sr:>+15.3f} {auc:>11.3f} {sm:>+22.3f}")
+        print(f"{name:<12} {pr:>+10.3f} {pr_p:>9.4f} {sr:>+10.3f} {sr_p:>9.4f} "
+              f"{auc:>10.3f} {sm:>+18.3f}")
 
-    # انتخاب بهترین معیار برای تشخیص خطا
+    # Mean hesitancy (correct vs incorrect) -- direct answer to reviewer's concern
+    print("-" * 110)
+    print("Mean hesitancy (correct vs incorrect):")
+    for name, vals in collected.items():
+        if name == 'mean_level':
+            continue
+        v = np.array(vals)
+        mc = float(v[errors_np == 0].mean()) if (errors_np == 0).any() else 0.0
+        mi = float(v[errors_np == 1].mean()) if (errors_np == 1).any() else 0.0
+        print(f"  {name:<12} correct={mc:>8.4f}  incorrect={mi:>8.4f}  delta={mi-mc:>+8.4f}")
+
     candidates = [n for n in keys if n != 'mean_level']
     best = max(candidates, key=lambda n: results[n]['auc_error_detection'])
-    print(f"{'-'*92}")
-    print(f"Best measure for error detection: {best} "
-          f"(AUC = {results[best]['auc_error_detection']:.4f})")
-    print(f"Active default measure: {ensemble.hesitancy_measure}")
-    print("=" * 92 + "\n")
+    print("-" * 110)
+    print(f"Best measure by AUC(err): {best} (AUC = {results[best]['auc_error_detection']:.4f})")
+    print(f"Active measure: {ensemble.hesitancy_measure} | Threshold: {ensemble.hesitancy_threshold:.4f}")
+    print("=" * 110 + "\n")
 
-    with open(os.path.join(save_dir, 'hesitancy_validation.json'), 'w') as f:
+    with open(os.path.join(save_dir, f'hesitancy_validation_{tag}.json'), 'w') as f:
         json.dump({
+            'split': tag,
             'num_samples': int(len(errors_np)),
             'error_rate': float(errors_np.mean()),
+            'active_measure': ensemble.hesitancy_measure,
+            'active_threshold': float(ensemble.hesitancy_threshold),
             'per_model_error_rates': {
                 name: float(model_errs_np[:, j].mean())
                 for j, name in enumerate(model_names)
             },
-            'active_measure': ensemble.hesitancy_measure,
             'measures': results,
-            'best_measure_for_error_detection': best,
+            'best_measure_by_auc': best,
         }, f, indent=2)
 
-    _plot_hesitancy_hist(collected, errors_np, save_dir)
+    _plot_hesitancy_hist(collected, errors_np, save_dir, tag)
     return results
 
 
-def _plot_hesitancy_hist(collected, errors_np, save_dir):
-    """نمودار توزیع معیارهای عدم‌قطعیت برای نمونه‌های درست و غلط."""
-    to_plot = ['variance', 'entropy', 'cv', 'combined']
-    to_plot = [n for n in to_plot if n in collected]
+def _plot_hesitancy_hist(collected, errors_np, save_dir, tag="val"):
+    to_plot = [n for n in ['variance', 'entropy', 'cv', 'combined'] if n in collected]
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     axes = axes.flatten()
-
     for ax, name in zip(axes, to_plot):
         v = np.array(collected[name])
-        ax.hist(v[errors_np == 0], bins=30, alpha=0.6, density=True,
-                label='Correct', color='green')
-        ax.hist(v[errors_np == 1], bins=30, alpha=0.6, density=True,
-                label='Incorrect', color='red')
+        ax.hist(v[errors_np == 0], bins=30, alpha=0.6, density=True, label='Correct', color='green')
+        ax.hist(v[errors_np == 1], bins=30, alpha=0.6, density=True, label='Incorrect', color='red')
         ax.set_xlabel(name.capitalize())
         ax.set_ylabel('Density')
         ax.set_title(f'{name.capitalize()}')
         ax.legend()
         ax.grid(alpha=0.3)
-
     for ax in axes[len(to_plot):]:
         ax.axis('off')
-
     plt.tight_layout()
-    path = os.path.join(save_dir, 'hesitancy_validation_distributions.png')
+    path = os.path.join(save_dir, f'hesitancy_validation_distributions_{tag}.png')
     plt.savefig(path, dpi=200, bbox_inches='tight')
     plt.close()
     print(f"Distributions plot saved: {path}")
-# ====================================================================================
+
+
+@torch.no_grad()
+def run_measure_ablation(ensemble, val_loader, device, save_dir, percentile=75.0):
+    """Ablation on all measures, using the VALIDATION set only (no leakage).
+    Each measure gets its own calibrated threshold. Best measure picked by val accuracy.
+    """
+    measures = ['variance', 'cv', 'entropy', 'range', 'combined']
+    results = {}
+
+    original_measure = ensemble.hesitancy_measure
+    original_threshold = ensemble.hesitancy_threshold
+
+    for measure in measures:
+        print(f"\n{'='*60}\nABLATION: {measure}\n{'='*60}")
+        try:
+            threshold, _ = calibrate_hesitancy_threshold(
+                ensemble, val_loader, device, measure, percentile
+            )
+        except Exception as e:
+            print(f"  [SKIP] Calibration failed: {e}")
+            continue
+
+        ensemble.hesitancy_measure = measure
+        ensemble.hesitancy_threshold = threshold
+
+        criterion = nn.BCEWithLogitsLoss()
+        acc, loss = evaluate_accuracy_and_loss(ensemble, val_loader, device, criterion)
+
+        results[measure] = {
+            'threshold': threshold,
+            'val_accuracy': acc,
+            'val_loss': loss,
+        }
+        print(f"  Threshold: {threshold:.4f} | Val Acc: {acc:.2f}% | Val Loss: {loss:.4f}")
+
+    ensemble.hesitancy_measure = original_measure
+    ensemble.hesitancy_threshold = original_threshold
+
+    print(f"\n{'='*60}\nABLATION SUMMARY (Val, percentile={percentile})\n{'='*60}")
+    print(f"{'Measure':<12} {'Threshold':>12} {'Val Acc':>10} {'Val Loss':>10}")
+    print("-" * 48)
+    for m, r in results.items():
+        print(f"{m:<12} {r['threshold']:>12.4f} {r['val_accuracy']:>10.2f} {r['val_loss']:>10.4f}")
+
+    best_measure = max(results, key=lambda m: results[m]['val_accuracy'])
+    print(f"\nBest measure (val accuracy): {best_measure} ({results[best_measure]['val_accuracy']:.2f}%)")
+
+    with open(os.path.join(save_dir, 'ablation_measures.json'), 'w') as f:
+        json.dump({
+            'split': 'validation',
+            'percentile': percentile,
+            'results': results,
+            'best_measure': best_measure,
+        }, f, indent=2)
+
+    return best_measure, results
 
 
 # ================== MODEL LOADING ==================
@@ -682,8 +683,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
             ckpt = torch.load(path, map_location='cpu', weights_only=False)
             model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
             model.load_state_dict(ckpt['model_state_dict'])
-            model = model.to(device).eval()
-            models.append(model)
+            models.append(model.to(device).eval())
         except Exception as e:
             print(f" [ERROR] Failed to load {path}: {e}")
     if len(models) == 0:
@@ -693,14 +693,10 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
 
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
-def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
-                                name: str, mean: Tuple[float, float, float],
-                                std: Tuple[float, float, float]) -> float:
+def evaluate_single_model_exact(model, loader, device, name, mean, std):
     model.eval()
     normalizer = MultiModelNormalization([mean], [std]).to(device)
-    correct = 0
-    total = 0
-
+    correct, total = 0, 0
     for images, labels in tqdm(loader, desc=f"Evaluating {name}"):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
@@ -710,7 +706,6 @@ def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: to
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
         total += labels.size(0)
-
     acc = 100. * correct / total
     print(f" {name}: {acc:.2f}%")
     return acc
@@ -718,28 +713,20 @@ def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: to
 
 @torch.no_grad()
 def evaluate_accuracy_and_loss(model, loader, device, criterion):
-
     model.eval()
-    correct = 0
-    total_loss = 0.0
-    total_real_samples = len(loader.dataset)
-
+    correct, total_loss = 0, 0.0
+    total_samples = len(loader.dataset)
     for images, labels in tqdm(loader, desc="Validation"):
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
-
         loss = criterion(outputs.squeeze(1), labels)
         total_loss += loss.item() * images.size(0)
-
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-
-    acc = 100. * correct / total_real_samples
-    avg_loss = total_loss / total_real_samples
-    return acc, avg_loss
+    return 100. * correct / total_samples, total_loss / total_samples
 
 
-# ================== TRAINING (Single GPU) ==================
+# ================== TRAINING ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
                         device, save_dir, model_names):
     os.makedirs(save_dir, exist_ok=True)
@@ -750,14 +737,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     best_val_acc = 0.0
 
     total_real_samples = len(train_loader.dataset)
-
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'train_acc': [],
-        'val_acc': []
-    }
-
+    history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
     epoch_times, train_times, val_times = [], [], []
     total_sw = Stopwatch(device).start()
 
@@ -767,54 +747,30 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     print(f"Trainable params: {sum(p.numel() for p in hesitant_net.parameters()):,}")
     print(f"Epochs: {num_epochs} | Initial LR: {lr}")
     print(f"Hesitant memberships per model: {hesitant_net.num_memberships}")
-    print(f"Hesitancy measure: {ensemble_model.hesitancy_measure}")     # NEW
+    print(f"Hesitancy measure: {ensemble_model.hesitancy_measure}")
     print(f"Number of models: {len(model_names)}")
     print(f"Total real training samples: {total_real_samples:,}\n")
 
     for epoch in range(num_epochs):
         epoch_sw = Stopwatch(device).start()
         ensemble_model.train()
-
-        train_loss = 0.0
-        train_correct = 0
-
-        sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
-        sum_cumsum_used = 0
-        sum_active_models = torch.zeros(len(model_names), device=device)
+        train_loss, train_correct = 0.0, 0
 
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
         for images, labels in pbar:
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
-
-            outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
+            outputs, _, _, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
             optimizer.step()
-
-            batch_size = images.size(0)
-            train_loss += loss.item() * batch_size
+            train_loss += loss.item() * images.size(0)
             pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
 
-            per_model_hesitancy = memberships.var(dim=2, unbiased=False)
-            sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
-
-            active_mask = (weights > 1e-4).float()
-            num_active_per_sample = active_mask.sum(dim=1)
-            cumsum_used_samples = (num_active_per_sample < len(model_names)).sum().item()
-            sum_cumsum_used += cumsum_used_samples
-            sum_active_models += active_mask.sum(dim=0)
-
         t_train = epoch_sw.stop()
-
-        train_loss = train_loss / total_real_samples
+        train_loss /= total_real_samples
         train_acc = 100. * train_correct / total_real_samples
-
-        avg_per_model_hesitancy = sum_per_model_hesitancy / total_real_samples
-        avg_cumsum_usage = (sum_cumsum_used / total_real_samples) * 100
-        avg_model_activation = (sum_active_models / total_real_samples) * 100
-        overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
 
         val_sw = Stopwatch(device).start()
         val_acc, val_loss = evaluate_accuracy_and_loss(ensemble_model, val_loader, device, criterion)
@@ -828,85 +784,41 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         history['train_acc'].append(train_acc)
         history['val_acc'].append(val_acc)
 
-        print(f"\n{'='*70}")
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        print(f"{'='*70}")
+        print(f"\n{'='*70}\nEpoch {epoch+1}/{num_epochs}\n{'='*70}")
         print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
         print(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
         print(f"Time: epoch {t_epoch:.1f}s (train {t_train:.1f}s | val {t_val:.1f}s)")
 
-        print(f"\n{'Hesitancy (Variance) per Model:':^70}")
-        print(f"{'-'*70}")
-        for i, name in enumerate(model_names):
-            hesitancy_val = avg_per_model_hesitancy[i].item()
-            print(f"  {i+1:2d}. {name:<30}: {hesitancy_val:.6f}")
-        print(f"{'-'*70}")
-        print(f"  {'Overall Mean Hesitancy:':<30}  {overall_mean_hesitancy:.6f}")
-
-        print(f"\n{'Cumulative Weight Threshold (Cumsum) Analysis:':^70}")
-        print(f"{'-'*70}")
-        print(f"  {'Cumsum activated in:':<30}  {avg_cumsum_usage:.2f}% of samples")
-        if avg_cumsum_usage > 50:
-            print(f"  {'Status:':<30}  ✓ Efficient")
-        elif avg_cumsum_usage > 20:
-            print(f"  {'Status:':<30}  ≈ Moderate")
-        else:
-            print(f"  {'Status:':<30}  ✗ Low efficiency")
-        print(f"  {'All models used in:':<30}  {100-avg_cumsum_usage:.2f}% of samples")
-
-        print(f"\n{'Model Activation Frequency:':^70}")
-        print(f"{'-'*70}")
-        for i, name in enumerate(model_names):
-            activation_pct = avg_model_activation[i].item()
-            bar_length = int(activation_pct / 2)
-            bar = '█' * bar_length
-            print(f"  {i+1:2d}. {name:<30}: {activation_pct:5.1f}% {bar}")
-
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            save_path = os.path.join(save_dir, 'best_hesitant_fuzzy.pt')
-            torch.save({'hesitant_state_dict': hesitant_net.state_dict()}, save_path)
+            torch.save({'hesitant_state_dict': hesitant_net.state_dict()},
+                       os.path.join(save_dir, 'best_hesitant_fuzzy.pt'))
             print(f"\n✓ Best model saved → {val_acc:.2f}%")
-
-        print()
 
     total_time = total_sw.stop()
     timing = summarize_training_times(epoch_times, train_times, val_times, total_time)
-    print(f"Total training time: {total_time/60:.2f} min "
-          f"(mean epoch: {timing['mean_epoch_time_s']:.1f}s)")
+    print(f"Total training time: {total_time/60:.2f} min (mean epoch: {timing['mean_epoch_time_s']:.1f}s)")
 
     plt.figure(figsize=(14, 6))
-
     plt.subplot(1, 2, 1)
     plt.plot(range(1, num_epochs + 1), history['train_loss'], label='train', color='blue', linewidth=2)
     plt.plot(range(1, num_epochs + 1), history['val_loss'], label='validation', color='orange', linewidth=2)
-    plt.title('Loss', fontsize=16)
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('Loss', fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(fontsize=12)
-
+    plt.title('Loss', fontsize=16); plt.xlabel('Epoch'); plt.ylabel('Loss')
+    plt.grid(True, linestyle='--', alpha=0.7); plt.legend()
     plt.subplot(1, 2, 2)
     plt.plot(range(1, num_epochs + 1), history['train_acc'], label='train', color='blue', linewidth=2)
     plt.plot(range(1, num_epochs + 1), history['val_acc'], label='validation', color='orange', linewidth=2)
-    plt.title('Accuracy', fontsize=16)
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('Accuracy (%)', fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(fontsize=12)
-
+    plt.title('Accuracy', fontsize=16); plt.xlabel('Epoch'); plt.ylabel('Accuracy (%)')
+    plt.grid(True, linestyle='--', alpha=0.7); plt.legend()
     plt.tight_layout()
-    curves_path = os.path.join(save_dir, 'training_curves.png')
-    plt.savefig(curves_path, dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✅ Training curves (Loss & Acc) saved to: {curves_path}")
-
     return best_val_acc, timing
 
 
-# ================== MAIN FUNCTION ==================
+# ================== MAIN ==================
 def main():
-    parser = argparse.ArgumentParser(description="Optimized Fuzzy Hesitant Ensemble Training (Single GPU)")
+    parser = argparse.ArgumentParser(description="Fuzzy Hesitant Ensemble with Hesitancy Validation (Single GPU)")
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -924,13 +836,19 @@ def main():
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
 
-    # ===== NEW: REVIEWER RESPONSE - آرگومان‌های جدید =====
+    # ===== REVIEWER RESPONSE ARGS =====
     parser.add_argument('--hesitancy_measure', type=str, default='variance',
                         choices=['variance', 'cv', 'entropy', 'range', 'combined'],
-                        help="Uncertainty measure used for the hesitancy override.")
+                        help="Uncertainty measure for hesitancy override.")
+    parser.add_argument('--calibrate_threshold', action='store_true',
+                        help="Calibrate hesitancy threshold on validation set (per measure).")
+    parser.add_argument('--threshold_percentile', type=float, default=75.0,
+                        help="Percentile for threshold calibration (default: 75).")
+    parser.add_argument('--run_ablation', action='store_true',
+                        help="Run ablation over all measures on validation set and pick the best.")
     parser.add_argument('--validate_hesitancy', action='store_true',
-                        help="Run empirical validation of the hesitancy measure.")
-    # ======================================================
+                        help="Detailed validation of hesitancy measures on VALIDATION set.")
+    # ==================================
 
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
@@ -941,31 +859,28 @@ def main():
         raise ValueError("Number of model_names must match model_paths")
 
     set_seed(args.seed)
-
     device = setup_device()
     pipeline_sw = Stopwatch(device).start()
 
     print("=" * 70)
-    print(f"OPTIMIZED FUZZY HESITANT ENSEMBLE TRAINING")
-    print(f"Single GPU Mode | Seed: {args.seed}")
+    print("FUZZY HESITANT ENSEMBLE TRAINING + HESITANCY VALIDATION")
+    print(f"Single GPU | Seed: {args.seed}")
     print("=" * 70)
     print(f"Dataset: {args.dataset}")
-    print(f"Data directory: {args.data_dir}")
-    print(f"Batch size: {args.batch_size}")
     print(f"Models: {len(args.model_paths)}")
-    print(f"Hesitancy measure: {args.hesitancy_measure}")           # NEW
+    print(f"Initial hesitancy measure: {args.hesitancy_measure}")
     print("=" * 70 + "\n")
 
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
-    DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
+    DEFAULT_STDS  = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
 
     num_models = len(args.model_paths)
     if num_models > len(DEFAULT_MEANS):
         MEANS = DEFAULT_MEANS + [DEFAULT_MEANS[-1]] * (num_models - len(DEFAULT_MEANS))
-        STDS = DEFAULT_STDS + [DEFAULT_STDS[-1]] * (num_models - len(DEFAULT_STDS))
+        STDS  = DEFAULT_STDS  + [DEFAULT_STDS[-1]]  * (num_models - len(DEFAULT_STDS))
     else:
         MEANS = DEFAULT_MEANS[:num_models]
-        STDS = DEFAULT_STDS[:num_models]
+        STDS  = DEFAULT_STDS[:num_models]
 
     base_models = load_pruned_models(args.model_paths, device)
     MODEL_NAMES = args.model_names[:len(base_models)]
@@ -976,7 +891,7 @@ def main():
         freeze_models=True,
         cum_weight_threshold=args.cum_weight_threshold,
         hesitancy_threshold=args.hesitancy_threshold,
-        hesitancy_measure=args.hesitancy_measure,          # NEW
+        hesitancy_measure=args.hesitancy_measure,
     ).to(device)
 
     trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
@@ -987,10 +902,7 @@ def main():
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=False, seed=args.seed, is_main=True)
 
-    print("\n" + "=" * 70)
-    print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
-    print("=" * 70)
-
+    print("\n" + "=" * 70 + "\nINDIVIDUAL MODEL PERFORMANCE (Before Training)\n" + "=" * 70)
     individual_accs = []
     for i, model in enumerate(base_models):
         acc = evaluate_single_model_exact(model, test_loader, device,
@@ -1000,8 +912,7 @@ def main():
 
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
-    print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
-    print("=" * 70)
+    print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%\n" + "=" * 70)
 
     best_val_acc, train_timing = train_hesitant_fuzzy(
         ensemble, train_loader, val_loader,
@@ -1014,18 +925,30 @@ def main():
         ensemble.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
         print("Best model loaded.\n")
 
-    # ===== NEW: REVIEWER RESPONSE - اعتبارسنجی معیار hesitancy =====
-    if args.validate_hesitancy:
-        print("\n" + "=" * 70)
-        print("VALIDATING HESITANCY MEASURE (Reviewer Concern)")
-        print("=" * 70)
-        validate_hesitancy_measure(ensemble, test_loader, device,
-                                   MODEL_NAMES, args.save_dir)
-    # ===============================================================
+    # ===== REVIEWER RESPONSE: on VALIDATION set only (no leakage) =====
+    if args.run_ablation:
+        print("\n" + "=" * 70 + "\nABLATION OVER HESITANCY MEASURES (Validation)\n" + "=" * 70)
+        best_measure, abl = run_measure_ablation(
+            ensemble, val_loader, device, args.save_dir, args.threshold_percentile
+        )
+        ensemble.hesitancy_measure = best_measure
+        ensemble.hesitancy_threshold = abl[best_measure]['threshold']
+        print(f"[MAIN] Using best measure: {best_measure}, threshold={abl[best_measure]['threshold']:.4f}")
 
-    print("\n" + "=" * 70)
-    print("FINAL ENSEMBLE EVALUATION")
-    print("=" * 70)
+    elif args.calibrate_threshold:
+        print("\n" + "=" * 70 + f"\nCALIBRATING THRESHOLD FOR {args.hesitancy_measure}\n" + "=" * 70)
+        threshold, _ = calibrate_hesitancy_threshold(
+            ensemble, val_loader, device, args.hesitancy_measure, args.threshold_percentile
+        )
+        ensemble.hesitancy_threshold = threshold
+        print(f"[MAIN] Calibrated threshold: {threshold:.4f} (percentile={args.threshold_percentile})")
+
+    if args.validate_hesitancy:
+        print("\n" + "=" * 70 + "\nVALIDATING HESITANCY MEASURES (Validation Set)\n" + "=" * 70)
+        validate_hesitancy_measure(ensemble, val_loader, device, MODEL_NAMES, args.save_dir, tag="val")
+    # ===================================================================
+
+    print("\n" + "=" * 70 + "\nFINAL ENSEMBLE EVALUATION (TEST SET)\n" + "=" * 70)
 
     efficiency = benchmark_efficiency(ensemble, test_loader, device, MODEL_NAMES,
                                       latency_samples=len(test_loader.dataset))
@@ -1038,9 +961,7 @@ def main():
     )
     final_eval_time = eval_sw.stop()
 
-    print("\n" + "=" * 70)
-    print("FINAL COMPARISON")
-    print("=" * 70)
+    print("\n" + "=" * 70 + "\nFINAL COMPARISON\n" + "=" * 70)
     print(f"Best Single Model: {best_single:.2f}%")
     print(f"Ensemble Accuracy: {final_acc:.2f}%")
     print(f"Improvement: {final_acc - best_single:+.2f}%")
@@ -1049,10 +970,11 @@ def main():
     final_results = {
         'seed': args.seed,
         'method': 'Fuzzy_Hesitant',
-        'hesitancy_measure': args.hesitancy_measure,           # NEW
+        'hesitancy_measure_final': ensemble.hesitancy_measure,
+        'hesitancy_threshold_final': float(ensemble.hesitancy_threshold),
         'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
         'ensemble': {'test_accuracy': float(final_acc)},
-        'improvement': float(final_acc - best_single)
+        'improvement': float(final_acc - best_single),
     }
     with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
         json.dump(final_results, f, indent=4)
@@ -1060,10 +982,9 @@ def main():
     torch.save({
         'ensemble_state_dict': ensemble.state_dict(),
         'model_names': MODEL_NAMES,
-        'means': MEANS,
-        'stds': STDS,
-        'seed': args.seed,
-        'hesitancy_measure': args.hesitancy_measure,           # NEW
+        'means': MEANS, 'stds': STDS, 'seed': args.seed,
+        'hesitancy_measure': ensemble.hesitancy_measure,
+        'hesitancy_threshold': float(ensemble.hesitancy_threshold),
     }, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
 
     efficiency['final_evaluation_time_s'] = final_eval_time
