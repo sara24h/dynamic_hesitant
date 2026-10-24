@@ -609,6 +609,279 @@ def _plot_hesitancy_hist(collected, errors_np, save_dir, tag="val"):
 
 
 @torch.no_grad()
+def validate_model_competence(ensemble, loader, device, model_names, save_dir, tag="val"):
+    """Validate that the learned final_weights correlate with actual per-model correctness.
+
+    Direct test for "model competence estimation": does the ensemble give higher
+    weight to models that are actually correct on each sample?
+    """
+    ensemble.eval()
+    ds = loader.dataset
+    N = ensemble.num_models
+
+    all_weights = []           # [S, N]
+    all_per_model_correct = [] # [S, N]
+    all_ensemble_correct = []  # [S]
+
+    for i in tqdm(range(len(ds)), desc=f"Validate competence [{tag}]"):
+        try:
+            image, label = ds[i]
+        except Exception:
+            continue
+        image = image.unsqueeze(0).to(device)
+        label_int = int(label)
+
+        out, final_weights, _, _ = ensemble(image, return_details=True)
+        w = final_weights.squeeze(0).cpu().numpy()
+
+        p = torch.sigmoid(out.squeeze()).item()
+        pred = int(p > 0.5)
+        all_ensemble_correct.append(1 if pred == label_int else 0)
+
+        all_logits = ensemble.compute_all_model_logits(image)
+        per_correct = [
+            (1 if int(all_logits[0, j, 0].item() > 0) == label_int else 0)
+            for j in range(N)
+        ]
+        all_weights.append(w)
+        all_per_model_correct.append(per_correct)
+
+    weights_np = np.array(all_weights)
+    correct_np = np.array(all_per_model_correct)
+    ens_correct_np = np.array(all_ensemble_correct)
+    S = weights_np.shape[0]
+
+    print("\n" + "=" * 110)
+    print(f"VALIDATION OF MODEL-COMPETENCE ESTIMATION ON {tag.upper()} SET")
+    print("=" * 110)
+    print(f"#samples: {S} | Ensemble accuracy: {ens_correct_np.mean()*100:.2f}%")
+    print(f"#models : {N}")
+    print("-" * 110)
+
+    results = {
+        'split': tag,
+        'num_samples': int(S),
+        'num_models': int(N),
+        'ensemble_accuracy': float(ens_correct_np.mean()),
+        'per_model_accuracy': {model_names[j]: float(correct_np[:, j].mean())
+                                for j in range(N)},
+        'per_model_mean_weight': {model_names[j]: float(weights_np[:, j].mean())
+                                   for j in range(N)},
+    }
+
+    print("\n[1] Per-model correlation: final weight vs correctness (across samples)")
+    print(f"    {'Model':<30} {'Acc':>8} {'MeanW':>8} {'Pearson':>10} {'p-val':>10} "
+          f"{'Spearman':>10} {'p-val':>10}")
+    print("    " + "-" * 96)
+
+    per_model_corr = {}
+    for j, name in enumerate(model_names):
+        w = weights_np[:, j]
+        c = correct_np[:, j]
+        try:
+            pr, pr_p = pearsonr(w, c)
+        except Exception:
+            pr, pr_p = 0.0, 1.0
+        try:
+            sr, sr_p = spearmanr(w, c)
+        except Exception:
+            sr, sr_p = 0.0, 1.0
+        per_model_corr[name] = {
+            'accuracy': float(c.mean()),
+            'mean_weight': float(w.mean()),
+            'pearson_weight_vs_correct': float(pr),
+            'pearson_p_value': float(pr_p),
+            'spearman_weight_vs_correct': float(sr),
+            'spearman_p_value': float(sr_p),
+        }
+        print(f"    {name:<30} {c.mean()*100:>7.2f}% {w.mean():>8.4f} "
+              f"{pr:>+10.3f} {pr_p:>10.4f} {sr:>+10.3f} {sr_p:>10.4f}")
+
+    print("\n[2] Pooled correlation over all (sample, model) pairs")
+    w_flat = weights_np.flatten()
+    c_flat = correct_np.flatten()
+    try:
+        pr, pr_p = pearsonr(w_flat, c_flat)
+    except Exception:
+        pr, pr_p = 0.0, 1.0
+    try:
+        sr, sr_p = spearmanr(w_flat, c_flat)
+    except Exception:
+        sr, sr_p = 0.0, 1.0
+    print(f"    Pearson:  r = {pr:+.4f}  (p = {pr_p:.4f})")
+    print(f"    Spearman: r = {sr:+.4f}  (p = {sr_p:.4f})")
+    results['pooled_correlation'] = {
+        'pearson': float(pr), 'pearson_p': float(pr_p),
+        'spearman': float(sr), 'spearman_p': float(sr_p),
+    }
+
+    print("\n[3] Top-1 weight accuracy: is the highest-weighted model correct?")
+    top1_model_idx = weights_np.argmax(axis=1)
+    top1_model_correct = correct_np[np.arange(S), top1_model_idx]
+    top1_acc = float(top1_model_correct.mean())
+    top1_selections = np.bincount(top1_model_idx, minlength=N)
+
+    print(f"    Top-1 model correct rate: {top1_acc*100:.2f}%")
+    print(f"    {'Model':<30} {'#Top1':>8} {'%Top1':>8} {'AccWhenTop1':>14}")
+    print("    " + "-" * 62)
+    for j, name in enumerate(model_names):
+        n_top1 = int(top1_selections[j])
+        acc_when_top1 = float(correct_np[top1_model_idx == j, j].mean()) if n_top1 > 0 else 0.0
+        print(f"    {name:<30} {n_top1:>8d} {n_top1/S*100:>7.2f}% {acc_when_top1*100:>13.2f}%")
+        per_model_corr[name]['times_top1'] = n_top1
+        per_model_corr[name]['pct_top1'] = float(n_top1 / S)
+        per_model_corr[name]['accuracy_when_top1'] = acc_when_top1
+
+    results['top1_weight_accuracy'] = {
+        'top1_correct_rate': top1_acc,
+        'per_model_top1_count': {model_names[j]: int(top1_selections[j]) for j in range(N)},
+    }
+
+    weighted_competence = (weights_np * correct_np).sum(axis=1)
+    print("\n[4] Weighted competence score (sum_j w_j * correct_j):")
+    print(f"    Mean:   {weighted_competence.mean():.4f}")
+    print(f"    Median: {np.median(weighted_competence):.4f}")
+    print(f"    Std:    {weighted_competence.std():.4f}")
+    results['weighted_competence'] = {
+        'mean': float(weighted_competence.mean()),
+        'median': float(np.median(weighted_competence)),
+        'std': float(weighted_competence.std()),
+    }
+
+    any_correct = correct_np.max(axis=1)
+    oracle_acc = float(any_correct.mean())
+    print("\n[5] Oracle vs achieved:")
+    print(f"    Oracle (pick any correct model): {oracle_acc*100:.2f}%")
+    print(f"    Top-1 weight accuracy:            {top1_acc*100:.2f}%")
+    print(f"    Ensemble accuracy:                {ens_correct_np.mean()*100:.2f}%")
+    print(f"    Gap (oracle - top1):              {(oracle_acc-top1_acc)*100:+.2f}%")
+    results['oracle'] = {
+        'oracle_accuracy': oracle_acc,
+        'top1_weight_accuracy': top1_acc,
+        'ensemble_accuracy': float(ens_correct_np.mean()),
+        'gap_oracle_top1': float(oracle_acc - top1_acc),
+    }
+
+    print("\n[6] Mean final weight on samples where model was correct vs incorrect:")
+    print(f"    {'Model':<30} {'W|correct':>12} {'W|incorrect':>12} {'delta':>10}")
+    print("    " + "-" * 66)
+    for j, name in enumerate(model_names):
+        w = weights_np[:, j]
+        c = correct_np[:, j]
+        wc = float(w[c == 1].mean()) if (c == 1).any() else 0.0
+        wi = float(w[c == 0].mean()) if (c == 0).any() else 0.0
+        print(f"    {name:<30} {wc:>12.4f} {wi:>12.4f} {wc-wi:>+10.4f}")
+        per_model_corr[name]['mean_weight_correct'] = wc
+        per_model_corr[name]['mean_weight_incorrect'] = wi
+        per_model_corr[name]['delta_weight'] = wc - wi
+    results['per_model_correlation'] = per_model_corr
+
+    active_mask = (weights_np > 1e-4)
+    active_per_sample = active_mask.sum(axis=1)
+    print("\n[7] Active models per sample (weight > 1e-4):")
+    print(f"    Mean: {active_per_sample.mean():.2f} | Median: {np.median(active_per_sample):.1f}")
+    unique_counts, count_freq = np.unique(active_per_sample, return_counts=True)
+    for count, freq in zip(unique_counts, count_freq):
+        print(f"    {int(count)} model(s): {int(freq):5d} samples ({freq/S*100:5.2f}%)")
+
+    per_sample_data = []
+    for i in range(S):
+        per_sample_data.append({
+            'weights': [float(x) for x in weights_np[i]],
+            'model_correct': [int(x) for x in correct_np[i]],
+            'ensemble_correct': int(ens_correct_np[i]),
+            'top1_model_idx': int(top1_model_idx[i]),
+            'top1_model_correct': int(top1_model_correct[i]),
+            'weighted_competence': float(weighted_competence[i]),
+        })
+    results['per_sample'] = per_sample_data
+
+    print("\n" + "=" * 110)
+    print("VERDICT — Does the learned weighting reflect model competence?")
+    print("=" * 110)
+    n_positive_delta = sum(1 for m in per_model_corr.values() if m.get('delta_weight', 0) > 0)
+    print(f"  Models with higher weight when correct: {n_positive_delta}/{N}")
+
+    pooled_sr = results['pooled_correlation']['spearman']
+    if pooled_sr > 0.05:
+        print(f"  Pooled Spearman = {pooled_sr:+.4f} (positive → weight tracks competence)")
+    else:
+        print(f"  Pooled Spearman = {pooled_sr:+.4f} (weak/near-zero)")
+
+    chance_top1 = float(correct_np.mean())
+    print(f"  Top-1 weight accuracy: {top1_acc*100:.2f}%  "
+          f"(chance reference: {chance_top1*100:.2f}%)")
+    random_baseline = float(correct_np.mean())
+    print(f"  Weighted competence: {weighted_competence.mean():.4f}  "
+          f"(uniform-weight reference: {random_baseline:.4f})")
+
+    if top1_acc > chance_top1 + 0.05 or weighted_competence.mean() > random_baseline + 0.05:
+        print("\n  ✅ POSITIVE EVIDENCE: The learned weights show competence awareness.")
+    elif top1_acc < chance_top1 - 0.05:
+        print("\n  ❌ NEGATIVE EVIDENCE: Weights anti-correlate with competence.")
+    else:
+        print("\n  ⚠️  WEAK EVIDENCE: Weights are near chance-level for competence tracking.")
+    print("=" * 110 + "\n")
+
+    json_path = os.path.join(save_dir, f'competence_validation_{tag}.json')
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"Competence validation saved: {json_path}")
+
+    try:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        ax = axes[0]
+        x = np.arange(N)
+        width = 0.35
+        w_correct = [per_model_corr[name].get('mean_weight_correct', 0) for name in model_names]
+        w_incorrect = [per_model_corr[name].get('mean_weight_incorrect', 0) for name in model_names]
+        ax.bar(x - width/2, w_correct, width, label='Correct', color='green', alpha=0.7)
+        ax.bar(x + width/2, w_incorrect, width, label='Incorrect', color='red', alpha=0.7)
+        ax.set_xticks(x)
+        ax.set_xticklabels([f'M{i+1}' for i in range(N)])
+        ax.set_ylabel('Mean final weight')
+        ax.set_title('Weight on correct vs incorrect\n(per model)')
+        ax.legend()
+        ax.grid(alpha=0.3, axis='y')
+
+        ax = axes[1]
+        ax.hist(weighted_competence, bins=20, color='steelblue', alpha=0.7, edgecolor='black')
+        ax.axvline(weighted_competence.mean(), color='red', linestyle='--',
+                   label=f'Mean = {weighted_competence.mean():.3f}')
+        ax.axvline(random_baseline, color='orange', linestyle=':',
+                   label=f'Uniform baseline = {random_baseline:.3f}')
+        ax.set_xlabel('Weighted competence')
+        ax.set_ylabel('Count')
+        ax.set_title('Distribution of weighted competence')
+        ax.legend()
+        ax.grid(alpha=0.3, axis='y')
+
+        ax = axes[2]
+        labels = ['Ensemble', 'Top-1 weight', 'Oracle']
+        values = [ens_correct_np.mean()*100, top1_acc*100, oracle_acc*100]
+        colors = ['steelblue', 'green', 'gold']
+        bars = ax.bar(labels, values, color=colors, alpha=0.7, edgecolor='black')
+        for bar, v in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width()/2, v + 1, f'{v:.1f}%',
+                    ha='center', fontsize=11, fontweight='bold')
+        ax.set_ylabel('Accuracy (%)')
+        ax.set_title('Ensemble vs Top-1 weight vs Oracle')
+        ax.set_ylim(0, 105)
+        ax.grid(alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        plot_path = os.path.join(save_dir, f'competence_validation_{tag}.png')
+        plt.savefig(plot_path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"Competence plot saved: {plot_path}")
+    except Exception as e:
+        print(f"Plotting failed: {e}")
+
+    return results
+
+
+@torch.no_grad()
 def run_measure_ablation(ensemble, val_loader, device, save_dir, percentile=75.0):
     """Ablation on all measures, using the VALIDATION set only (no leakage).
     Each measure gets its own calibrated threshold. Best measure picked by val accuracy.
@@ -848,6 +1121,8 @@ def main():
                         help="Run ablation over all measures on validation set and pick the best.")
     parser.add_argument('--validate_hesitancy', action='store_true',
                         help="Detailed validation of hesitancy measures on VALIDATION set.")
+    parser.add_argument('--validate_competence', action='store_true',
+                        help="Validate that learned final weights reflect model competence.")
     # ==================================
 
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
@@ -946,6 +1221,11 @@ def main():
     if args.validate_hesitancy:
         print("\n" + "=" * 70 + "\nVALIDATING HESITANCY MEASURES (Validation Set)\n" + "=" * 70)
         validate_hesitancy_measure(ensemble, val_loader, device, MODEL_NAMES, args.save_dir, tag="val")
+
+    if args.validate_competence:
+        print("\n" + "=" * 70 + "\nVALIDATING MODEL-COMPETENCE ESTIMATION (Validation Set)\n" + "=" * 70)
+        validate_model_competence(ensemble, val_loader, device, MODEL_NAMES,
+                                  args.save_dir, tag="val")
     # ===================================================================
 
     print("\n" + "=" * 70 + "\nFINAL ENSEMBLE EVALUATION (TEST SET)\n" + "=" * 70)
