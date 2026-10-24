@@ -882,6 +882,300 @@ def validate_model_competence(ensemble, loader, device, model_names, save_dir, t
 
 
 @torch.no_grad()
+def validate_variance_vs_competence(ensemble, loader, device, model_names, save_dir, tag="val"):
+    """Directly correlate the variance-based hesitancy score with per-model competence.
+
+    This is the DIRECT test requested by the reviewer:
+        "Does the variance measure track model competence?"
+
+    For each sample we compute:
+        - H_var: variance-based hesitancy (the paper's measure)
+        - correct_i: whether base model i was actually correct (mask-independent)
+        - mean_correct: fraction of base models that were correct
+        - ensemble_correct: whether the ensemble prediction was correct
+        - top1_correct: whether the highest-weighted model was correct
+
+    Then we compute correlations and AUC to answer whether high variance
+    co-occurs with competent models (paper's claim) or with incompetent
+    models (uncertainty inversion).
+    """
+    ensemble.eval()
+    ds = loader.dataset
+    N = ensemble.num_models
+
+    original_measure = ensemble.hesitancy_measure
+    ensemble.hesitancy_measure = 'variance'
+
+    all_var = []
+    all_per_model_correct = []
+    all_ensemble_correct = []
+    all_mean_correct = []
+    all_any_correct = []
+    all_all_correct = []
+    all_weights = []
+
+    for i in tqdm(range(len(ds)), desc=f"Variance vs Competence [{tag}]"):
+        try:
+            image, label = ds[i]
+        except Exception:
+            continue
+        image = image.unsqueeze(0).to(device)
+        label_int = int(label)
+
+        out, final_weights, mem, _ = ensemble(image, return_details=True)
+
+        # 1) Variance-based hesitancy
+        m = compute_uncertainty_measures(mem)
+        h_var = float(m['variance'].item())
+        all_var.append(h_var)
+
+        # 2) Ensemble correctness
+        p = torch.sigmoid(out.squeeze()).item()
+        pred = int(p > 0.5)
+        all_ensemble_correct.append(1 if pred == label_int else 0)
+
+        # 3) Per-model correctness (mask-independent)
+        all_logits = ensemble.compute_all_model_logits(image)
+        per_correct = [
+            (1 if int(all_logits[0, j, 0].item() > 0) == label_int else 0)
+            for j in range(N)
+        ]
+        all_per_model_correct.append(per_correct)
+        all_mean_correct.append(float(np.mean(per_correct)))
+        all_any_correct.append(int(any(per_correct)))
+        all_all_correct.append(int(all(per_correct)))
+        all_weights.append(final_weights.squeeze(0).cpu().numpy())
+
+    ensemble.hesitancy_measure = original_measure
+
+    h_var_np = np.array(all_var)
+    correct_np = np.array(all_per_model_correct)
+    ens_correct_np = np.array(all_ensemble_correct)
+    mean_correct_np = np.array(all_mean_correct)
+    any_correct_np = np.array(all_any_correct)
+    all_correct_np = np.array(all_all_correct)
+    weights_np = np.array(all_weights)
+
+    top1_idx = weights_np.argmax(axis=1)
+    top1_correct_np = correct_np[np.arange(len(h_var_np)), top1_idx]
+
+    S = len(h_var_np)
+
+    print("\n" + "=" * 110)
+    print(f"VARIANCE-BASED HESITANCY vs MODEL COMPETENCE — {tag.upper()} SET")
+    print("=" * 110)
+    print(f"#samples: {S} | Ensemble accuracy: {ens_correct_np.mean()*100:.2f}%")
+    print(f"#models : {N}")
+    print(f"Variance  mean={h_var_np.mean():.6f}  median={np.median(h_var_np):.6f}  "
+          f"min={h_var_np.min():.6f}  max={h_var_np.max():.6f}")
+    print("-" * 110)
+
+    results = {
+        'split': tag,
+        'num_samples': int(S),
+        'num_models': int(N),
+        'variance_stats': {
+            'mean': float(h_var_np.mean()),
+            'median': float(np.median(h_var_np)),
+            'std': float(h_var_np.std()),
+            'min': float(h_var_np.min()),
+            'max': float(h_var_np.max()),
+        },
+        'ensemble_accuracy': float(ens_correct_np.mean()),
+    }
+
+    # ============ [1] Correlation: variance vs competence targets ============
+    print("\n[1] Spearman/Pearson: variance vs competence targets")
+    print("    Positive r = high variance co-occurs with competent models")
+    print("    Negative r = high variance co-occurs with incompetent models (inversion)")
+    print(f"    {'Target':<35} {'Pearson':>10} {'p-val':>10} {'Spearman':>10} {'p-val':>10}")
+    print("    " + "-" * 82)
+
+    corr_results = {}
+    targets = {
+        'mean_correct': mean_correct_np,
+        'ensemble_correct': ens_correct_np,
+        'any_correct': any_correct_np,
+        'all_correct': all_correct_np,
+        'top1_correct': top1_correct_np,
+    }
+    for name, target in targets.items():
+        try:
+            pr, pr_p = pearsonr(h_var_np, target)
+        except Exception:
+            pr, pr_p = 0.0, 1.0
+        try:
+            sr, sr_p = spearmanr(h_var_np, target)
+        except Exception:
+            sr, sr_p = 0.0, 1.0
+        corr_results[name] = {
+            'pearson': float(pr), 'pearson_p': float(pr_p),
+            'spearman': float(sr), 'spearman_p': float(sr_p),
+        }
+        print(f"    {name:<35} {pr:>+10.3f} {pr_p:>10.4f} {sr:>+10.3f} {sr_p:>10.4f}")
+
+    results['correlations_with_competence'] = corr_results
+
+    # ============ [2] AUC: can variance discriminate correct vs incorrect? ============
+    print("\n[2] AUC: can variance discriminate correct from incorrect?")
+    print("    AUC > 0.5 → high variance = correct (desired)")
+    print("    AUC < 0.5 → high variance = incorrect (inversion)")
+
+    auc_results = {}
+    for name, target in [('ensemble_correct', ens_correct_np),
+                          ('any_correct', any_correct_np),
+                          ('all_correct', all_correct_np),
+                          ('top1_correct', top1_correct_np)]:
+        if len(np.unique(target)) > 1:
+            try:
+                auc = roc_auc_score(target, h_var_np)
+            except Exception:
+                auc = 0.5
+        else:
+            auc = 0.5
+        auc_results[name] = float(auc)
+        print(f"    AUC(variance → {name:<20}) = {auc:.4f}")
+
+    results['auc'] = auc_results
+
+    # ============ [3] Per-model correlation ============
+    print("\n[3] Per-model: variance vs correct_i for each base model")
+    print(f"    {'Model':<30} {'Acc':>8} {'Pearson':>10} {'p-val':>10} {'Spearman':>10} {'p-val':>10}")
+    print("    " + "-" * 82)
+
+    per_model_results = {}
+    for j, name in enumerate(model_names):
+        c = correct_np[:, j]
+        try:
+            pr, pr_p = pearsonr(h_var_np, c)
+        except Exception:
+            pr, pr_p = 0.0, 1.0
+        try:
+            sr, sr_p = spearmanr(h_var_np, c)
+        except Exception:
+            sr, sr_p = 0.0, 1.0
+        per_model_results[name] = {
+            'accuracy': float(c.mean()),
+            'pearson_variance_vs_correct': float(pr),
+            'pearson_p': float(pr_p),
+            'spearman_variance_vs_correct': float(sr),
+            'spearman_p': float(sr_p),
+        }
+        print(f"    {name:<30} {c.mean()*100:>7.2f}% {pr:>+10.3f} {pr_p:>10.4f} "
+              f"{sr:>+10.3f} {sr_p:>10.4f}")
+
+    results['per_model'] = per_model_results
+
+    # ============ [4] Group comparison ============
+    print("\n[4] Mean variance on correct vs incorrect samples")
+    print(f"    {'Target':<35} {'var|correct':>15} {'var|incorrect':>15} {'delta':>10}")
+    print("    " + "-" * 82)
+
+    group_results = {}
+    for name, target in targets.items():
+        if target.sum() == 0 or (1 - target).sum() == 0:
+            print(f"    {name:<35} {'N/A (single class)':>42}")
+            continue
+        var_correct = float(h_var_np[target == 1].mean())
+        var_incorrect = float(h_var_np[target == 0].mean())
+        delta = var_correct - var_incorrect
+        group_results[name] = {
+            'variance_on_correct': var_correct,
+            'variance_on_incorrect': var_incorrect,
+            'delta': delta,
+        }
+        print(f"    {name:<35} {var_correct:>15.6f} {var_incorrect:>15.6f} {delta:>+10.6f}")
+
+    results['group_comparison'] = group_results
+
+    # ============ [5] Verdict ============
+    print("\n" + "=" * 110)
+    print("VERDICT — Does variance track model competence?")
+    print("=" * 110)
+
+    key_sr = corr_results['mean_correct']['spearman']
+    key_auc = auc_results['ensemble_correct']
+    key_delta = group_results.get('ensemble_correct', {}).get('delta', 0.0)
+
+    print(f"  Spearman(variance, mean_correctness)  = {key_sr:+.4f}")
+    print(f"  AUC(variance → ensemble_correct)      = {key_auc:.4f}")
+    print(f"  Delta variance (correct − incorrect)  = {key_delta:+.6f}")
+
+    if key_sr > 0.10 and key_auc > 0.55:
+        print("\n  ✅ STRONG POSITIVE: variance is positively associated with competence.")
+        verdict = "strong_positive"
+    elif key_sr > 0.03 or key_auc > 0.52:
+        print("\n  🟡 WEAK POSITIVE: variance is weakly associated with competence.")
+        verdict = "weak_positive"
+    elif key_sr < -0.10 or key_auc < 0.45:
+        print("\n  ❌ NEGATIVE: variance is ANTI-correlated with competence.")
+        print("     Interpretation: low variance co-occurs with incorrect models —")
+        print("     this is the 'uncertainty inversion' phenomenon discussed by the reviewer.")
+        verdict = "negative"
+    else:
+        print("\n  ⚠️  NEUTRAL: variance is essentially uncorrelated with competence.")
+        verdict = "neutral"
+
+    results['verdict'] = verdict
+    print("=" * 110 + "\n")
+
+    json_path = os.path.join(save_dir, f'variance_competence_validation_{tag}.json')
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"Variance-vs-competence validation saved: {json_path}")
+
+    # ============ Plots ============
+    try:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        ax = axes[0]
+        if 'ensemble_correct' in group_results:
+            data = [h_var_np[ens_correct_np == 1], h_var_np[ens_correct_np == 0]]
+            ax.boxplot(data, labels=['Correct', 'Incorrect'])
+            ax.set_ylabel('Variance')
+            ax.set_title('Variance on correct vs incorrect\n(ensemble level)')
+        ax.grid(alpha=0.3, axis='y')
+
+        ax = axes[1]
+        ax.scatter(mean_correct_np + np.random.normal(0, 0.02, S), h_var_np,
+                   alpha=0.4, s=20)
+        z = np.polyfit(mean_correct_np, h_var_np, 1)
+        p = np.poly1d(z)
+        x_line = np.linspace(mean_correct_np.min(), mean_correct_np.max(), 100)
+        ax.plot(x_line, p(x_line), 'r--', label=f'trend (slope={z[0]:+.6f})')
+        ax.set_xlabel('Mean per-model correctness')
+        ax.set_ylabel('Variance')
+        ax.set_title(f'Variance vs mean correctness\nSpearman = {corr_results["mean_correct"]["spearman"]:+.3f}')
+        ax.legend()
+        ax.grid(alpha=0.3)
+
+        ax = axes[2]
+        names = list(per_model_results.keys())
+        srs = [per_model_results[n]['spearman_variance_vs_correct'] for n in names]
+        colors = ['green' if s > 0 else 'red' for s in srs]
+        bars = ax.bar(range(len(names)), srs, color=colors, alpha=0.7, edgecolor='black')
+        ax.set_xticks(range(len(names)))
+        ax.set_xticklabels([f'M{i+1}' for i in range(len(names))])
+        ax.axhline(0, color='black', linewidth=0.8)
+        ax.set_ylabel('Spearman(variance, correct_i)')
+        ax.set_title('Per-model variance–competence correlation')
+        for bar, s in zip(bars, srs):
+            ax.text(bar.get_x() + bar.get_width()/2, s + (0.01 if s >= 0 else -0.03),
+                    f'{s:+.3f}', ha='center', fontsize=10)
+        ax.grid(alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        plot_path = os.path.join(save_dir, f'variance_competence_validation_{tag}.png')
+        plt.savefig(plot_path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"Plot saved: {plot_path}")
+    except Exception as e:
+        print(f"Plotting failed: {e}")
+
+    return results
+
+
+@torch.no_grad()
 def run_measure_ablation(ensemble, val_loader, device, save_dir, percentile=75.0):
     """Ablation on all measures, using the VALIDATION set only (no leakage).
     Each measure gets its own calibrated threshold. Best measure picked by val accuracy.
@@ -1123,6 +1417,8 @@ def main():
                         help="Detailed validation of hesitancy measures on VALIDATION set.")
     parser.add_argument('--validate_competence', action='store_true',
                         help="Validate that learned final weights reflect model competence.")
+    parser.add_argument('--validate_variance_competence', action='store_true',
+                        help="Directly correlate variance with per-model competence.")
     # ==================================
 
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
@@ -1226,6 +1522,11 @@ def main():
         print("\n" + "=" * 70 + "\nVALIDATING MODEL-COMPETENCE ESTIMATION (Validation Set)\n" + "=" * 70)
         validate_model_competence(ensemble, val_loader, device, MODEL_NAMES,
                                   args.save_dir, tag="val")
+
+    if args.validate_variance_competence:
+        print("\n" + "=" * 70 + "\nVARIANCE vs MODEL COMPETENCE (Validation Set)\n" + "=" * 70)
+        validate_variance_vs_competence(ensemble, val_loader, device, MODEL_NAMES,
+                                        args.save_dir, tag="val")
     # ===================================================================
 
     print("\n" + "=" * 70 + "\nFINAL ENSEMBLE EVALUATION (TEST SET)\n" + "=" * 70)
