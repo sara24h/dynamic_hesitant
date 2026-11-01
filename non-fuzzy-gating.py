@@ -1,30 +1,3 @@
-#!/usr/bin/env python
-"""
-=============================================================================
-NON-FUZZY GATING BASELINE — Reviewer Response for HFDE
-=============================================================================
-
-پاسخ به نگرانی داور که «آیا بهبود از dynamic weighting می‌آید یا از
-hesitant fuzzy modeling؟»
-
-سه حالت اجرا:
-
-  --mode matched  : softmax gating + cum_weight + fallback بر اساس disagreement
-                    ⚠ "hesitancy" اینجا واریانس احتمال softmax است، نه
-                      hesitancy فازی. یک ANALOGUE مصنوعی است.
-                    کاربرد: پاسخ تحت‌اللفظی به «same selection thresholds»
-
-  --mode pure     : softmax gating + cum_weight فقط. بدون fallback.
-                    ✅ standard sparse MoE (Switch Transformer style).
-                    کاربرد: پاسخ صادقانه به «pure non-fuzzy gating»
-
-  --mode both     : هر دو را اجرا و مقایسه می‌کند (پیش‌فرض).
-
-با --fuzzy_pred_path مسیر roc_data_test.json از HFDE، آزمون McNemar
-به‌صورت خودکار انجام می‌شود.
-=============================================================================
-"""
-
 import argparse
 import csv
 import json
