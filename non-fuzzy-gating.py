@@ -24,12 +24,6 @@ from old_dataset_utils import (
     get_sample_info,
 )
 from visualization_utils import generate_visualizations
-from efficiency_utils import (
-    Stopwatch,
-    summarize_training_times,
-    benchmark_efficiency,
-    print_headline,
-)
 
 warnings.filterwarnings("ignore")
 
@@ -58,6 +52,98 @@ def setup_device():
         device = torch.device("cpu")
         print("WARNING: CUDA not available, using CPU")
     return device
+
+
+class Stopwatch:
+    """Small local timer; avoids dependency on efficiency_utils.py."""
+    def __init__(self, device):
+        self.device = device
+        self.started_at = None
+
+    def start(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self.started_at = time.perf_counter()
+        return self
+
+    def stop(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        if self.started_at is None:
+            raise RuntimeError("Stopwatch.start() must be called before stop().")
+        elapsed = time.perf_counter() - self.started_at
+        self.started_at = None
+        return elapsed
+
+
+def summarize_training_times(epoch_times, train_times, val_times, total_time):
+    """Summarize timings locally, without importing efficiency_utils."""
+    return {
+        "total_training_time_s": float(total_time),
+        "mean_epoch_time_s": float(np.mean(epoch_times)) if epoch_times else 0.0,
+        "mean_train_time_s": float(np.mean(train_times)) if train_times else 0.0,
+        "mean_validation_time_s": float(np.mean(val_times)) if val_times else 0.0,
+        "num_epochs": int(len(epoch_times)),
+    }
+
+
+@torch.no_grad()
+def benchmark_efficiency(model, loader, device, model_names=None, latency_samples=None):
+    """Measure end-to-end inference latency and throughput for this ensemble."""
+    model.eval()
+    try:
+        first_images, _ = next(iter(loader))
+    except StopIteration:
+        raise RuntimeError("Cannot benchmark efficiency: test loader is empty.")
+
+    warmup = first_images[:min(2, len(first_images))].to(device)
+    for _ in range(2):
+        model(warmup)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    total_images = 0
+    elapsed_total = 0.0
+    batches_done = 0
+    for images, _ in loader:
+        if latency_samples is not None and total_images >= latency_samples:
+            break
+        if latency_samples is not None:
+            remaining = latency_samples - total_images
+            images = images[:remaining]
+        images = images.to(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        model(images)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elapsed_total += time.perf_counter() - start
+        total_images += int(images.size(0))
+        batches_done += 1
+
+    if total_images == 0:
+        raise RuntimeError("No samples were measured during efficiency benchmarking.")
+    return {
+        "benchmark_samples": int(total_images),
+        "inference_time_s": float(elapsed_total),
+        "latency_ms_per_image": float(1000.0 * elapsed_total / total_images),
+        "throughput_images_per_sec": float(total_images / elapsed_total) if elapsed_total else 0.0,
+        "benchmark_batches": int(batches_done),
+    }
+
+
+def print_headline(efficiency):
+    """Print the local efficiency summary."""
+    print("\\nEFFICIENCY SUMMARY")
+    print("-" * 50)
+    for key in ("benchmark_samples", "inference_time_s",
+                "latency_ms_per_image", "throughput_images_per_sec"):
+        if key in efficiency:
+            print(f"{key}: {efficiency[key]}")
+    if "training_time" in efficiency:
+        print(f"Training timing: {efficiency['training_time']}")
+    print("-" * 50)
 
 
 # -----------------------------------------------------------------------------
