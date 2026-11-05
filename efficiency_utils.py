@@ -265,12 +265,13 @@ def benchmark_efficiency(ensemble, test_loader, device, model_names,
     n_lat = min(latency_samples, len(dataset))
     idx = np.sort(np.random.RandomState(0).choice(len(dataset), n_lat, replace=False))
     lat_inputs = [dataset[int(i)][0].unsqueeze(0).to(device) for i in idx]
-    thr_inputs = []
-    for images, _ in test_loader:
-        thr_inputs.append(images.to(device))
-        if len(thr_inputs) >= throughput_batches:
-            break
-    batch_size = thr_inputs[0].size(0)
+    # نمونه‌گیری تصادفی از کل دیتاست، مستقل از ترتیب test_loader
+    n_batches = min(throughput_batches, len(dataset) // batch_size)
+    n_needed = n_batches * batch_size    
+    rng = np.random.RandomState(0)
+    all_indices = rng.choice(len(dataset), n_needed, replace=False)
+    sampled = torch.stack([dataset[int(i)][0] for i in all_indices]).to(device)
+    thr_inputs = [sampled[i*batch_size:(i+1)*batch_size] for i in range(n_batches)]
 
     # ---- callables to benchmark -------------------------------------------
     methods = {
