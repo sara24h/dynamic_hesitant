@@ -247,7 +247,7 @@ def measure_full_pass(fn, loader, device, repeats=10):
 # ------------------------------------------------------------ main benchmark
 def benchmark_efficiency(ensemble, test_loader, device, model_names,
                          latency_samples=300, latency_warmup=50,
-                         throughput_batches=20, throughput_warmup=30,
+                         throughput_batches=50, throughput_warmup=30,
                          throughput_iters=100, verbose=False,
                          throughput_repeats=10, full_pass_repeats=10,
                          gpu_warmup_s=3.0):
@@ -260,6 +260,12 @@ def benchmark_efficiency(ensemble, test_loader, device, model_names,
     dataset = test_loader.dataset
     n_models = len(ensemble.models)
     norm = ensemble.normalizations
+
+# ← این خط را اضافه کن:
+    batch_size = test_loader.batch_size
+    if batch_size is None:
+        first_batch, _ = next(iter(test_loader))
+        batch_size = first_batch.size(0)
 
     # ---- cache real test data on GPU --------------------------------------
     n_lat = min(latency_samples, len(dataset))
