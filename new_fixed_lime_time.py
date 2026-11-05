@@ -792,7 +792,7 @@ def main():
 
     # بنچمارک Latency / Throughput (قبل از ارزیابی نهایی)
     efficiency = benchmark_efficiency(ensemble, test_loader, device, MODEL_NAMES,
-                                  latency_samples=len(test_loader.dataset))
+                                  latency_samples=min(300, len(test_loader.dataset)))
     efficiency['training_time'] = train_timing
     print_headline(efficiency)
 
