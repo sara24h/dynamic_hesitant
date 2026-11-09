@@ -37,7 +37,6 @@ def set_seed(seed: int = 42):
 
 # ================== DEVICE SETUP (Single GPU) ==================
 def setup_device():
-    """تنظیم دستگاه روی یک GPU واحد"""
     if torch.cuda.is_available():
         device = torch.device('cuda:0')
         torch.cuda.set_device(0)
@@ -50,7 +49,6 @@ def setup_device():
 
 # ================== ECE METRIC ==================
 def compute_ece(y_true, y_prob, n_bins: int = 15) -> float:
-    """Expected Calibration Error برای طبقه‌بندی دودویی."""
     y_true = np.asarray(y_true).astype(int)
     y_prob = np.asarray(y_prob).astype(float)
     pred = (y_prob > 0.5).astype(int)
@@ -70,9 +68,7 @@ def compute_ece(y_true, y_prob, n_bins: int = 15) -> float:
 def final_evaluation_unified(model, test_loader, device, save_dir, model_names, args):
 
     model.eval()
-
     test_dataset = test_loader.dataset
-
     num_samples = len(test_dataset)
 
     lines = []
@@ -84,11 +80,7 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
     lines.append("-"*100)
 
     TP, TN, FP, FN = 0, 0, 0, 0
-
-    all_y_true = []
-    all_y_score = []
-    all_y_pred = []
-    all_model_weights = []
+    all_y_true, all_y_score, all_y_pred, all_model_weights = [], [], [], []
 
     print(f"\nRunning Unified Final Evaluation on {num_samples} samples...")
 
@@ -96,7 +88,6 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
         for i in tqdm(range(num_samples), desc="Final Eval"):
             try:
                 image, label = test_dataset[i]
-
                 original_idx = test_dataset.indices[i]
                 path, _ = get_sample_info(test_dataset.dataset, original_idx)
             except Exception as e:
@@ -107,11 +98,8 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
             label_int = int(label)
 
             output, final_weights, _, _ = model(image, return_details=True)
-
             prob = torch.sigmoid(output.squeeze()).item()
-
             all_model_weights.append(final_weights.squeeze(0).cpu().numpy())
-
             pred_int = int(prob > 0.5)
 
             all_y_true.append(label_int)
@@ -147,30 +135,19 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
     macro_precision = (precision_real + precision_fake) / 2
     macro_recall    = (recall_real + recall_fake) / 2
     macro_f1        = (f1_real + f1_fake) / 2
-
     balanced_acc = ((recall_real + recall_fake) / 2) * 100
 
-    # ================== Confusion Matrix Plot ==================
-    cm = np.array([[TN, FP],
-                   [FN, TP]])
-
+    cm = np.array([[TN, FP], [FN, TP]])
     plt.figure(figsize=(8, 6))
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt='d',
-        cmap='Blues',
-        xticklabels=['Predicted Fake', 'Predicted Real'],
-        yticklabels=['Actual Fake', 'Actual Real'],
-        cbar=True,
-        annot_kws={"size": 16}
-    )
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Predicted Fake', 'Predicted Real'],
+                yticklabels=['Actual Fake', 'Actual Real'],
+                cbar=True, annot_kws={"size": 16})
     plt.title(f'Confusion Matrix\nAccuracy: {acc:.2f}% | Balanced Acc: {balanced_acc:.2f}% | Macro-F1: {macro_f1:.4f}',
               fontsize=13, fontweight='bold')
     plt.ylabel('True Label', fontsize=12)
     plt.xlabel('Predicted Label', fontsize=12)
     plt.tight_layout()
-
     cm_path = os.path.join(save_dir, 'confusion_matrix.png')
     plt.savefig(cm_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -195,14 +172,12 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
 
     if len(all_model_weights) > 0:
         weights_np = np.array(all_model_weights)
-
         print(f"\n{'='*70}")
         print("MODEL ACTIVATION STATISTICS (Final Evaluation)")
         print(f"{'='*70}")
 
         activation_threshold = 1e-4
         active_mask = (weights_np > activation_threshold).astype(float)
-
         activation_rates = active_mask.mean(axis=0) * 100
         avg_weights = weights_np.mean(axis=0)
         max_weights = weights_np.max(axis=0)
@@ -255,7 +230,6 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
         print(f"Model activation stats saved: {activation_json_path}")
 
     output_str = []
-
     output_str.append("-" * 100)
     output_str.append("SUMMARY STATISTICS:")
     output_str.append("-" * 100)
@@ -382,7 +356,6 @@ class FuzzyHesitantEnsemble(nn.Module):
         self.cum_weight_threshold = cum_weight_threshold
         self.hesitancy_threshold = hesitancy_threshold
 
-        # Per-model temperature scaling (fitted BEFORE aggregator training on val split)
         if temperatures is None:
             temperatures = [1.0] * self.num_models
         self.temperatures = [float(t) for t in temperatures]
@@ -395,13 +368,11 @@ class FuzzyHesitantEnsemble(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        # Force base models to remain in eval mode
         for model in self.models:
             model.eval()
         return self
 
     def _compute_mask_vectorized(self, final_weights: torch.Tensor, avg_hesitancy: torch.Tensor):
-        batch_size = final_weights.size(0)
         sorted_weights, sorted_indices = torch.sort(final_weights, dim=1, descending=True)
         cum_weights = torch.cumsum(sorted_weights, dim=1)
         mask = (cum_weights <= self.cum_weight_threshold).float()
@@ -430,7 +401,6 @@ class FuzzyHesitantEnsemble(nn.Module):
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-            # Apply per-model temperature calibration before aggregation
             outputs[:, i] = out / self.temperatures[i_idx]
 
         final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
@@ -468,11 +438,6 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
 
 # ================== TEMPERATURE CALIBRATION ==================
 def fit_temperatures(base_models, val_loader, device, means, stds, model_names=None):
-    """
-    Fit per-model Temperature Scaling on the validation set via NLL minimization.
-    Calibrated logit = raw_logit / T_i.
-    Returns list of temperatures, one per model.
-    """
     temperatures = []
     criterion = nn.BCEWithLogitsLoss()
     for i, model in enumerate(base_models):
@@ -512,10 +477,6 @@ def fit_temperatures(base_models, val_loader, device, means, stds, model_names=N
 
 # ================== VAL SPLIT HELPER ==================
 def split_val_loader(val_loader, seed=42, calib_fraction=0.5, batch_size=16):
-    """
-    Split val_loader into (calib_loader, eval_loader) to avoid leakage
-    between temperature fitting and early stopping.
-    """
     val_dataset = val_loader.dataset
     n_val = len(val_dataset)
     rng = np.random.RandomState(seed)
@@ -559,7 +520,6 @@ def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: to
 
 @torch.no_grad()
 def evaluate_accuracy_and_loss(model, loader, device, criterion):
-
     model.eval()
     correct = 0
     total_loss = 0.0
@@ -568,10 +528,8 @@ def evaluate_accuracy_and_loss(model, loader, device, criterion):
     for images, labels in tqdm(loader, desc="Validation"):
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
-
         loss = criterion(outputs.squeeze(1), labels)
         total_loss += loss.item() * images.size(0)
-
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
 
@@ -592,13 +550,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
 
     total_real_samples = len(train_loader.dataset)
 
-    history = {
-        'train_loss': [],
-        'val_loss': [],
-        'train_acc': [],
-        'val_acc': []
-    }
-
+    history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
     epoch_times, train_times, val_times = [], [], []
     total_sw = Stopwatch(device).start()
 
@@ -618,7 +570,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
 
         train_loss = 0.0
         train_correct = 0
-
         sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
         sum_cumsum_used = 0
         sum_active_models = torch.zeros(len(model_names), device=device)
@@ -764,13 +715,11 @@ def main():
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
 
-    # Calibration flag (default ON; use --no_calibrate for ablation)
     parser.add_argument('--calibrate', action='store_true', default=True,
                         help='Apply per-model Temperature Scaling (default: enabled)')
     parser.add_argument('--no_calibrate', action='store_false', dest='calibrate',
                         help='Disable per-model Temperature Scaling (ablation baseline)')
 
-    # Val-split flag (default ON: split val into calibration + early-stopping subsets)
     parser.add_argument('--split_val_for_calibration', action='store_true', default=True,
                         help='Split val into calibration + eval subsets to avoid leakage (default: True)')
     parser.add_argument('--no_split_val', action='store_false', dest='split_val_for_calibration',
@@ -816,12 +765,26 @@ def main():
     base_models = load_pruned_models(args.model_paths, device)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    # ===== 2. Create dataloaders (needed BEFORE T fitting) =====
+    # ===== 2. Create ensemble FIRST (preserves RNG order for reproducibility) =====
+    ensemble = FuzzyHesitantEnsemble(
+        base_models, MEANS, STDS,
+        num_memberships=args.num_memberships,
+        freeze_models=True,
+        cum_weight_threshold=args.cum_weight_threshold,
+        hesitancy_threshold=args.hesitancy_threshold,
+        temperatures=[1.0] * len(base_models),
+    ).to(device)
+
+    trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in ensemble.parameters())
+    print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
+
+    # ===== 3. Create dataloaders =====
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=False, seed=args.seed, is_main=True)
 
-    # ===== 3. Baseline individual model evaluation =====
+    # ===== 4. Baseline individual model evaluation =====
     print("\n" + "="*70)
     print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
     print("="*70)
@@ -836,7 +799,7 @@ def main():
     print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
     print("="*70)
 
-    # ===== 4. FIT TEMPERATURES *BEFORE* TRAINING THE AGGREGATOR =====
+    # ===== 5. FIT TEMPERATURES *BEFORE* TRAINING (but AFTER ensemble init) =====
     if args.calibrate:
         if args.split_val_for_calibration:
             calib_loader, eval_loader = split_val_loader(
@@ -851,27 +814,14 @@ def main():
         print("="*70)
         temperatures = fit_temperatures(
             base_models, calib_loader, device, MEANS, STDS, MODEL_NAMES)
+        ensemble.temperatures = temperatures
         print(f"\n✅ Calibration fitted. Temperatures: "
               f"{[f'{t:.4f}' for t in temperatures]}\n")
     else:
         temperatures = [1.0] * len(MODEL_NAMES)
+        ensemble.temperatures = temperatures
         eval_loader = val_loader
         print("\n⚠️  Calibration disabled (T = 1.0 for all models).\n")
-
-    # ===== 5. Create ensemble WITH calibrated temperatures =====
-    # Training now sees calibrated logits, so no train-test mismatch.
-    ensemble = FuzzyHesitantEnsemble(
-        base_models, MEANS, STDS,
-        num_memberships=args.num_memberships,
-        freeze_models=True,
-        cum_weight_threshold=args.cum_weight_threshold,
-        hesitancy_threshold=args.hesitancy_threshold,
-        temperatures=temperatures,
-    ).to(device)
-
-    trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in ensemble.parameters())
-    print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
     # ===== 6. Train aggregator WITH calibrated logits =====
     best_val_acc, train_timing = train_hesitant_fuzzy(
