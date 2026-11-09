@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import os
 from tqdm import tqdm
 import numpy as np
@@ -22,6 +22,7 @@ from visualization_utils import generate_visualizations
 from efficiency_utils import Stopwatch, summarize_training_times, benchmark_efficiency, print_headline
 
 warnings.filterwarnings("ignore")
+
 
 # ================== UTILITY FUNCTIONS ==================
 def set_seed(seed: int = 42):
@@ -151,7 +152,7 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
 
     # ================== Confusion Matrix Plot ==================
     cm = np.array([[TN, FP],
-               [FN, TP]])
+                   [FN, TP]])
 
     plt.figure(figsize=(8, 6))
     sns.heatmap(
@@ -165,7 +166,7 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
         annot_kws={"size": 16}
     )
     plt.title(f'Confusion Matrix\nAccuracy: {acc:.2f}% | Balanced Acc: {balanced_acc:.2f}% | Macro-F1: {macro_f1:.4f}',
-          fontsize=13, fontweight='bold')
+              fontsize=13, fontweight='bold')
     plt.ylabel('True Label', fontsize=12)
     plt.xlabel('Predicted Label', fontsize=12)
     plt.tight_layout()
@@ -175,7 +176,6 @@ def final_evaluation_unified(model, test_loader, device, save_dir, model_names, 
     plt.close()
     print(f"✅ Confusion Matrix saved to: {cm_path}")
 
-    # ================== چاپ نتایج نهایی ==================
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
@@ -382,7 +382,7 @@ class FuzzyHesitantEnsemble(nn.Module):
         self.cum_weight_threshold = cum_weight_threshold
         self.hesitancy_threshold = hesitancy_threshold
 
-        # 🆕 Per-model temperature scaling (fit post-training on validation set)
+        # Per-model temperature scaling (fitted BEFORE aggregator training on val split)
         if temperatures is None:
             temperatures = [1.0] * self.num_models
         self.temperatures = [float(t) for t in temperatures]
@@ -430,7 +430,7 @@ class FuzzyHesitantEnsemble(nn.Module):
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-            # 🆕 Apply per-model temperature calibration before aggregation
+            # Apply per-model temperature calibration before aggregation
             outputs[:, i] = out / self.temperatures[i_idx]
 
         final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
@@ -510,9 +510,32 @@ def fit_temperatures(base_models, val_loader, device, means, stds, model_names=N
     return temperatures
 
 
+# ================== VAL SPLIT HELPER ==================
+def split_val_loader(val_loader, seed=42, calib_fraction=0.5, batch_size=16):
+    """
+    Split val_loader into (calib_loader, eval_loader) to avoid leakage
+    between temperature fitting and early stopping.
+    """
+    val_dataset = val_loader.dataset
+    n_val = len(val_dataset)
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(n_val).tolist()
+    n_calib = max(1, int(n_val * calib_fraction))
+    calib_idx = perm[:n_calib]
+    eval_idx = perm[n_calib:]
+
+    calib_loader = DataLoader(Subset(val_dataset, calib_idx),
+                              batch_size=batch_size, shuffle=False)
+    eval_loader = DataLoader(Subset(val_dataset, eval_idx),
+                             batch_size=batch_size, shuffle=False)
+    print(f"📊 Val split: {n_calib} samples for calibration, "
+          f"{n_val - n_calib} samples for early stopping")
+    return calib_loader, eval_loader
+
+
 # ================== EVALUATION FUNCTIONS ==================
 @torch.no_grad()
-def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: torch.DeviceObjType,
+def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: torch.device,
                                 name: str, mean: Tuple[float, float, float],
                                 std: Tuple[float, float, float]) -> float:
     model.eval()
@@ -559,7 +582,7 @@ def evaluate_accuracy_and_loss(model, loader, device, criterion):
 
 # ================== TRAINING (Single GPU) ==================
 def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, lr,
-                        device, save_dir, model_names):
+                         device, save_dir, model_names):
     os.makedirs(save_dir, exist_ok=True)
     hesitant_net = ensemble_model.hesitant_fuzzy
     optimizer = torch.optim.AdamW(hesitant_net.parameters(), lr=lr, weight_decay=1e-4)
@@ -586,7 +609,8 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     print(f"Epochs: {num_epochs} | Initial LR: {lr}")
     print(f"Hesitant memberships per model: {hesitant_net.num_memberships}")
     print(f"Number of models: {len(model_names)}")
-    print(f"Total real training samples: {total_real_samples:,}\n")
+    print(f"Total real training samples: {total_real_samples:,}")
+    print(f"Temperatures used during training: {ensemble_model.temperatures}\n")
 
     for epoch in range(num_epochs):
         epoch_sw = Stopwatch(device).start()
@@ -727,7 +751,9 @@ def main():
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--dataset', type=str, required=True, choices=['wild','artiface', 'hard_fake_real', 'deepfake_lab', 'uadfV', 'custom_genai', 'custom_genai_v2', 'real_fake_dataset', '20k'])
+    parser.add_argument('--dataset', type=str, required=True,
+                        choices=['wild', 'artiface', 'hard_fake_real', 'deepfake_lab', 'uadfV',
+                                 'custom_genai', 'custom_genai_v2', 'real_fake_dataset', '20k'])
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--model_paths', type=str, nargs='+', required=True)
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
@@ -738,11 +764,17 @@ def main():
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
 
-    # 🆕 Calibration flag (default ON; use --no_calibrate for ablation)
+    # Calibration flag (default ON; use --no_calibrate for ablation)
     parser.add_argument('--calibrate', action='store_true', default=True,
                         help='Apply per-model Temperature Scaling (default: enabled)')
     parser.add_argument('--no_calibrate', action='store_false', dest='calibrate',
                         help='Disable per-model Temperature Scaling (ablation baseline)')
+
+    # Val-split flag (default ON: split val into calibration + early-stopping subsets)
+    parser.add_argument('--split_val_for_calibration', action='store_true', default=True,
+                        help='Split val into calibration + eval subsets to avoid leakage (default: True)')
+    parser.add_argument('--no_split_val', action='store_false', dest='split_val_for_calibration',
+                        help='Use full val for both T fitting and early stopping')
 
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
@@ -766,6 +798,7 @@ def main():
     print(f"Batch size: {args.batch_size}")
     print(f"Models: {len(args.model_paths)}")
     print(f"Calibration enabled: {args.calibrate}")
+    print(f"Split val for calibration: {args.split_val_for_calibration if args.calibrate else False}")
     print("="*70 + "\n")
 
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
@@ -779,73 +812,87 @@ def main():
         MEANS = DEFAULT_MEANS[:num_models]
         STDS = DEFAULT_STDS[:num_models]
 
+    # ===== 1. Load base models =====
     base_models = load_pruned_models(args.model_paths, device)
     MODEL_NAMES = args.model_names[:len(base_models)]
 
-    ensemble = FuzzyHesitantEnsemble(
-        base_models, MEANS, STDS,
-        num_memberships=args.num_memberships,
-        freeze_models=True,
-        cum_weight_threshold=args.cum_weight_threshold,
-        hesitancy_threshold=args.hesitancy_threshold
-    ).to(device)
-
-    trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in ensemble.parameters())
-    print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
-
+    # ===== 2. Create dataloaders (needed BEFORE T fitting) =====
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=False, seed=args.seed, is_main=True)
 
+    # ===== 3. Baseline individual model evaluation =====
     print("\n" + "="*70)
     print("INDIVIDUAL MODEL PERFORMANCE (Before Training)")
     print("="*70)
-
     individual_accs = []
     for i, model in enumerate(base_models):
         acc = evaluate_single_model_exact(model, test_loader, device,
                                           f"Model {i+1} ({MODEL_NAMES[i]})",
                                           MEANS[i], STDS[i])
         individual_accs.append(acc)
-
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
     print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
     print("="*70)
 
+    # ===== 4. FIT TEMPERATURES *BEFORE* TRAINING THE AGGREGATOR =====
+    if args.calibrate:
+        if args.split_val_for_calibration:
+            calib_loader, eval_loader = split_val_loader(
+                val_loader, seed=args.seed, calib_fraction=0.5,
+                batch_size=args.batch_size)
+        else:
+            calib_loader = val_loader
+            eval_loader = val_loader
+
+        print("\n" + "="*70)
+        print("FITTING PER-MODEL TEMPERATURE SCALING (before aggregator training)")
+        print("="*70)
+        temperatures = fit_temperatures(
+            base_models, calib_loader, device, MEANS, STDS, MODEL_NAMES)
+        print(f"\n✅ Calibration fitted. Temperatures: "
+              f"{[f'{t:.4f}' for t in temperatures]}\n")
+    else:
+        temperatures = [1.0] * len(MODEL_NAMES)
+        eval_loader = val_loader
+        print("\n⚠️  Calibration disabled (T = 1.0 for all models).\n")
+
+    # ===== 5. Create ensemble WITH calibrated temperatures =====
+    # Training now sees calibrated logits, so no train-test mismatch.
+    ensemble = FuzzyHesitantEnsemble(
+        base_models, MEANS, STDS,
+        num_memberships=args.num_memberships,
+        freeze_models=True,
+        cum_weight_threshold=args.cum_weight_threshold,
+        hesitancy_threshold=args.hesitancy_threshold,
+        temperatures=temperatures,
+    ).to(device)
+
+    trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in ensemble.parameters())
+    print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
+
+    # ===== 6. Train aggregator WITH calibrated logits =====
     best_val_acc, train_timing = train_hesitant_fuzzy(
-        ensemble, train_loader, val_loader,
+        ensemble, train_loader, eval_loader,
         args.epochs, args.lr, device, args.save_dir, MODEL_NAMES
     )
 
-    # لود بهترین مدل
+    # ===== 7. Load best checkpoint =====
     ckpt_path = os.path.join(args.save_dir, 'best_hesitant_fuzzy.pt')
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device)
         ensemble.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
         print("Best model loaded.\n")
 
-    # 🆕 Fit per-model temperature scaling on validation set (post-hoc, no retrain)
-    if args.calibrate:
-        print("\n" + "="*70)
-        print("FITTING PER-MODEL TEMPERATURE SCALING (on validation set)")
-        print("="*70)
-        temperatures = fit_temperatures(
-            base_models, val_loader, device, MEANS, STDS, MODEL_NAMES)
-        ensemble.temperatures = temperatures
-        print(f"\n✅ Calibration applied. Temperatures: "
-              f"{[f'{t:.4f}' for t in temperatures]}\n")
-    else:
-        temperatures = [1.0] * len(MODEL_NAMES)
-        print("\n⚠️  Calibration disabled (T = 1.0 for all models).\n")
-
+    # ===== 8. Final evaluation on test =====
     print("\n" + "="*70)
     print("FINAL ENSEMBLE EVALUATION")
     print("="*70)
 
     efficiency = benchmark_efficiency(ensemble, test_loader, device, MODEL_NAMES,
-                                  latency_samples=len(test_loader.dataset))
+                                      latency_samples=len(test_loader.dataset))
     efficiency['training_time'] = train_timing
     print_headline(efficiency)
 
@@ -855,7 +902,6 @@ def main():
     )
     final_eval_time = eval_sw.stop()
 
-    # 🆕 ECE report
     test_ece = compute_ece(y_true, y_scores)
     print(f"\n📊 Test ECE (Expected Calibration Error): {test_ece:.4f}")
 
@@ -868,13 +914,13 @@ def main():
     print(f"Test ECE: {test_ece:.4f}")
     print("="*70)
 
-    # ذخیره نتایج JSON
     final_results = {
         'seed': args.seed,
         'method': 'Fuzzy_Hesitant',
         'calibration': {
             'enabled': bool(args.calibrate),
-            'temperatures': list(ensemble.temperatures)
+            'temperatures': list(ensemble.temperatures),
+            'split_val_for_calibration': bool(args.split_val_for_calibration) if args.calibrate else False,
         },
         'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
         'ensemble': {
@@ -891,7 +937,7 @@ def main():
         'model_names': MODEL_NAMES,
         'means': MEANS,
         'stds': STDS,
-        'temperatures': ensemble.temperatures,   # 🆕
+        'temperatures': ensemble.temperatures,
         'seed': args.seed
     }, os.path.join(args.save_dir, 'final_ensemble_model.pt'))
 
