@@ -346,7 +346,8 @@ class FuzzyHesitantEnsemble(nn.Module):
     def __init__(self, models: List[nn.Module], means: List[Tuple[float]],
                  stds: List[Tuple[float]], num_memberships: int = 3, freeze_models: bool = True,
                  cum_weight_threshold: float = 0.9, hesitancy_threshold: float = 0.2,
-                 temperatures: List[float] = None):
+                 temperatures: List[float] = None, model_names: List[str] = None,
+                 print_logits_samples: int = 0):
         super().__init__()
         self.num_models = len(models)
         self.models = nn.ModuleList(models)
@@ -360,11 +361,80 @@ class FuzzyHesitantEnsemble(nn.Module):
             temperatures = [1.0] * self.num_models
         self.temperatures = [float(t) for t in temperatures]
 
+        # --- Debug logging state ---
+        self.model_names = model_names or [f"Model {i+1}" for i in range(self.num_models)]
+        self.print_logits_samples = print_logits_samples
+        self._logit_print_counter = 0
+        self._logit_print_active = False
+
         if freeze_models:
             for model in self.models:
                 model.eval()
                 for p in model.parameters():
                     p.requires_grad = False
+
+    # ---- Logit debug API ----
+    def enable_logit_printing(self, n: int = None):
+        """Enable per-model logit printing for the next `n` forward passes (batch count)."""
+        if n is not None:
+            self.print_logits_samples = n
+        self._logit_print_counter = 0
+        self._logit_print_active = self.print_logits_samples > 0
+        if self._logit_print_active:
+            print(f"\n{'='*80}")
+            print(f"🔍 LOGIT DEBUG MODE ENABLED")
+            print(f"   Will print per-model logits for first {self.print_logits_samples} samples")
+            print(f"   Temperatures: {[f'{t:.4f}' for t in self.temperatures]}")
+            if all(abs(t - 1.0) < 1e-9 for t in self.temperatures):
+                print(f"   ✓ No Calibration: Raw Logit == Scaled Logit")
+            print(f"{'='*80}\n")
+
+    def disable_logit_printing(self):
+        self._logit_print_active = False
+
+    def _print_debug_logits(self, outputs: torch.Tensor,
+                            final_weights: torch.Tensor,
+                            mask: torch.Tensor):
+        batch_size = outputs.size(0)
+        for b in range(batch_size):
+            if self._logit_print_counter >= self.print_logits_samples:
+                self._logit_print_active = False
+                return
+            self._logit_print_counter += 1
+
+            print(f"\n{'─'*84}")
+            print(f"🔍 Sample #{self._logit_print_counter} | Per-Model Logits "
+                  f"{'(No Calibration: T=1.0)' if all(abs(t-1.0)<1e-9 for t in self.temperatures) else '(Calibrated)'}")
+            print(f"{'─'*84}")
+            print(f"  {'#':<4} {'Model':<30} {'Raw Logit':>12} {'Scaled Logit':>14} "
+                  f"{'Weight':>10} {'Status':>8}")
+            print(f"  {'-'*84}")
+
+            for i in range(self.num_models):
+                scaled_logit = outputs[b, i, 0].item()
+                T = self.temperatures[i]
+                raw_logit = scaled_logit * T  # undo temperature scaling to recover raw logit
+                weight = final_weights[b, i].item()
+                is_active = mask[b, i].item() > 0
+
+                if is_active:
+                    print(f"  {i+1:<4d} {self.model_names[i]:<30} "
+                          f"{raw_logit:12.6f} {scaled_logit:14.6f} "
+                          f"{weight:10.6f} {'✓ ACTIVE':>8}")
+                else:
+                    print(f"  {i+1:<4d} {self.model_names[i]:<30} "
+                          f"{'[MASKED]':>12} {'[MASKED]':>14} "
+                          f"{weight:10.6f} {'✗ MASKED':>8}")
+
+            ensemble_logit = outputs[b].sum().item() if False else \
+                             (outputs[b].squeeze(-1) * final_weights[b]).sum().item()
+            ensemble_prob = torch.sigmoid(torch.tensor(ensemble_logit)).item()
+            print(f"  {'-'*84}")
+            print(f"  {'Ensemble Logit:':<46} {ensemble_logit:>14.6f}")
+            print(f"  {'Ensemble Prob (Sigmoid):':<46} {ensemble_prob:>14.6f}")
+            print(f"  {'Prediction (threshold=0.5):':<46} "
+                  f"{'REAL (1)' if ensemble_prob > 0.5 else 'FAKE (0)':>14}")
+            print(f"{'─'*84}")
 
     def train(self, mode=True):
         super().train(mode)
@@ -404,6 +474,11 @@ class FuzzyHesitantEnsemble(nn.Module):
             outputs[:, i] = out / self.temperatures[i_idx]
 
         final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
+
+        # --- Debug: print per-model logits if enabled ---
+        if return_details and self._logit_print_active:
+            self._print_debug_logits(outputs, final_weights, mask)
+
         if return_details:
             return final_output, final_weights, all_memberships, outputs
         return final_output, final_weights
@@ -728,6 +803,11 @@ def main():
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
 
+    # ⭐ NEW: logit debug printing (only active when --no_calibrate)
+    parser.add_argument('--print_logits_samples', type=int, default=10,
+                        help='Number of test samples to print per-model logits for '
+                             '(only active when --no_calibrate). Default: 10. Set 0 to disable.')
+
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
@@ -748,6 +828,8 @@ def main():
     print(f"Models: {len(args.model_paths)}")
     print(f"Calibration enabled: {args.calibrate}")
     print(f"Split val for calibration: {args.split_val_for_calibration if args.calibrate else False}")
+    print(f"Print logits samples: {args.print_logits_samples} "
+          f"({'active' if not args.calibrate else 'inactive (calibration on)'})")
     print("="*70 + "\n")
 
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
@@ -773,6 +855,8 @@ def main():
         cum_weight_threshold=args.cum_weight_threshold,
         hesitancy_threshold=args.hesitancy_threshold,
         temperatures=[1.0] * len(base_models),
+        model_names=MODEL_NAMES,
+        print_logits_samples=args.print_logits_samples if not args.calibrate else 0,
     ).to(device)
 
     trainable = sum(p.numel() for p in ensemble.parameters() if p.requires_grad)
@@ -799,7 +883,7 @@ def main():
     print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
     print("="*70)
 
-    # ===== 5. FIT TEMPERATURES *BEFORE* TRAINING (but AFTER ensemble init) =====
+    # ===== 5. FIT TEMPERATURES *BEFORE* TRAINING =====
     if args.calibrate:
         if args.split_val_for_calibration:
             calib_loader, eval_loader = split_val_loader(
@@ -823,7 +907,7 @@ def main():
         eval_loader = val_loader
         print("\n⚠️  Calibration disabled (T = 1.0 for all models).\n")
 
-    # ===== 6. Train aggregator WITH calibrated logits =====
+    # ===== 6. Train aggregator =====
     best_val_acc, train_timing = train_hesitant_fuzzy(
         ensemble, train_loader, eval_loader,
         args.epochs, args.lr, device, args.save_dir, MODEL_NAMES
@@ -846,11 +930,18 @@ def main():
     efficiency['training_time'] = train_timing
     print_headline(efficiency)
 
+    # ⭐ Enable per-model logit debug printing (only in --no_calibrate mode)
+    if not args.calibrate and args.print_logits_samples > 0:
+        ensemble.enable_logit_printing(args.print_logits_samples)
+
     eval_sw = Stopwatch(device).start()
     final_acc, y_true, y_scores = final_evaluation_unified(
         ensemble, test_loader, device, args.save_dir, MODEL_NAMES, args
     )
     final_eval_time = eval_sw.stop()
+
+    # Disable debug after final eval
+    ensemble.disable_logit_printing()
 
     test_ece = compute_ece(y_true, y_scores)
     print(f"\n📊 Test ECE (Expected Calibration Error): {test_ece:.4f}")
