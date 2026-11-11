@@ -537,16 +537,35 @@ class FuzzyHesitantEnsemble(nn.Module):
         final_weights = final_weights / (final_weights.sum(dim=1, keepdim=True) + 1e-8)
 
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-        active_models = torch.any(final_weights > 0, dim=0).nonzero(as_tuple=True)[0]
 
-        for i in active_models:
-            i_idx = int(i.item())
-            x_n = self.normalizations(x, i_idx)
+        for i in range(self.num_models):
+            idx = (final_weights[:, i] > 0)
+            if not idx.any():
+                continue
+            x_sub = x[idx]
+            x_n = self.normalizations(x_sub, i)
             with torch.no_grad():
-                out = self.models[i](x_n)
-                if isinstance(out, (tuple, list)):
-                    out = out[0]
-            outputs[:, i] = out / self.temperatures[i_idx]
+                out_i = self.models[i](x_n)
+                if isinstance(out_i, (tuple, list)):
+                    out_i = out_i[0]
+            outputs[idx, i] = out_i / self.temperatures[i]
+
+    # ── Aggregation strategy (فقط یک بلوک) ──
+        if self.aggregation == 'logit':
+            final_output = (outputs * final_weights.unsqueeze(-1)).sum(dim=1)
+        else:
+            probs = torch.sigmoid(outputs)
+            avg_prob = (probs * final_weights.unsqueeze(-1)).sum(dim=1)
+            avg_prob = avg_prob.clamp(1e-6, 1.0 - 1e-6)
+            final_output = torch.logit(avg_prob)
+
+    # ── Debug ──
+        if return_details and self._logit_print_active:
+            self._print_debug_logits(outputs, final_weights, mask)
+
+        if return_details:
+            return final_output, final_weights, all_memberships, outputs
+        return final_output, final_weights
 
         # ── Aggregation strategy ─────────────────────────────────
         if self.aggregation == 'logit':
