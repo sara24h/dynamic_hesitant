@@ -484,7 +484,7 @@ def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: to
 @torch.no_grad()
 def evaluate_accuracy_and_loss(model, loader, device, criterion):
     """
-    محاسبه دقت/خطا + آمار routing — همه از همان loader.
+    محاسبه دقت/خطا + آمار کامل routing — همه از همان loader.
     برای validation استفاده می‌شود تا همه‌ی معیارها از یک split بیایند.
     """
     model.eval()
@@ -496,6 +496,7 @@ def evaluate_accuracy_and_loss(model, loader, device, criterion):
     sum_per_model_hesitancy = torch.zeros(num_models, device=device)
     sum_active_models       = torch.zeros(num_models, device=device)
     sum_cumsum_used         = 0
+    active_counts_all       = []          # تعداد مدل‌های فعال per sample
 
     for images, labels in tqdm(loader, desc="Validation"):
         images, labels = images.to(device), labels.to(device).float()
@@ -513,6 +514,7 @@ def evaluate_accuracy_and_loss(model, loader, device, criterion):
 
         active_mask = (weights > 1e-4).float()                      # (B, M)
         num_active_per_sample = active_mask.sum(dim=1)              # (B,)
+        active_counts_all.append(num_active_per_sample.cpu())       # ذخیره برای mean و توزیع
         sum_cumsum_used += (num_active_per_sample < num_models).sum().item()
         sum_active_models += active_mask.sum(dim=0)
 
@@ -524,11 +526,32 @@ def evaluate_accuracy_and_loss(model, loader, device, criterion):
     cumsum_used_pct       = 100.0 * sum_cumsum_used / total_samples
     per_model_active_pct  = (100.0 * sum_active_models / total_samples).cpu().tolist()
 
+    # ---- میانگین و توزیع تعداد مدل‌های فعال per sample ----
+    ac = torch.cat(active_counts_all).long()
+    mean_active = ac.float().mean().item()
+
+    # توزیع: برای هر k از 1 تا num_models
+    dist_counts = {}
+    dist_pcts   = {}
+    for k in range(1, num_models + 1):
+        if k < num_models:
+            cnt = (ac == k).sum().item()
+        else:
+            cnt = (ac >= k).sum().item()        # k آخر شامل >=k (در صورت وجود حالت‌های نادر)
+        dist_counts[k] = cnt
+        dist_pcts[k]   = 100.0 * cnt / total_samples
+
+    pct_1_model = dist_pcts.get(1, 0.0)
+
     stats = {
         "per_model_hesitancy":  per_model_hes_avg,
         "overall_hesitancy":    overall_hes_avg,
         "cumsum_used_pct":      cumsum_used_pct,
         "per_model_active_pct": per_model_active_pct,
+        "mean_active":          mean_active,
+        "dist_counts":          dist_counts,
+        "dist_pcts":            dist_pcts,
+        "pct_1_model":          pct_1_model,
     }
     return acc, avg_loss, stats
 
@@ -545,7 +568,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
 
     total_train_samples = len(train_loader.dataset)
 
-    # لیست‌ها برای ذخیره تاریخچه آموزش جهت رسم نمودار
     history = {
         'train_loss': [],
         'val_loss': [],
@@ -553,7 +575,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         'val_acc': []
     }
 
-    # زمان‌سنجی آموزش
     epoch_times, train_times, val_times = [], [], []
     total_sw = Stopwatch(device).start()
 
@@ -603,7 +624,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         epoch_times.append(t_epoch); train_times.append(t_train); val_times.append(t_val)
         scheduler.step()
 
-        # ذخیره در تاریخچه
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['train_acc'].append(train_acc)
@@ -634,6 +654,18 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             print(f"  {'Status:':<30}  ✗ Low efficiency")
         print(f"  {'All models used in:':<30}  {100 - vstats['cumsum_used_pct']:.2f}% of samples")
 
+        # ================== NEW: Active Models per Sample ==================
+        print(f"\n{'Active Models per Sample (Validation):':^70}")
+        print(f"{'-'*70}")
+        print(f"  {'Mean active models:':<30}  {vstats['mean_active']:.2f}")
+        print(f"  {'Distribution of active count:':<30}")
+        for k in sorted(vstats['dist_counts'].keys()):
+            cnt = vstats['dist_counts'][k]
+            pct = vstats['dist_pcts'][k]
+            bar = '█' * int(pct / 2)
+            print(f"    {k} model(s): {cnt:6d} samples ({pct:6.2f}%) {bar}")
+        print(f"  {'Only 1 active model:':<30}  {vstats['pct_1_model']:.2f}% of samples")
+
         print(f"\n{'Model Activation Frequency:':^70}")
         print(f"{'-'*70}")
         for i, name in enumerate(model_names):
@@ -645,12 +677,19 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             save_path = os.path.join(save_dir, 'best_hesitant_fuzzy.pt')
-            torch.save({'hesitant_state_dict': hesitant_net.state_dict()}, save_path)
+            torch.save({
+                'hesitant_state_dict': hesitant_net.state_dict(),
+                'best_val_acc': val_acc,
+                'best_val_loss': val_loss,
+                'best_epoch': epoch + 1,
+                'val_routing_stats': vstats,
+                'T': ensemble_model.cum_weight_threshold,
+                'H': ensemble_model.hesitancy_threshold,
+            }, save_path)
             print(f"\n✓ Best model saved → {val_acc:.2f}%")
 
         print()
 
-    # خلاصه زمان آموزش
     total_time = total_sw.stop()
     timing = summarize_training_times(epoch_times, train_times, val_times, total_time)
     print(f"Total training time: {total_time/60:.2f} min "
@@ -659,7 +698,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     # ================== رسم نمودارهای Loss و Accuracy ==================
     plt.figure(figsize=(14, 6))
 
-    # نمودار Loss
     plt.subplot(1, 2, 1)
     plt.plot(range(1, num_epochs + 1), history['train_loss'], label='train', color='blue', linewidth=2)
     plt.plot(range(1, num_epochs + 1), history['val_loss'], label='validation', color='orange', linewidth=2)
@@ -669,7 +707,6 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend(fontsize=12)
 
-    # نمودار Accuracy
     plt.subplot(1, 2, 2)
     plt.plot(range(1, num_epochs + 1), history['train_acc'], label='train', color='blue', linewidth=2)
     plt.plot(range(1, num_epochs + 1), history['val_acc'], label='validation', color='orange', linewidth=2)
@@ -790,6 +827,21 @@ def main():
         ckpt = torch.load(ckpt_path, map_location=device)
         ensemble.hesitant_fuzzy.load_state_dict(ckpt['hesitant_state_dict'])
         print("Best model loaded.\n")
+
+        # چاپ آمار routing در بهترین epoch
+        if 'val_routing_stats' in ckpt:
+            vs = ckpt['val_routing_stats']
+            print("="*70)
+            print(f"BEST EPOCH VALIDATION STATS  (T={ckpt['T']}, H={ckpt['H']})")
+            print(f"  Best epoch: {ckpt['best_epoch']} | Val Acc: {ckpt['best_val_acc']:.2f}% "
+                  f"| Val Loss: {ckpt['best_val_loss']:.4f}")
+            print(f"  Mean active models: {vs['mean_active']:.2f}")
+            print(f"  Distribution of active count:")
+            for k in sorted(vs['dist_counts'].keys()):
+                print(f"    {k} model(s): {vs['dist_counts'][k]:6d} samples "
+                      f"({vs['dist_pcts'][k]:6.2f}%)")
+            print(f"  Only 1 active model: {vs['pct_1_model']:.2f}%")
+            print("="*70)
 
     print("\n" + "="*70)
     print("FINAL ENSEMBLE EVALUATION")
