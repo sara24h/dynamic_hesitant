@@ -249,27 +249,12 @@ class NonFuzzyGatingEnsemble(nn.Module):
         return self
 
     def _compute_mask_vectorized(self, gate_weights: torch.Tensor) -> torch.Tensor:
-        """Keep the highest-weight models until cumulative mass reaches threshold.
-
-        The model that crosses the threshold is retained. For example, if sorted
-        weights are [0.60, 0.30, 0.10] and threshold=0.90, the first two models
-        are selected (their cumulative weight is 0.90).
-        """
-        if gate_weights.ndim != 2 or gate_weights.size(1) != self.num_models:
-            raise ValueError("gate_weights must have shape [batch_size, num_models]")
-
         sorted_weights, sorted_indices = torch.sort(
             gate_weights, dim=1, descending=True
         )
-        cumulative_before = torch.cumsum(sorted_weights, dim=1) - sorted_weights
-
-        # Select a classifier when the weight accumulated BEFORE it is below
-        # the threshold. This includes the classifier that reaches/crosses it.
-        sorted_mask = (cumulative_before < self.cum_weight_threshold).to(
-            gate_weights.dtype
-        )
-        sorted_mask[:, 0] = 1.0  # always retain at least the top classifier
-
+        cum_weights = torch.cumsum(sorted_weights, dim=1)
+        sorted_mask = (cum_weights <= self.cum_weight_threshold).to(gate_weights.dtype)
+        sorted_mask[:, 0] = 1.0
         mask = torch.zeros_like(gate_weights)
         mask.scatter_(1, sorted_indices, sorted_mask)
         return mask
