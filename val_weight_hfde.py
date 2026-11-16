@@ -483,10 +483,7 @@ def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: to
 
 @torch.no_grad()
 def evaluate_accuracy_and_loss(model, loader, device, criterion):
-    """
-    محاسبه دقت/خطا + آمار کامل routing — همه از همان loader.
-    برای validation استفاده می‌شود تا همه‌ی معیارها از یک split بیایند.
-    """
+
     model.eval()
     correct = 0
     total_loss = 0.0
@@ -495,8 +492,9 @@ def evaluate_accuracy_and_loss(model, loader, device, criterion):
 
     sum_per_model_hesitancy = torch.zeros(num_models, device=device)
     sum_active_models       = torch.zeros(num_models, device=device)
+    sum_weights             = torch.zeros(num_models, device=device)   # ← اضافه شد
     sum_cumsum_used         = 0
-    active_counts_all       = []          # تعداد مدل‌های فعال per sample
+    active_counts_all       = []
 
     for images, labels in tqdm(loader, desc="Validation"):
         images, labels = images.to(device), labels.to(device).float()
@@ -509,12 +507,14 @@ def evaluate_accuracy_and_loss(model, loader, device, criterion):
         correct += pred.eq(labels.long()).sum().item()
 
         # ---- routing stats روی همان بچ validation ----
-        per_model_hes = memberships.var(dim=2, unbiased=False)      # (B, M)
+        per_model_hes = memberships.var(dim=2, unbiased=False)
         sum_per_model_hesitancy += per_model_hes.sum(dim=0)
 
-        active_mask = (weights > 1e-4).float()                      # (B, M)
-        num_active_per_sample = active_mask.sum(dim=1)              # (B,)
-        active_counts_all.append(num_active_per_sample.cpu())       # ذخیره برای mean و توزیع
+        sum_weights += weights.sum(dim=0)                             # ← اضافه شد
+
+        active_mask = (weights > 1e-4).float()
+        num_active_per_sample = active_mask.sum(dim=1)
+        active_counts_all.append(num_active_per_sample.cpu())
         sum_cumsum_used += (num_active_per_sample < num_models).sum().item()
         sum_active_models += active_mask.sum(dim=0)
 
@@ -525,19 +525,18 @@ def evaluate_accuracy_and_loss(model, loader, device, criterion):
     overall_hes_avg       = (sum_per_model_hesitancy / total_samples).mean().item()
     cumsum_used_pct       = 100.0 * sum_cumsum_used / total_samples
     per_model_active_pct  = (100.0 * sum_active_models / total_samples).cpu().tolist()
+    average_weights       = (sum_weights / total_samples).cpu().tolist()   # ← اضافه شد
 
-    # ---- میانگین و توزیع تعداد مدل‌های فعال per sample ----
     ac = torch.cat(active_counts_all).long()
     mean_active = ac.float().mean().item()
 
-    # توزیع: برای هر k از 1 تا num_models
     dist_counts = {}
     dist_pcts   = {}
     for k in range(1, num_models + 1):
         if k < num_models:
             cnt = (ac == k).sum().item()
         else:
-            cnt = (ac >= k).sum().item()        # k آخر شامل >=k (در صورت وجود حالت‌های نادر)
+            cnt = (ac >= k).sum().item()
         dist_counts[k] = cnt
         dist_pcts[k]   = 100.0 * cnt / total_samples
 
@@ -548,6 +547,7 @@ def evaluate_accuracy_and_loss(model, loader, device, criterion):
         "overall_hesitancy":    overall_hes_avg,
         "cumsum_used_pct":      cumsum_used_pct,
         "per_model_active_pct": per_model_active_pct,
+        "average_weights":      average_weights,          # ← اضافه شد
         "mean_active":          mean_active,
         "dist_counts":          dist_counts,
         "dist_pcts":            dist_pcts,
@@ -841,11 +841,13 @@ def main():
                 print(f"    {k} model(s): {vs['dist_counts'][k]:6d} samples "
                       f"({vs['dist_pcts'][k]:6.2f}%)")
             print(f"  Only 1 active model: {vs['pct_1_model']:.2f}%")
-            print("="*70)
 
-    print("\n" + "="*70)
-    print("FINAL ENSEMBLE EVALUATION")
-    print("="*70)
+            # ---------- میانگین وزن‌های بهترین Validation ----------
+            if 'average_weights' in vs:
+                print(f"\n  Average Weights (Best Validation):")
+                for i, name in enumerate(MODEL_NAMES):
+                    print(f"    {i+1}. {name:<30}: {vs['average_weights'][i]:.6f}")
+            print("="*70)
 
     # بنچمارک Latency / Throughput (قبل از ارزیابی نهایی)
     efficiency = benchmark_efficiency(ensemble, test_loader, device, MODEL_NAMES,
